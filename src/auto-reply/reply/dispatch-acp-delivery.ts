@@ -1,4 +1,6 @@
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
+import { logAcpMessage } from "../../acp/message-log.js";
+import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { logVerbose } from "../../globals.js";
@@ -352,6 +354,19 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       ttsAuto: params.sessionTtsAuto,
       skipTts: meta?.skipTts,
     });
+
+    // Log outbound ACP response to message DB (fire-and-forget).
+    if ((kind === "block" || kind === "final") && ttsPayload.text?.trim()) {
+      logAcpMessage({
+        sessionKey: params.ctx.SessionKey ?? "",
+        direction: "outbound",
+        channel: (params.originatingChannel ?? "").toLowerCase() || undefined,
+        chatId: params.originatingTo ?? undefined,
+        topicId:
+          params.ctx.MessageThreadId != null ? String(params.ctx.MessageThreadId) : undefined,
+        body: ttsPayload.text,
+      });
+    }
 
     if (params.shouldRouteToOriginating && params.originatingChannel && params.originatingTo) {
       const toolCallId = normalizeOptionalString(meta?.toolCallId);

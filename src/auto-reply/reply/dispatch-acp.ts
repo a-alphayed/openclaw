@@ -1,3 +1,6 @@
+import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
+import type { AcpTurnAttachment } from "../../acp/control-plane/manager.types.js";
+import { logAcpMessage } from "../../acp/message-log.js";
 import { resolveAcpAgentPolicyError, resolveAcpDispatchPolicyError } from "../../acp/policy.js";
 import { formatAcpRuntimeErrorText } from "../../acp/runtime/error-text.js";
 import { toAcpRuntimeError } from "../../acp/runtime/errors.js";
@@ -477,6 +480,23 @@ export async function tryDispatchAcpReply(params: {
       mediaAttachments.length > 0
         ? mediaAttachments
         : resolveAcpInlineImageAttachments(params.images);
+
+    // Log inbound message to ACP message DB (fire-and-forget).
+    if (promptText) {
+      logAcpMessage({
+        sessionKey,
+        direction: "inbound",
+        channel: (params.ctx.Surface ?? params.ctx.Provider ?? "").toLowerCase() || undefined,
+        chatId: params.ctx.To ?? undefined,
+        topicId:
+          params.ctx.MessageThreadId != null ? String(params.ctx.MessageThreadId) : undefined,
+        senderId: params.ctx.SenderId ?? params.ctx.From ?? undefined,
+        senderName: params.ctx.SenderName ?? undefined,
+        body: promptText,
+        messageSid: params.ctx.MessageSidFull ?? params.ctx.MessageSid ?? undefined,
+      });
+    }
+
     if (!promptText && attachments.length === 0) {
       const counts = params.dispatcher.getQueuedCounts();
       delivery.applyRoutedCounts(counts);
