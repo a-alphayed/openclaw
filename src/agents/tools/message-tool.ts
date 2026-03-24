@@ -313,18 +313,19 @@ function buildPollSchema() {
   };
   for (const name of SHARED_POLL_CREATION_PARAM_NAMES) {
     const def = POLL_CREATION_PARAM_DEFS[name];
+    const desc = def.description ? { description: def.description } : {};
     switch (def.kind) {
       case "string":
-        props[name] = Type.Optional(Type.String());
+        props[name] = Type.Optional(Type.String(desc));
         break;
       case "stringArray":
-        props[name] = Type.Optional(Type.Array(Type.String()));
+        props[name] = Type.Optional(Type.Array(Type.String(), desc));
         break;
       case "number":
-        props[name] = Type.Optional(Type.Number());
+        props[name] = Type.Optional(Type.Number(desc));
         break;
       case "boolean":
-        props[name] = Type.Optional(Type.Boolean());
+        props[name] = Type.Optional(Type.Boolean(desc));
         break;
     }
   }

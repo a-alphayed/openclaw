@@ -5,13 +5,23 @@ type PollCreationParamKind = "string" | "stringArray" | "number" | "boolean";
 
 type PollCreationParamDef = {
   kind: PollCreationParamKind;
+  description?: string;
 };
 
 const SHARED_POLL_CREATION_PARAM_DEFS = {
-  pollQuestion: { kind: "string" },
-  pollOption: { kind: "stringArray" },
-  pollDurationHours: { kind: "number" },
-  pollMulti: { kind: "boolean" },
+  pollQuestion: { kind: "string", description: "The poll question text." },
+  pollOption: {
+    kind: "stringArray",
+    description: "Array of answer options for the poll (2-10 options).",
+  },
+  pollDurationHours: {
+    kind: "number",
+    description: "How long the poll stays open, in hours (default: 24).",
+  },
+  pollMulti: {
+    kind: "boolean",
+    description: "Allow multiple selections (default: false, single-select).",
+  },
 } satisfies Record<string, PollCreationParamDef>;
 
 export const POLL_CREATION_PARAM_DEFS: Record<string, PollCreationParamDef> =
