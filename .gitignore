@@ -172,6 +172,10 @@ dist/protocol.schema.json
 **/.settings/
 **/.gradle/
 
+# Playwright browser profiles and MCP logs
+.playwright-mcp/
+scripts/.playwright-profile/
+
 # Synthing
 **/.stfolder/
 .dev-state

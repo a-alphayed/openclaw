@@ -1760,6 +1760,7 @@
     "oxfmt": "0.47.0",
     "oxlint": "^1.62.0",
     "oxlint-tsgolint": "^0.22.1",
+    "playwright": "^1.58.2",
     "signal-utils": "0.21.1",
     "tsdown": "0.21.10",
     "tsx": "^4.21.0",
