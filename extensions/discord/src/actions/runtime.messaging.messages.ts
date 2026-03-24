@@ -90,6 +90,48 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
         messages: messages.map((message) => ctx.normalizeMessage(message)),
       });
     }
+    case "pollAnswers": {
+      if (!ctx.isActionEnabled("polls")) {
+        throw new Error("Discord polls are disabled.");
+      }
+      const channelId = ctx.resolveChannelId();
+      const messageId = readStringParam(ctx.params, "messageId", { required: true });
+      const message = await discordMessagingActionRuntime.fetchMessageDiscord(
+        channelId,
+        messageId,
+        ctx.withOpts(),
+      );
+      const poll = (message as unknown as Record<string, unknown>).poll as
+        | {
+            question?: { text?: string };
+            answers: { answer_id: number; poll_media?: { text?: string } }[];
+            results?: {
+              is_finalized?: boolean;
+              answer_counts?: { id: number; count: number; me_voted: boolean }[];
+            };
+            expiry?: string;
+          }
+        | undefined;
+      if (!poll) {
+        return jsonResult({ ok: false, error: "Message is not a poll." });
+      }
+      const results = (poll.results?.answer_counts ?? []).map((answerCount) => {
+        const answer = poll.answers.find((candidate) => candidate.answer_id === answerCount.id);
+        return {
+          answerId: answerCount.id,
+          text: answer?.poll_media?.text ?? `Answer ${answerCount.id}`,
+          count: answerCount.count,
+          meVoted: answerCount.me_voted,
+        };
+      });
+      return jsonResult({
+        ok: true,
+        question: poll.question?.text ?? "",
+        isFinalized: poll.results?.is_finalized ?? false,
+        expiry: poll.expiry,
+        results,
+      });
+    }
     case "editMessage": {
       if (!ctx.isActionEnabled("messages")) {
         throw new Error("Discord message edits are disabled.");

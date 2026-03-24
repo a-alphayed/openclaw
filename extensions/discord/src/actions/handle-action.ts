@@ -227,6 +227,20 @@ export async function handleDiscordMessageAction(
     );
   }
 
+  if (action === "poll-answers") {
+    const messageId = readStringParam(params, "messageId", { required: true });
+    return await handleDiscordAction(
+      {
+        action: "pollAnswers",
+        accountId: accountId ?? undefined,
+        channelId: readTarget(),
+        messageId,
+      },
+      cfg,
+      actionOptions,
+    );
+  }
+
   if (action === "read") {
     const limit = readNumberParam(params, "limit", { integer: true });
     return await handleDiscordAction(

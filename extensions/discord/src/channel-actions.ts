@@ -80,6 +80,7 @@ function describeDiscordMessageTool({
   const actions = new Set<ChannelMessageActionName>(["send"]);
   if (discovery.isEnabled("polls")) {
     actions.add("poll");
+    actions.add("poll-answers");
   }
   if (discovery.isEnabled("reactions")) {
     actions.add("react");
