@@ -1,0 +1,16 @@
+{
+  "name": "@openclaw/dymo-label",
+  "version": "2026.3.23",
+  "private": true,
+  "description": "OpenClaw Dymo LabelWriter 550 label printing plugin",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48",
+    "pdfkit": "^0.16.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -978,6 +978,10 @@
       "types": "./dist/plugin-sdk/keyed-async-queue.d.ts",
       "default": "./dist/plugin-sdk/keyed-async-queue.js"
     },
+    "./plugin-sdk/dymo-label": {
+      "types": "./dist/plugin-sdk/dymo-label.d.ts",
+      "default": "./dist/plugin-sdk/dymo-label.js"
+    },
     "./plugin-sdk/qa-runner-runtime": {
       "types": "./dist/plugin-sdk/qa-runner-runtime.d.ts",
       "default": "./dist/plugin-sdk/qa-runner-runtime.js"

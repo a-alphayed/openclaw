@@ -1,0 +1,27 @@
+{
+  "id": "dymo-label",
+  "name": "Dymo Label",
+  "description": "Print asset and parts labels on a Dymo LabelWriter 550 via SSH over Tailscale.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "tailscaleHost": {
+        "type": "string",
+        "description": "Tailscale hostname or IP of the Mac with the Dymo printer attached."
+      },
+      "sshUser": {
+        "type": "string",
+        "description": "SSH user on the remote host. Defaults to the current local user."
+      },
+      "printerName": {
+        "type": "string",
+        "description": "CUPS printer name on the remote host. Auto-discovered if omitted."
+      },
+      "defaultBinLocation": {
+        "type": "string",
+        "description": "Default bin/shelf location when not provided by the agent."
+      }
+    }
+  }
+}
