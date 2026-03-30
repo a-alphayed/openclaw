@@ -150,6 +150,7 @@
   "direct-dm-access",
   "direct-dm-guard-policy",
   "discord",
+  "dymo-label",
   "mattermost",
   "matrix",
   "device-bootstrap",
