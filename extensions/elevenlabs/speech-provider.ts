@@ -27,7 +27,7 @@ import { resolveElevenLabsApiKeyWithProfileFallback } from "./config-api.js";
 import { isValidElevenLabsVoiceId, normalizeElevenLabsBaseUrl } from "./shared.js";
 import { elevenLabsTTS, elevenLabsTTSStream } from "./tts.js";
 const DEFAULT_ELEVENLABS_VOICE_ID = "pMsXgVXv3BLzUgSXRplE";
-const DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2";
+const DEFAULT_ELEVENLABS_MODEL_ID = "eleven_v3";
 const DEFAULT_ELEVENLABS_VOICE_SETTINGS = {
   stability: 0.5,
   similarityBoost: 0.75,
