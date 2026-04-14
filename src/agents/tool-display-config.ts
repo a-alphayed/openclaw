@@ -567,5 +567,10 @@ export const TOOL_DISPLAY_CONFIG: ToolDisplayConfig = {
       title: "TTS",
       detailKeys: ["text", "channel"],
     },
+    youtube_transcript: {
+      emoji: "▶️",
+      title: "YouTube Transcript",
+      detailKeys: ["url", "videoId"],
+    },
   },
 };

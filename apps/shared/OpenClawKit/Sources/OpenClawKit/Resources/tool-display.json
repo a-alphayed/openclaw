@@ -893,6 +893,14 @@
         "text",
         "channel"
       ]
+    },
+    "youtube_transcript": {
+      "emoji": "▶️",
+      "title": "YouTube Transcript",
+      "detailKeys": [
+        "url",
+        "videoId"
+      ]
     }
   }
 }
