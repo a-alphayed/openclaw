@@ -1,5 +1,3 @@
-import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
-import type { AcpTurnAttachment } from "../../acp/control-plane/manager.types.js";
 import { logAcpMessage } from "../../acp/message-log.js";
 import { resolveAcpAgentPolicyError, resolveAcpDispatchPolicyError } from "../../acp/policy.js";
 import { formatAcpRuntimeErrorText } from "../../acp/runtime/error-text.js";

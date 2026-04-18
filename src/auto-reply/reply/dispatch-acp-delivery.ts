@@ -1,6 +1,5 @@
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
 import { logAcpMessage } from "../../acp/message-log.js";
-import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { logVerbose } from "../../globals.js";
