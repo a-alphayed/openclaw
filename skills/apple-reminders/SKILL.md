@@ -76,6 +76,8 @@ remindctl list Projects --create    # Create list
 remindctl list Work --delete        # Delete list
 ```
 
+**Do not** use AppleScript to create or mutate Reminders lists — it hangs. Always use `remindctl`.
+
 ### Create Reminders
 
 ```bash
