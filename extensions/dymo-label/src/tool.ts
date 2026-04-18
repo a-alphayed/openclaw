@@ -61,6 +61,7 @@ export function createDymoLabelTool(opts: {
             },
           ],
           isError: true,
+          details: { error: "tailscaleHost-not-configured" },
         };
       }
 
@@ -84,25 +85,23 @@ export function createDymoLabelTool(opts: {
         logger: api.logger,
       });
 
+      const resultSummary = {
+        status: "printed",
+        jobId: result.jobId,
+        printer: result.printer,
+        host: result.host,
+        copies,
+        partNumber: content.partNumber,
+        oemPartNumber: content.oemPartNumber,
+      };
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(
-              {
-                status: "printed",
-                jobId: result.jobId,
-                printer: result.printer,
-                host: result.host,
-                copies,
-                partNumber: content.partNumber,
-                oemPartNumber: content.oemPartNumber,
-              },
-              null,
-              2,
-            ),
+            text: JSON.stringify(resultSummary, null, 2),
           },
         ],
+        details: resultSummary,
       };
     },
   };
