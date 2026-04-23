@@ -27,6 +27,7 @@ minimumReleaseAgeExclude:
   - "@oxlint/*"
   - "@oxfmt/*"
   - "axios@1.15.0"
+  - "tokenjuice@0.6.1"
   - "discord-api-types"
   - "rolldown"
   - "sqlite-vec"
