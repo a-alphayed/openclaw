@@ -1,4 +1,4 @@
-import { createCodingTools, createReadTool } from "@mariozechner/pi-coding-agent";
+import { createCodingTools } from "@mariozechner/pi-coding-agent";
 import { HEARTBEAT_RESPONSE_TOOL_NAME } from "../auto-reply/heartbeat-tool-response.js";
 import type { ModelCompatConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -42,7 +42,7 @@ import {
   assertRequiredParams,
   createHostWorkspaceEditTool,
   createHostWorkspaceWriteTool,
-  createOpenClawReadTool,
+  createHostWorkspaceReadTool,
   createSandboxedEditTool,
   createSandboxedReadTool,
   createSandboxedWriteTool,
@@ -528,8 +528,7 @@ export function createOpenClawCodingTools(options?: {
           );
           continue;
         }
-        const freshReadTool = createReadTool(workspaceRoot);
-        const wrapped = createOpenClawReadTool(freshReadTool, {
+        const wrapped = createHostWorkspaceReadTool(workspaceRoot, {
           modelContextWindowTokens: options?.modelContextWindowTokens,
           imageSanitization,
         });

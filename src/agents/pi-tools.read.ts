@@ -4,6 +4,7 @@ import { URL } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { createEditTool, createReadTool, createWriteTool } from "@mariozechner/pi-coding-agent";
 import { isWindowsDrivePath } from "../infra/archive-path.js";
+import { assertFileProviderResponsive } from "../infra/fs-fileprovider-health.js";
 import { root as fsRoot, FsSafeError } from "../infra/fs-safe.js";
 import { expandHomePrefix, resolveOsHomeDir } from "../infra/home-dir.js";
 import { hasEncodedFileUrlSeparator, trySafeFileURLToPath } from "../infra/local-file-access.js";
@@ -652,6 +653,28 @@ export function createHostWorkspaceWriteTool(root: string, options?: { workspace
   return wrapToolParamValidation(base, REQUIRED_PARAM_GROUPS.write);
 }
 
+export function createHostWorkspaceReadTool(
+  root: string,
+  options?: {
+    modelContextWindowTokens?: number;
+    imageSanitization?: ImageSanitizationLimits;
+  },
+) {
+  // Upstream's bare createReadTool(root) uses raw fs.promises.access/readFile
+  // against absolute paths resolved by the model. When iCloud's File Provider
+  // is wedged, that pins libuv workers in openat$NOCANCEL, which AbortSignal
+  // can't free. createHostReadOperations prefixes each fs call with
+  // assertFileProviderResponsive so iCloud-hosted reads fail fast instead of
+  // hanging. Path-boundary enforcement stays external via wrapToolWorkspaceRootGuard.
+  const base = createReadTool(root, {
+    operations: createHostReadOperations(),
+  }) as unknown as AnyAgentTool;
+  return createOpenClawReadTool(base, {
+    modelContextWindowTokens: options?.modelContextWindowTokens,
+    imageSanitization: options?.imageSanitization,
+  });
+}
+
 export function createHostWorkspaceEditTool(root: string, options?: { workspaceOnly?: boolean }) {
   const base = createEditTool(root, {
     operations: createHostEditOperations(root, options),
@@ -744,6 +767,32 @@ async function writeHostFile(absolutePath: string, content: string) {
   const resolved = path.resolve(expandTildeToOsHome(absolutePath));
   await fs.mkdir(path.dirname(resolved), { recursive: true });
   await fs.writeFile(resolved, content, "utf-8");
+}
+
+function createHostReadOperations() {
+  return {
+    readFile: async (absolutePath: string) => {
+      const resolved = path.resolve(expandTildeToOsHome(absolutePath));
+      await assertFileProviderResponsive(resolved);
+      return await fs.readFile(resolved);
+    },
+    access: async (absolutePath: string) => {
+      const resolved = path.resolve(expandTildeToOsHome(absolutePath));
+      await assertFileProviderResponsive(resolved);
+      await fs.access(resolved);
+    },
+    detectImageMimeType: async (absolutePath: string) => {
+      const resolved = path.resolve(expandTildeToOsHome(absolutePath));
+      await assertFileProviderResponsive(resolved);
+      try {
+        const buffer = await fs.readFile(resolved);
+        const mime = await detectMime({ buffer, filePath: resolved });
+        return mime && mime.startsWith("image/") ? mime : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+  } as const;
 }
 
 function createHostWriteOperations(root: string, options?: { workspaceOnly?: boolean }) {
