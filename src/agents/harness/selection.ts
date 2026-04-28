@@ -91,14 +91,13 @@ function selectAgentHarnessDecision(params: {
   sessionKey?: string;
   agentHarnessId?: string;
 }): AgentHarnessSelectionDecision {
+  const pinnedPolicy = resolvePinnedAgentHarnessPolicy({
+    agentHarnessId: params.agentHarnessId,
+  });
+  const policy = pinnedPolicy ?? resolveAgentHarnessPolicy(params);
   // PI is intentionally not part of the plugin candidate list. Explicit plugin
   // runtimes fail closed; only `auto` may route an unmatched turn to PI.
   const pluginHarnesses = listPluginAgentHarnesses();
-  const pinnedPolicy = resolvePinnedAgentHarnessPolicy({
-    agentHarnessId: params.agentHarnessId,
-    pluginHarnesses,
-  });
-  const policy = pinnedPolicy ?? resolveAgentHarnessPolicy(params);
   const piHarness = createPiAgentHarness();
   const runtime = policy.runtime;
   if (runtime === "pi") {
@@ -252,26 +251,13 @@ function logAgentHarnessSelection(
 
 function resolvePinnedAgentHarnessPolicy(params: {
   agentHarnessId: string | undefined;
-  pluginHarnesses: AgentHarness[];
 }): AgentHarnessPolicy | undefined {
-  const { agentHarnessId, pluginHarnesses } = params;
+  const { agentHarnessId } = params;
   if (!agentHarnessId?.trim()) {
     return undefined;
   }
   const runtime = normalizeEmbeddedAgentRuntime(agentHarnessId);
   if (runtime === "auto") {
-    return undefined;
-  }
-  // Drop the pin if it does not resolve to a registered harness. CLI runtime
-  // aliases (e.g. "claude-cli") can leak into session-stored agentHarnessId
-  // from older config shapes or in-memory state and would otherwise reach the
-  // strict missing-plugin throw at the selection site. Falling through to the
-  // unpinned policy preserves the agent's configured runtime instead of
-  // silently forcing PI.
-  if (runtime !== "pi" && !pluginHarnesses.some((entry) => entry.id === runtime)) {
-    log.warn("pinned agent harness is not registered; ignoring pin", {
-      requestedRuntime: runtime,
-    });
     return undefined;
   }
   return { runtime, runtimeSource: "pinned" };

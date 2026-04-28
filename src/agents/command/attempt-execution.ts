@@ -10,12 +10,14 @@ import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { normalizeAgentId } from "../../routing/session-key.js";
 import { annotateInterSessionPromptText } from "../../sessions/input-provenance.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import { sanitizeForLog } from "../../terminal/ansi.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
 import { resolveAuthProfileOrder } from "../auth-profiles/order.js";
 import { ensureAuthProfileStore } from "../auth-profiles/store.js";
+import { resolveAgentRuntimePolicy } from "../agent-runtime-policy.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../bootstrap-budget.js";
 import { runCliAgent } from "../cli-runner.js";
 import { getCliSessionBinding, setCliSessionBinding } from "../cli-session.js";
@@ -670,27 +672,33 @@ function resolveSessionPinnedAgentHarnessId(params: {
     return resolveConfiguredAgentHarnessId(params);
   }
   if (params.sessionEntry.agentHarnessId) {
-    if (isOpenAIProvider(params.provider)) {
-      const configuredPolicy = resolveAgentHarnessPolicy({
-        config: params.cfg,
-        agentId: params.sessionAgentId,
-        sessionKey: params.sessionKey,
-        provider: params.provider,
-        modelId: params.modelId,
-      });
-      const configuredAgentHarnessId =
-        configuredPolicy.runtime === "auto" || isCliRuntimeAlias(configuredPolicy.runtime)
-          ? undefined
-          : configuredPolicy.runtime;
-      const storedRuntime = normalizeEmbeddedAgentRuntime(params.sessionEntry.agentHarnessId);
-      if (configuredAgentHarnessId && configuredPolicy.runtimeSource !== "implicit") {
-        return configuredAgentHarnessId;
+    const storedAgentHarnessId = params.sessionEntry.agentHarnessId;
+    // CLI runtime aliases (e.g. "claude-cli") are not registered embedded
+    // harnesses and must not flow into agentHarnessId; they belong to the CLI
+    // backend layer (see model-runtime-aliases.isCliRuntimeAlias).
+    if (!isCliRuntimeAlias(storedAgentHarnessId)) {
+      if (isOpenAIProvider(params.provider)) {
+        const configuredPolicy = resolveAgentHarnessPolicy({
+          config: params.cfg,
+          agentId: params.sessionAgentId,
+          sessionKey: params.sessionKey,
+          provider: params.provider,
+          modelId: params.modelId,
+        });
+        const configuredAgentHarnessId =
+          configuredPolicy.runtime === "auto" || isCliRuntimeAlias(configuredPolicy.runtime)
+            ? undefined
+            : configuredPolicy.runtime;
+        const storedRuntime = normalizeEmbeddedAgentRuntime(storedAgentHarnessId);
+        if (configuredAgentHarnessId && configuredPolicy.runtimeSource !== "implicit") {
+          return configuredAgentHarnessId;
+        }
+        if (storedRuntime === "pi" && configuredAgentHarnessId) {
+          return configuredAgentHarnessId;
+        }
       }
-      if (storedRuntime === "pi" && configuredAgentHarnessId) {
-        return configuredAgentHarnessId;
-      }
+      return storedAgentHarnessId;
     }
-    return params.sessionEntry.agentHarnessId;
   }
   const configuredAgentHarnessId = resolveConfiguredAgentHarnessId(params);
   if (configuredAgentHarnessId) {
@@ -702,6 +710,24 @@ function resolveSessionPinnedAgentHarnessId(params: {
   return "pi";
 }
 
+function resolveConfiguredAgentRuntimeId(params: {
+  cfg: OpenClawConfig;
+  sessionAgentId: string;
+}): string | undefined {
+  const envRuntime = process.env.OPENCLAW_AGENT_RUNTIME?.trim();
+  if (envRuntime) {
+    return envRuntime;
+  }
+  const agentEntry = params.cfg.agents?.list?.find(
+    (entry) => normalizeAgentId(entry.id) === normalizeAgentId(params.sessionAgentId),
+  );
+  const agentRuntime = resolveAgentRuntimePolicy(agentEntry)?.id?.trim();
+  if (agentRuntime) {
+    return agentRuntime;
+  }
+  return resolveAgentRuntimePolicy(params.cfg.agents?.defaults)?.id?.trim();
+}
+
 function resolveConfiguredAgentHarnessId(params: {
   cfg: OpenClawConfig;
   sessionAgentId: string;
@@ -709,6 +735,9 @@ function resolveConfiguredAgentHarnessId(params: {
   provider: string;
   modelId?: string;
 }): string | undefined {
+  if (isCliRuntimeAlias(resolveConfiguredAgentRuntimeId(params))) {
+    return undefined;
+  }
   const policy = resolveAgentHarnessPolicy({
     config: params.cfg,
     agentId: params.sessionAgentId,
@@ -786,3 +815,8 @@ export function emitAcpAssistantDelta(params: { runId: string; text: string; del
     },
   });
 }
+
+export const __testing = {
+  resolveSessionPinnedAgentHarnessId,
+  resolveConfiguredAgentHarnessId,
+};

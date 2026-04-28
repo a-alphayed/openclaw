@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   buildClaudeCliFallbackContextPrelude,
   claudeCliSessionTranscriptHasContent,
@@ -10,6 +11,7 @@ import {
   resolveFallbackRetryPrompt,
   sessionFileHasContent,
 } from "./attempt-execution.helpers.js";
+import { __testing as attemptExecutionTesting } from "./attempt-execution.js";
 
 describe("resolveFallbackRetryPrompt", () => {
   const originalBody = "Summarize the quarterly earnings report and highlight key trends.";
@@ -484,5 +486,94 @@ describe("createAcpVisibleTextAccumulator", () => {
       text: "Actual answer",
       delta: "Actual answer",
     });
+  });
+});
+
+describe("resolveSessionPinnedAgentHarnessId — CLI runtime alias filtering", () => {
+  const baseParams = {
+    cfg: {
+      agents: {
+        defaults: { agentRuntime: { id: "auto" } },
+      },
+    } as OpenClawConfig,
+    sessionAgentId: "main",
+    sessionId: "session-1",
+    sessionKey: "agent:main:session-1",
+    sessionHasHistory: true,
+    provider: "anthropic",
+    modelId: "sonnet-4.6",
+  };
+
+  it("ignores a stale CLI-runtime alias persisted as agentHarnessId", () => {
+    expect(
+      attemptExecutionTesting.resolveSessionPinnedAgentHarnessId({
+        ...baseParams,
+        sessionEntry: {
+          sessionId: "session-1",
+          updatedAt: 0,
+          agentHarnessId: "claude-cli",
+        },
+      }),
+    ).toBe("pi");
+  });
+
+  it("preserves a registered embedded-harness pin like codex", () => {
+    expect(
+      attemptExecutionTesting.resolveSessionPinnedAgentHarnessId({
+        ...baseParams,
+        sessionEntry: {
+          sessionId: "session-1",
+          updatedAt: 0,
+          agentHarnessId: "codex",
+        },
+      }),
+    ).toBe("codex");
+  });
+
+  it("preserves a pi pin", () => {
+    expect(
+      attemptExecutionTesting.resolveSessionPinnedAgentHarnessId({
+        ...baseParams,
+        sessionEntry: {
+          sessionId: "session-1",
+          updatedAt: 0,
+          agentHarnessId: "pi",
+        },
+      }),
+    ).toBe("pi");
+  });
+});
+
+describe("resolveConfiguredAgentHarnessId — CLI runtime alias filtering", () => {
+  it("returns undefined when configured runtime is a CLI alias", () => {
+    expect(
+      attemptExecutionTesting.resolveConfiguredAgentHarnessId({
+        cfg: {
+          agents: {
+            defaults: { agentRuntime: { id: "claude-cli" } },
+          },
+        } as OpenClawConfig,
+        sessionAgentId: "main",
+        sessionKey: "agent:main:session-1",
+        provider: "anthropic",
+        modelId: "sonnet-4.6",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns the runtime id for non-CLI embedded harnesses", () => {
+    expect(
+      attemptExecutionTesting.resolveConfiguredAgentHarnessId({
+        cfg: {
+          agents: {
+            defaults: { agentRuntime: { id: "codex" } },
+          },
+        } as OpenClawConfig,
+        sessionAgentId: "main",
+        sessionKey: "agent:main:session-1",
+        provider: "anthropic",
+        modelId: "sonnet-4.6",
+      }),
+    ).toBe("codex");
   });
 });
