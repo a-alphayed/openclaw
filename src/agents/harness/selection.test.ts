@@ -429,6 +429,44 @@ describe("selectAgentHarness", () => {
     ).toBe("codex");
   });
 
+  it("drops a stale CLI-alias pin and falls through to the configured policy", () => {
+    const codexSupports = vi.fn(() => ({
+      supported: true as const,
+      priority: 100,
+      reason: "codex provider",
+    }));
+    registerAgentHarness(
+      {
+        id: "codex",
+        label: "Codex",
+        supports: codexSupports,
+        runAttempt: vi.fn(async () => createAttemptResult("codex")),
+      },
+      { ownerPluginId: "codex" },
+    );
+
+    const harness = selectAgentHarness({
+      provider: "codex",
+      modelId: "gpt-5.4",
+      agentHarnessId: "claude-cli",
+      config: { agents: { defaults: { agentRuntime: { id: "auto" } } } },
+    });
+
+    expect(harness.id).toBe("codex");
+    expect(codexSupports).toHaveBeenCalled();
+  });
+
+  it("drops a stale CLI-alias pin without throwing when no plugin matches", () => {
+    expect(
+      selectAgentHarness({
+        provider: "anthropic",
+        modelId: "sonnet-4.6",
+        agentHarnessId: "claude-cli",
+        config: { agents: { defaults: { agentRuntime: { id: "auto" } } } },
+      }).id,
+    ).toBe("pi");
+  });
+
   it("does not compact a plugin-pinned session through PI when the plugin has no compactor", async () => {
     registerFailingCodexHarness();
 
