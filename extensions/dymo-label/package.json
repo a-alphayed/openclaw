@@ -12,6 +12,9 @@
     "@types/pdfkit": "^0.14.0"
   },
   "openclaw": {
+    "bundle": {
+      "stageRuntimeDependencies": true
+    },
     "extensions": [
       "./index.ts"
     ]
