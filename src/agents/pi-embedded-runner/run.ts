@@ -179,6 +179,17 @@ const MID_TURN_PRECHECK_CONTINUATION_PROMPT =
   "Continue from the current transcript after the latest tool result. Do not repeat the original user request, and do not rerun completed tools unless the transcript shows they are still needed.";
 const COMPACTION_CONTINUATION_RETRY_INSTRUCTION =
   "The previous attempt compacted the conversation context before producing a final user-visible answer. Continue from the compacted transcript and produce the final answer now. Do not restart from scratch, do not repeat completed work, and do not rerun tools unless the transcript clearly lacks required evidence.";
+
+function resolveModelCompatibleThinkLevel(params: {
+  requested: ThinkLevel;
+  model?: { reasoning?: boolean } | null;
+}): ThinkLevel {
+  if (params.model?.reasoning === false) {
+    return "off";
+  }
+  return params.requested;
+}
+
 type EmbeddedRunAttemptForRunner = Awaited<ReturnType<typeof runEmbeddedAttemptWithBackend>>;
 
 function resolveHarnessContextConfigProvider(params: {
@@ -690,7 +701,10 @@ export async function runEmbeddedPiAgent(
       let profileIndex = 0;
       const traceAttempts: TraceAttempt[] = [];
 
-      const initialThinkLevel = params.thinkLevel ?? "off";
+      const initialThinkLevel = resolveModelCompatibleThinkLevel({
+        requested: params.thinkLevel ?? "off",
+        model: effectiveModel,
+      });
       let thinkLevel = initialThinkLevel;
       const attemptedThinking = new Set<ThinkLevel>();
       let apiKeyInfo: ApiKeyInfo | null = null;
@@ -1070,7 +1084,16 @@ export async function runEmbeddedPiAgent(
           runLoopIterations += 1;
           const runtimeAuthRetry = authRetryPending;
           authRetryPending = false;
-          attemptedThinking.add(thinkLevel);
+          const attemptThinkLevel = resolveModelCompatibleThinkLevel({
+            requested: thinkLevel,
+            model: effectiveModel,
+          });
+          if (attemptThinkLevel !== thinkLevel) {
+            log.debug(
+              `disabling thinking for non-reasoning model ${provider}/${modelId} (requested=${thinkLevel})`,
+            );
+          }
+          attemptedThinking.add(attemptThinkLevel);
           await fs.mkdir(resolvedWorkspace, { recursive: true });
 
           const basePrompt =
@@ -1108,7 +1131,7 @@ export async function runEmbeddedPiAgent(
             workspaceDir: resolvedWorkspace,
             agentDir,
             agentId: workspaceResolution.agentId,
-            thinkingLevel: thinkLevel,
+            thinkingLevel: attemptThinkLevel,
             extraParamsOverride: {
               ...params.streamParams,
               fastMode: params.fastMode,
@@ -1198,7 +1221,7 @@ export async function runEmbeddedPiAgent(
             modelRegistry,
             agentId: workspaceResolution.agentId,
             legacyBeforeAgentStartResult,
-            thinkLevel,
+            thinkLevel: attemptThinkLevel,
             onToolOutcome: observePostCompactionToolOutcome,
             fastMode: params.fastMode,
             verboseLevel: params.verboseLevel,

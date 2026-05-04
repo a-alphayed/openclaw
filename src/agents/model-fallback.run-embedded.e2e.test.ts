@@ -47,8 +47,16 @@ const installRunEmbeddedMocks = () => {
     sleepWithAbort: (ms, abortSignal) => sleepWithAbortMock(ms, abortSignal),
   });
   vi.doMock("./pi-embedded-runner/model.js", () => ({
-    resolveModelAsync: async (provider: string, modelId: string) =>
-      createResolvedEmbeddedRunnerModel(provider, modelId),
+    resolveModelAsync: async (provider: string, modelId: string) => {
+      const resolved = createResolvedEmbeddedRunnerModel(provider, modelId);
+      return {
+        ...resolved,
+        model: {
+          ...resolved.model,
+          reasoning: modelId === "mock-reasoning",
+        },
+      };
+    },
   }));
 };
 
@@ -75,6 +83,7 @@ type EmbeddedAttemptParams = {
   provider: string;
   modelId?: string;
   authProfileId?: string;
+  thinkLevel?: string;
 };
 
 function makeConfig(): OpenClawConfig {
@@ -403,6 +412,95 @@ describe("runWithModelFallback + runEmbeddedPiAgent failover behavior", () => {
           result,
         }),
       ).toBeNull();
+    });
+  });
+
+  it("forces thinking off for catalog non-reasoning models", async () => {
+    await withAgentWorkspace(async ({ agentDir, workspaceDir }) => {
+      await writeAuthStore(agentDir);
+      runEmbeddedAttemptMock.mockResolvedValueOnce(
+        makeEmbeddedRunnerAttempt({
+          assistantTexts: ["ok"],
+          lastAssistant: buildEmbeddedRunnerAssistant({
+            provider: "openai",
+            model: "mock-1",
+            stopReason: "stop",
+            content: [{ type: "text", text: "ok" }],
+          }),
+        }),
+      );
+
+      await runEmbeddedPiAgent({
+        sessionId: "session:non-reasoning-thinking-off",
+        sessionKey: "agent:test:non-reasoning-thinking-off",
+        sessionFile: path.join(workspaceDir, "non-reasoning-thinking-off.jsonl"),
+        workspaceDir,
+        agentDir,
+        config: makeConfig(),
+        prompt: "hello",
+        provider: "openai",
+        model: "mock-1",
+        authProfileIdSource: "auto",
+        thinkLevel: "high",
+        timeoutMs: 5_000,
+        runId: "run:non-reasoning-thinking-off",
+        enqueue: async (task) => await task(),
+      });
+
+      expect((runEmbeddedAttemptMock.mock.calls[0]?.[0] as EmbeddedAttemptParams).thinkLevel).toBe(
+        "off",
+      );
+    });
+  });
+
+  it("preserves requested thinking for reasoning-capable catalog models", async () => {
+    await withAgentWorkspace(async ({ agentDir, workspaceDir }) => {
+      await writeAuthStore(agentDir);
+      const cfg = makeConfig();
+      const openaiModels = cfg.models?.providers?.openai?.models;
+      const baseModel = openaiModels?.[0];
+      if (!openaiModels || !baseModel) {
+        throw new Error("missing openai test model");
+      }
+      openaiModels.push({
+        ...baseModel,
+        id: "mock-reasoning",
+        name: "Mock Reasoning",
+        reasoning: true,
+      });
+
+      runEmbeddedAttemptMock.mockResolvedValueOnce(
+        makeEmbeddedRunnerAttempt({
+          assistantTexts: ["ok"],
+          lastAssistant: buildEmbeddedRunnerAssistant({
+            provider: "openai",
+            model: "mock-reasoning",
+            stopReason: "stop",
+            content: [{ type: "text", text: "ok" }],
+          }),
+        }),
+      );
+
+      await runEmbeddedPiAgent({
+        sessionId: "session:reasoning-thinking-preserved",
+        sessionKey: "agent:test:reasoning-thinking-preserved",
+        sessionFile: path.join(workspaceDir, "reasoning-thinking-preserved.jsonl"),
+        workspaceDir,
+        agentDir,
+        config: cfg,
+        prompt: "hello",
+        provider: "openai",
+        model: "mock-reasoning",
+        authProfileIdSource: "auto",
+        thinkLevel: "high",
+        timeoutMs: 5_000,
+        runId: "run:reasoning-thinking-preserved",
+        enqueue: async (task) => await task(),
+      });
+
+      expect((runEmbeddedAttemptMock.mock.calls[0]?.[0] as EmbeddedAttemptParams).thinkLevel).toBe(
+        "high",
+      );
     });
   });
 
