@@ -175,13 +175,7 @@ async function extractVisibleTweets(page: Page): Promise<ScrapedTweet[]> {
             const t = (span.textContent || "").trim();
             if (t.startsWith("@")) {
               authorHandle = t;
-            } else if (
-              t &&
-              !authorName &&
-              !t.includes("·") &&
-              !t.match(/^\d+[hms]$/) &&
-              t !== "…"
-            ) {
+            } else if (t && !authorName && !t.includes("·") && !/^\d+[hms]$/.test(t) && t !== "…") {
               authorName = t;
             }
           }
