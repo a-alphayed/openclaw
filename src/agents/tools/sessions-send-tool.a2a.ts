@@ -14,7 +14,7 @@ import { resolveAnnounceTarget } from "./sessions-announce-target.js";
 import {
   buildAgentToAgentAnnounceContext,
   buildAgentToAgentReplyContext,
-  isAnnounceSkip,
+  isNonDeliverableSessionsAnnounceReply,
   isNonDeliverableSessionsReply,
   isReplySkip,
 } from "./sessions-send-helpers.js";
@@ -149,8 +149,7 @@ export async function runSessionsSendA2AFlow(params: {
       announceTarget &&
       announceReply &&
       announceReply.trim() &&
-      !isAnnounceSkip(announceReply) &&
-      !isNonDeliverableSessionsReply(announceReply)
+      !isNonDeliverableSessionsAnnounceReply(announceReply)
     ) {
       try {
         await sessionsSendA2ADeps.callGateway({

@@ -5,6 +5,10 @@ const runtimeModule = await import("./runtime.js");
 const handleDiscordActionMock = vi
   .spyOn(runtimeModule, "handleDiscordAction")
   .mockResolvedValue({ content: [], details: { ok: true } });
+const threadBindingsModule = await import("../monitor/thread-bindings.js");
+const getThreadBindingManagerMock = vi
+  .spyOn(threadBindingsModule, "getThreadBindingManager")
+  .mockReturnValue(null);
 const { handleDiscordMessageAction } = await import("./handle-action.js");
 const { beginDiscordInboundEventDeliveryCorrelation } =
   await import("../inbound-event-delivery.js");
@@ -46,6 +50,7 @@ function expectDiscordActionCall(params: {
 describe("handleDiscordMessageAction", () => {
   beforeEach(() => {
     handleDiscordActionMock.mockClear();
+    getThreadBindingManagerMock.mockReset().mockReturnValue(null);
   });
 
   it("uses trusted requesterSenderId for moderation and ignores params senderUserId", async () => {
@@ -390,6 +395,115 @@ describe("handleDiscordMessageAction", () => {
         mediaReadFile,
       },
     });
+  });
+
+  it("maps thread member actions to Discord thread membership runtime actions", async () => {
+    await handleDiscordMessageAction({
+      action: "thread-member-add",
+      params: {
+        threadId: "thread-123",
+        userId: "user-456",
+      },
+      cfg: {
+        channels: { discord: { token: "tok", actions: { threads: true } } },
+      } as OpenClawConfig,
+    });
+
+    expect(handleDiscordActionMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        action: "threadMemberAdd",
+        threadId: "thread-123",
+        userId: "user-456",
+      }),
+      expect.any(Object),
+    );
+
+    await handleDiscordMessageAction({
+      action: "thread-member-remove",
+      params: {
+        threadId: "thread-123",
+        userId: "user-456",
+      },
+      cfg: {
+        channels: { discord: { token: "tok", actions: { threads: true } } },
+      } as OpenClawConfig,
+    });
+
+    expect(handleDiscordActionMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        action: "threadMemberRemove",
+        threadId: "thread-123",
+        userId: "user-456",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("binds thread sessions through the live Discord thread binding manager", async () => {
+    const bindTarget = vi.fn(async (params: Record<string, unknown>) => ({
+      ...params,
+      accountId: "malik",
+      boundAt: 123,
+      lastActivityAt: 456,
+      webhookToken: "secret-webhook-token",
+    }));
+    getThreadBindingManagerMock.mockReturnValue({
+      bindTarget,
+    } as never);
+
+    const result = await handleDiscordMessageAction({
+      action: "thread-bind-session",
+      params: {
+        threadId: "thread-123",
+        channelId: "parent-789",
+        targetSessionKey: "agent:malik:explicit:review",
+        agentId: "malik",
+        label: "Malik review",
+        threadName: "Review thread",
+        workflowId: "WF-123",
+      },
+      accountId: "malik",
+      cfg: {
+        channels: {
+          discord: {
+            token: "tok",
+            actions: { threads: true },
+            threadBindings: { enabled: true },
+          },
+        },
+      } as OpenClawConfig,
+    });
+
+    expect(getThreadBindingManagerMock).toHaveBeenCalledWith("malik");
+    expect(bindTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "thread-123",
+        channelId: "parent-789",
+        targetKind: "acp",
+        targetSessionKey: "agent:malik:explicit:review",
+        agentId: "malik",
+        label: "Malik review",
+        threadName: "Review thread",
+        boundBy: "openclaw-message-thread-bind-session",
+        metadata: expect.objectContaining({
+          workflowId: "WF-123",
+          workflowRole: "review",
+          pluginBindingOwner: "plugin",
+        }),
+      }),
+    );
+    expect(result.details).toEqual(
+      expect.objectContaining({
+        ok: true,
+        binding: expect.objectContaining({
+          accountId: "malik",
+          threadId: "thread-123",
+          targetSessionKey: "agent:malik:explicit:review",
+          agentId: "malik",
+        }),
+      }),
+    );
+    expect(JSON.stringify(result)).not.toContain("secret-webhook-token");
   });
 
   it("forwards top-level components on sends", async () => {

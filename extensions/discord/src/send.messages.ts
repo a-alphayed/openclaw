@@ -1,6 +1,7 @@
 import type { APIChannel, APIMessage } from "discord-api-types/v10";
 import { ChannelType } from "discord-api-types/v10";
 import {
+  addThreadMember,
   createChannelMessage,
   createThread,
   deleteChannelMessage,
@@ -12,6 +13,7 @@ import {
   listChannelMessages,
   listChannelPins,
   pinChannelMessage,
+  removeThreadMember,
   searchGuildMessages,
   unpinChannelMessage,
 } from "./internal/discord.js";
@@ -205,6 +207,26 @@ export async function listThreadsDiscord(payload: DiscordThreadList, opts: Disco
     return await listChannelArchivedThreads(rest, payload.channelId, params);
   }
   return await listGuildActiveThreads(rest, payload.guildId);
+}
+
+export async function addThreadMemberDiscord(
+  threadId: string,
+  userId: string,
+  opts: DiscordReactOpts,
+) {
+  const rest = resolveDiscordRest(opts);
+  await addThreadMember(rest, threadId, userId);
+  return { ok: true, threadId, userId };
+}
+
+export async function removeThreadMemberDiscord(
+  threadId: string,
+  userId: string,
+  opts: DiscordReactOpts,
+) {
+  const rest = resolveDiscordRest(opts);
+  await removeThreadMember(rest, threadId, userId);
+  return { ok: true, threadId, userId };
 }
 
 export async function searchMessagesDiscord(query: DiscordSearchQuery, opts: DiscordReactOpts) {

@@ -10,6 +10,23 @@ const NON_DELIVERABLE_REPLY_TOKENS = [
   HEARTBEAT_TOKEN,
 ] as const;
 
+const NOOP_ANNOUNCE_REPLIES = new Set([
+  "no action needed",
+  "no action taken",
+  "no operational instruction attached no action needed",
+  "no operational instruction attached no action taken",
+]);
+
+function normalizeSessionsControlText(text?: string) {
+  return (text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, "")
+    .replace(/[.!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function isAnnounceSkip(text?: string) {
   return (text ?? "").trim() === ANNOUNCE_SKIP_TOKEN;
 }
@@ -20,4 +37,11 @@ export function isReplySkip(text?: string) {
 
 export function isNonDeliverableSessionsReply(text?: string) {
   return NON_DELIVERABLE_REPLY_TOKENS.some((token) => isSilentReplyText(text, token));
+}
+
+export function isNonDeliverableSessionsAnnounceReply(text?: string) {
+  return (
+    isNonDeliverableSessionsReply(text) ||
+    NOOP_ANNOUNCE_REPLIES.has(normalizeSessionsControlText(text))
+  );
 }

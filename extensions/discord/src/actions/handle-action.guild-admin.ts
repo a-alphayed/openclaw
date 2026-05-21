@@ -28,6 +28,57 @@ type Ctx = Pick<
   | "mediaReadFile"
 >;
 
+type SanitizedThreadBindingRecord = {
+  accountId: string;
+  channelId?: string;
+  threadId: string;
+  targetKind: string;
+  targetSessionKey: string;
+  agentId?: string;
+  label?: string;
+  boundBy?: string;
+  boundAt?: number;
+  lastActivityAt?: number;
+  idleTimeoutMs?: number;
+  maxAgeMs?: number;
+  metadata?: unknown;
+};
+
+function sanitizeThreadBindingString(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function sanitizeThreadBindingRecord(
+  record: Record<string, unknown>,
+): SanitizedThreadBindingRecord {
+  return {
+    accountId: sanitizeThreadBindingString(record.accountId),
+    channelId: typeof record.channelId === "string" ? record.channelId : undefined,
+    threadId: sanitizeThreadBindingString(record.threadId),
+    targetKind: sanitizeThreadBindingString(record.targetKind),
+    targetSessionKey: sanitizeThreadBindingString(record.targetSessionKey),
+    agentId: typeof record.agentId === "string" ? record.agentId : undefined,
+    label: typeof record.label === "string" ? record.label : undefined,
+    boundBy: typeof record.boundBy === "string" ? record.boundBy : undefined,
+    boundAt: typeof record.boundAt === "number" ? record.boundAt : undefined,
+    lastActivityAt: typeof record.lastActivityAt === "number" ? record.lastActivityAt : undefined,
+    idleTimeoutMs: typeof record.idleTimeoutMs === "number" ? record.idleTimeoutMs : undefined,
+    maxAgeMs: typeof record.maxAgeMs === "number" ? record.maxAgeMs : undefined,
+    metadata: record.metadata && typeof record.metadata === "object" ? record.metadata : undefined,
+  };
+}
+
+function readThreadBindingTargetKind(raw?: string | null): "acp" | "subagent" {
+  const value = raw?.trim().toLowerCase();
+  if (!value || value === "acp") {
+    return "acp";
+  }
+  if (value === "subagent") {
+    return "subagent";
+  }
+  throw new Error("thread-bind-session targetKind must be acp or subagent.");
+}
+
 export async function tryHandleDiscordMessageActionGuildAdmin(params: {
   ctx: Ctx;
   resolveChannelId: () => string;
@@ -393,6 +444,74 @@ export async function tryHandleDiscordMessageActionGuildAdmin(params: {
       },
       cfg,
       { mediaLocalRoots: ctx.mediaLocalRoots, mediaReadFile: ctx.mediaReadFile },
+    );
+  }
+
+  if (action === "thread-bind-session") {
+    const threadId = readStringParam(actionParams, "threadId", {
+      required: true,
+    });
+    const channelId = readStringParam(actionParams, "channelId", {
+      required: true,
+    });
+    const targetSessionKey = readStringParam(actionParams, "targetSessionKey", {
+      required: true,
+    });
+    const targetKind = readThreadBindingTargetKind(readStringParam(actionParams, "targetKind"));
+    const agentId = readStringParam(actionParams, "agentId");
+    const label = readStringParam(actionParams, "label");
+    const threadName = readStringParam(actionParams, "threadName");
+    const workflowId = readStringParam(actionParams, "workflowId");
+    const workflowRole = readStringParam(actionParams, "workflowRole") ?? "review";
+    const boundBy =
+      readStringParam(actionParams, "boundBy") ?? "openclaw-message-thread-bind-session";
+    const { getThreadBindingManager } = await import("../monitor/thread-bindings.js");
+    const manager = getThreadBindingManager(accountId ?? undefined);
+    if (!manager) {
+      throw new Error("Discord thread bindings are unavailable for this account.");
+    }
+    const record = await manager.bindTarget({
+      threadId,
+      channelId,
+      targetKind,
+      targetSessionKey,
+      agentId: agentId ?? undefined,
+      label: label ?? undefined,
+      threadName: threadName ?? undefined,
+      boundBy,
+      metadata: {
+        ...(workflowId ? { workflowId } : {}),
+        workflowRole,
+        pluginBindingOwner: "plugin",
+      },
+    });
+    if (!record) {
+      throw new Error("Discord thread binding could not be created.");
+    }
+    return {
+      content: [],
+      details: {
+        ok: true,
+        binding: sanitizeThreadBindingRecord(record as Record<string, unknown>),
+      },
+    };
+  }
+
+  if (action === "thread-member-add" || action === "thread-member-remove") {
+    const threadId = readStringParam(actionParams, "threadId", {
+      required: true,
+    });
+    const userId = readStringParam(actionParams, "userId", {
+      required: true,
+    });
+    return await handleDiscordAction(
+      {
+        action: action === "thread-member-add" ? "threadMemberAdd" : "threadMemberRemove",
+        accountId: accountId ?? undefined,
+        threadId,
+        userId,
+      },
+      cfg,
     );
   }
 

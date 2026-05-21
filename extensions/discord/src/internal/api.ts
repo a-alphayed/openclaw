@@ -38,6 +38,7 @@ export {
 export {
   createChannelMessage,
   createThread,
+  addThreadMember,
   deleteChannel,
   deleteChannelMessage,
   editChannel,
@@ -48,6 +49,7 @@ export {
   listChannelMessages,
   listChannelPins,
   pinChannelMessage,
+  removeThreadMember,
   searchGuildMessages,
   sendChannelTyping,
   unpinChannelMessage,

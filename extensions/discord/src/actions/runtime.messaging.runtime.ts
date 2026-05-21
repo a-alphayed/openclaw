@@ -2,6 +2,7 @@ import { readDiscordComponentSpec } from "../components.js";
 import type { OpenClawConfig } from "../runtime-api.js";
 import { sendDiscordComponentMessage } from "../send.components.js";
 import {
+  addThreadMemberDiscord,
   createThreadDiscord,
   deleteMessageDiscord,
   editMessageDiscord,
@@ -15,6 +16,7 @@ import {
   pinMessageDiscord,
   reactMessageDiscord,
   readMessagesDiscord,
+  removeThreadMemberDiscord,
   removeOwnReactionsDiscord,
   removeReactionDiscord,
   searchMessagesDiscord,
@@ -28,6 +30,7 @@ import { resolveDiscordTargetChannelId } from "../send.shared.js";
 import { resolveDiscordChannelId } from "../targets.js";
 
 export const discordMessagingActionRuntime = {
+  addThreadMemberDiscord,
   createThreadDiscord,
   deleteMessageDiscord,
   editChannelDiscord,
@@ -42,6 +45,7 @@ export const discordMessagingActionRuntime = {
   reactMessageDiscord,
   readDiscordComponentSpec,
   readMessagesDiscord,
+  removeThreadMemberDiscord,
   removeOwnReactionsDiscord,
   removeReactionDiscord,
   resolveDiscordReactionTargetChannelId,

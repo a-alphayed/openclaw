@@ -96,6 +96,22 @@ export async function createThread<T extends object = APIChannel>(
   return (await rest.post(route, data)) as T;
 }
 
+export async function addThreadMember(
+  rest: RequestClient,
+  threadId: string,
+  userId: string,
+): Promise<void> {
+  await rest.put(Routes.threadMembers(threadId, userId));
+}
+
+export async function removeThreadMember(
+  rest: RequestClient,
+  threadId: string,
+  userId: string,
+): Promise<void> {
+  await rest.delete(Routes.threadMembers(threadId, userId));
+}
+
 export async function listChannelArchivedThreads(
   rest: RequestClient,
   channelId: string,

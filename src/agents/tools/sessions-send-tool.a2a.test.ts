@@ -207,8 +207,15 @@ describe("runSessionsSendA2AFlow announce delivery", () => {
     expect(gatewayCalls.find((call) => call.method === "send")).toBeUndefined();
   });
 
-  it.each(["NO_REPLY", "HEARTBEAT_OK"])(
-    "suppresses exact announce control reply %s before channel delivery",
+  it.each([
+    "NO_REPLY",
+    "HEARTBEAT_OK",
+    "No action needed.",
+    "No action taken.",
+    "No operational instruction attached. No action needed.",
+    "No operational instruction attached. No action taken.",
+  ])(
+    "suppresses non-deliverable announce reply %s before channel delivery",
     async (announceReply) => {
       vi.mocked(runAgentStep).mockResolvedValueOnce(announceReply);
 

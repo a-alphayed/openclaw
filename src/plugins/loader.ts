@@ -124,7 +124,10 @@ import {
   normalizePluginIdScope,
   serializePluginIdScope,
 } from "./plugin-scope.js";
-import { ensureOpenClawPluginSdkAlias } from "./plugin-sdk-dist-alias.js";
+import {
+  ensureOpenClawPluginSdkAlias,
+  ensureOpenClawPluginSdkAliasNodePath,
+} from "./plugin-sdk-dist-alias.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import type { PluginRegistryParams } from "./registry-types.js";
 import { createPluginRegistry, type PluginRecord, type PluginRegistry } from "./registry.js";
@@ -518,6 +521,11 @@ function runPluginRegisterSync(
 }
 
 function createPluginModuleLoader(options: Pick<PluginLoadOptions, "pluginSdkResolution">) {
+  ensureOpenClawPluginSdkAliasNodePath({
+    argv1: process.argv[1],
+    moduleUrl: import.meta.url,
+    cwd: process.cwd(),
+  });
   const moduleLoaders: PluginModuleLoaderCache = createPluginModuleLoaderCache();
   const createLoaderForModule = (modulePath: string) => {
     return getCachedPluginModuleLoader({

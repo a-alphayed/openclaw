@@ -71,6 +71,9 @@ describe("discordMessageActions", () => {
       "thread-create",
       "thread-list",
       "thread-reply",
+      "thread-bind-session",
+      "thread-member-add",
+      "thread-member-remove",
       "search",
       "sticker",
       "member-info",
@@ -118,6 +121,9 @@ describe("discordMessageActions", () => {
       "thread-create",
       "thread-list",
       "thread-reply",
+      "thread-bind-session",
+      "thread-member-add",
+      "thread-member-remove",
       "search",
       "sticker",
       "member-info",
@@ -179,6 +185,9 @@ describe("discordMessageActions", () => {
       "thread-create",
       "thread-list",
       "thread-reply",
+      "thread-bind-session",
+      "thread-member-add",
+      "thread-member-remove",
       "search",
       "sticker",
       "member-info",
@@ -245,6 +254,9 @@ describe("discordMessageActions", () => {
       "thread-create",
       "thread-list",
       "thread-reply",
+      "thread-bind-session",
+      "thread-member-add",
+      "thread-member-remove",
       "search",
       "sticker",
       "member-info",
@@ -280,6 +292,9 @@ describe("discordMessageActions", () => {
       "thread-create",
       "thread-list",
       "thread-reply",
+      "thread-bind-session",
+      "thread-member-add",
+      "thread-member-remove",
       "search",
       "sticker",
       "member-info",
@@ -335,11 +350,14 @@ describe("discordMessageActions", () => {
     expect(discovery?.schema).toBeUndefined();
   });
 
-  it.each(["read", "search"])("routes %s actions through gateway execution mode", (action) => {
-    expect(discordMessageActions.resolveExecutionMode?.({ action: action as never })).toBe(
-      "gateway",
-    );
-  });
+  it.each(["read", "search", "thread-bind-session"])(
+    "routes %s actions through gateway execution mode",
+    (action) => {
+      expect(discordMessageActions.resolveExecutionMode?.({ action: action as never })).toBe(
+        "gateway",
+      );
+    },
+  );
 
   it.each(["send", "upload-file", "edit", "delete", "react", "pin", "poll"])(
     "routes %s actions through local execution mode",

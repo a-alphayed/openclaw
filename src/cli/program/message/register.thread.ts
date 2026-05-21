@@ -76,4 +76,48 @@ export function registerMessageThreadCommands(message: Command, helpers: Message
     .action(async (opts) => {
       await helpers.runMessageAction("thread-reply", opts);
     });
+
+  helpers
+    .withMessageBase(
+      thread
+        .command("bind-session")
+        .description("Bind a thread to an OpenClaw session")
+        .requiredOption("--thread-id <id>", "Thread id")
+        .requiredOption("--channel-id <id>", "Parent channel id")
+        .requiredOption("--target-session-key <key>", "Target session key"),
+    )
+    .option("--target-kind <kind>", "Binding target kind (acp or subagent)", "acp")
+    .option("--agent-id <id>", "Agent id")
+    .option("--label <label>", "Binding label")
+    .option("--thread-name <name>", "Thread name")
+    .option("--workflow-id <id>", "Workflow id")
+    .option("--workflow-role <role>", "Workflow role")
+    .option("--bound-by <name>", "Binding owner")
+    .action(async (opts) => {
+      await helpers.runMessageAction("thread-bind-session", opts);
+    });
+
+  helpers
+    .withMessageBase(
+      thread
+        .command("add-member")
+        .description("Add a member to a thread")
+        .requiredOption("--thread-id <id>", "Thread id")
+        .requiredOption("--user-id <id>", "Discord user id"),
+    )
+    .action(async (opts) => {
+      await helpers.runMessageAction("thread-member-add", opts);
+    });
+
+  helpers
+    .withMessageBase(
+      thread
+        .command("remove-member")
+        .description("Remove a member from a thread")
+        .requiredOption("--thread-id <id>", "Thread id")
+        .requiredOption("--user-id <id>", "Discord user id"),
+    )
+    .action(async (opts) => {
+      await helpers.runMessageAction("thread-member-remove", opts);
+    });
 }

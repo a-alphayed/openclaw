@@ -330,6 +330,31 @@ export async function handleDiscordMessageSendAction(ctx: DiscordMessagingAction
       );
       return jsonResult({ ok: true, result });
     }
+    case "threadMemberAdd":
+    case "threadMemberRemove": {
+      if (!ctx.isActionEnabled("threads")) {
+        throw new Error("Discord threads are disabled.");
+      }
+      const threadId = readStringParam(ctx.params, "threadId", {
+        required: true,
+      });
+      const userId = readStringParam(ctx.params, "userId", {
+        required: true,
+      });
+      const result =
+        ctx.action === "threadMemberAdd"
+          ? await discordMessagingActionRuntime.addThreadMemberDiscord(
+              threadId,
+              userId,
+              ctx.withOpts(),
+            )
+          : await discordMessagingActionRuntime.removeThreadMemberDiscord(
+              threadId,
+              userId,
+              ctx.withOpts(),
+            );
+      return jsonResult({ ok: true, result });
+    }
     default:
       return undefined;
   }

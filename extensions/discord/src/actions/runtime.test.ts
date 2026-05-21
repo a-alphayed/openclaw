@@ -20,6 +20,7 @@ const originalDiscordGuildActionRuntime = { ...discordGuildActionRuntime };
 const originalDiscordModerationActionRuntime = { ...discordModerationActionRuntime };
 
 const discordSendMocks = {
+  addThreadMemberDiscord: vi.fn(async () => ({})),
   banMemberDiscord: vi.fn(async () => ({})),
   createChannelDiscord: vi.fn(async () => ({
     id: "new-channel",
@@ -49,6 +50,7 @@ const discordSendMocks = {
   removeChannelPermissionDiscord: vi.fn(async () => ({ ok: true })),
   removeOwnReactionsDiscord: vi.fn(async () => ({ removed: ["👍"] })),
   removeReactionDiscord: vi.fn(async () => ({})),
+  removeThreadMemberDiscord: vi.fn(async () => ({})),
   searchMessagesDiscord: vi.fn(async () => ({})),
   sendDiscordComponentMessage: vi.fn(async () => ({})),
   sendMessageDiscord: vi.fn(async () => ({})),
@@ -61,6 +63,7 @@ const discordSendMocks = {
 };
 
 const {
+  addThreadMemberDiscord,
   createChannelDiscord,
   createThreadDiscord,
   deleteChannelDiscord,
@@ -77,6 +80,7 @@ const {
   removeChannelPermissionDiscord,
   removeOwnReactionsDiscord,
   removeReactionDiscord,
+  removeThreadMemberDiscord,
   searchMessagesDiscord,
   sendDiscordComponentMessage,
   sendMessageDiscord,
@@ -845,6 +849,33 @@ describe("handleDiscordMessagingAction", () => {
       thread,
       warning: "Discord thread was created, but sending the initial message failed.",
       initialMessageError: "missing access",
+    });
+  });
+
+  it("adds and removes thread members", async () => {
+    await handleMessagingAction(
+      "threadMemberAdd",
+      {
+        threadId: "T1",
+        userId: "U1",
+      },
+      enableAllActions,
+    );
+
+    await handleMessagingAction(
+      "threadMemberRemove",
+      {
+        threadId: "T1",
+        userId: "U1",
+      },
+      enableAllActions,
+    );
+
+    expect(addThreadMemberDiscord).toHaveBeenCalledWith("T1", "U1", {
+      cfg: DISCORD_TEST_CFG,
+    });
+    expect(removeThreadMemberDiscord).toHaveBeenCalledWith("T1", "U1", {
+      cfg: DISCORD_TEST_CFG,
     });
   });
 });

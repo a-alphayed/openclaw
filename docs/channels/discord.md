@@ -338,6 +338,20 @@ openclaw message thread create --channel discord --target channel:<forumId> \
 
 Forum parents do not accept Discord components. If you need components, send to the thread itself (`channel:<threadId>`).
 
+Example: bind a thread to a session target, then add or remove a user
+
+```bash
+openclaw message thread bind-session --channel discord --account <account> \
+  --thread-id <threadId> --channel-id <parentChannelId> \
+  --target-session-key <sessionKey> --agent-id <agentId>
+
+openclaw message thread add-member --channel discord --account <account> \
+  --thread-id <threadId> --user-id <discordUserId>
+
+openclaw message thread remove-member --channel discord --account <account> \
+  --thread-id <threadId> --user-id <discordUserId>
+```
+
 ## Interactive components
 
 OpenClaw supports Discord components v2 containers for agent messages. Use the message tool with a `components` payload. Interaction results are routed back to the agent as normal inbound messages and follow the existing Discord `replyToMode` settings.
@@ -1112,7 +1126,7 @@ Discord message actions include messaging, channel admin, moderation, presence, 
 
 Core examples:
 
-- messaging: `sendMessage`, `readMessages`, `editMessage`, `deleteMessage`, `threadReply`
+- messaging: `sendMessage`, `readMessages`, `editMessage`, `deleteMessage`, `threadReply`, `thread-bind-session`, `thread-member-add`, `thread-member-remove`
 - reactions: `react`, `reactions`, `emojiList`
 - moderation: `timeout`, `kick`, `ban`
 - presence: `setPresence`

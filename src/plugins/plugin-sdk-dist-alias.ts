@@ -1,6 +1,10 @@
 import fs from "node:fs";
+import Module from "node:module";
 import path from "node:path";
 import { writeJsonSync } from "../infra/json-files.js";
+import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
+
+type ModuleWithInitPaths = typeof Module & { _initPaths?: () => void };
 
 function writeRuntimeJsonFile(targetPath: string, value: unknown): void {
   writeJsonSync(targetPath, value);
@@ -53,4 +57,66 @@ export function ensureOpenClawPluginSdkAlias(distRoot: string): void {
       path.join(pluginSdkAliasDir, entry.name),
     );
   }
+}
+
+export type EnsureOpenClawPluginSdkAliasNodePathOptions = {
+  distRoot?: string;
+  packageRoot?: string | null;
+  cwd?: string;
+  argv1?: string;
+  moduleUrl?: string;
+};
+
+export function ensureOpenClawPluginSdkAliasNodePath(
+  options: EnsureOpenClawPluginSdkAliasNodePathOptions = {},
+): string | null {
+  const aliasNodeModules = resolveOpenClawPluginSdkAliasNodeModules(options);
+  if (!aliasNodeModules) {
+    return null;
+  }
+  addNodePath(aliasNodeModules);
+  return aliasNodeModules;
+}
+
+export function resolveOpenClawPluginSdkAliasNodeModules(
+  options: EnsureOpenClawPluginSdkAliasNodePathOptions = {},
+): string | null {
+  const distRoot = resolveOpenClawPluginSdkDistRoot(options);
+  if (!distRoot) {
+    return null;
+  }
+  ensureOpenClawPluginSdkAlias(distRoot);
+  const aliasNodeModules = path.join(distRoot, "extensions", "node_modules");
+  return fs.existsSync(path.join(aliasNodeModules, "openclaw", "package.json"))
+    ? aliasNodeModules
+    : null;
+}
+
+function resolveOpenClawPluginSdkDistRoot(
+  options: EnsureOpenClawPluginSdkAliasNodePathOptions,
+): string | null {
+  if (options.distRoot) {
+    return path.resolve(options.distRoot);
+  }
+  const packageRoot =
+    options.packageRoot ??
+    resolveOpenClawPackageRootSync({
+      cwd: options.cwd ?? process.cwd(),
+      argv1: options.argv1 ?? process.argv[1],
+      moduleUrl: options.moduleUrl,
+    });
+  if (!packageRoot) {
+    return null;
+  }
+  return path.basename(packageRoot) === "dist" ? packageRoot : path.join(packageRoot, "dist");
+}
+
+function addNodePath(nodeModulesPath: string): void {
+  const normalized = path.resolve(nodeModulesPath);
+  const existing = (process.env.NODE_PATH ?? "").split(path.delimiter).filter(Boolean);
+  if (!existing.some((entry) => path.resolve(entry) === normalized)) {
+    process.env.NODE_PATH = [normalized, ...existing].join(path.delimiter);
+  }
+  const initPaths = (Module as ModuleWithInitPaths)._initPaths;
+  initPaths?.();
 }

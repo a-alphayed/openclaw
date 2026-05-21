@@ -124,4 +124,90 @@ describe("registerMessageThreadCommands", () => {
     expect(defaultCall?.[1]?.message).toBe("hello");
     expect(defaultCall?.[1]).not.toHaveProperty("name");
   });
+
+  it("routes thread member commands to message actions", async () => {
+    const message = new Command().exitOverride();
+    registerMessageThreadCommands(message, createHelpers(runMessageAction));
+
+    await message.parseAsync(
+      [
+        "thread",
+        "bind-session",
+        "--channel",
+        "discord",
+        "--thread-id",
+        "thread-123",
+        "--channel-id",
+        "parent-789",
+        "--target-session-key",
+        "agent:malik:explicit:review",
+        "--agent-id",
+        "malik",
+        "--label",
+        "Malik review",
+        "--workflow-id",
+        "WF-123",
+      ],
+      { from: "user" },
+    );
+
+    expect(runMessageAction).toHaveBeenLastCalledWith(
+      "thread-bind-session",
+      expect.objectContaining({
+        channel: "discord",
+        threadId: "thread-123",
+        channelId: "parent-789",
+        targetSessionKey: "agent:malik:explicit:review",
+        agentId: "malik",
+        label: "Malik review",
+        workflowId: "WF-123",
+      }),
+    );
+
+    await message.parseAsync(
+      [
+        "thread",
+        "add-member",
+        "--channel",
+        "discord",
+        "--thread-id",
+        "thread-123",
+        "--user-id",
+        "user-456",
+      ],
+      { from: "user" },
+    );
+
+    expect(runMessageAction).toHaveBeenLastCalledWith(
+      "thread-member-add",
+      expect.objectContaining({
+        channel: "discord",
+        threadId: "thread-123",
+        userId: "user-456",
+      }),
+    );
+
+    await message.parseAsync(
+      [
+        "thread",
+        "remove-member",
+        "--channel",
+        "discord",
+        "--thread-id",
+        "thread-123",
+        "--user-id",
+        "user-456",
+      ],
+      { from: "user" },
+    );
+
+    expect(runMessageAction).toHaveBeenLastCalledWith(
+      "thread-member-remove",
+      expect.objectContaining({
+        channel: "discord",
+        threadId: "thread-123",
+        userId: "user-456",
+      }),
+    );
+  });
 });

@@ -105,6 +105,9 @@ function describeDiscordMessageTool({
     actions.add("thread-create");
     actions.add("thread-list");
     actions.add("thread-reply");
+    actions.add("thread-bind-session");
+    actions.add("thread-member-add");
+    actions.add("thread-member-remove");
   }
   if (discovery.isEnabled("search")) {
     actions.add("search");
@@ -164,7 +167,9 @@ function describeDiscordMessageTool({
 
 export const discordMessageActions: ChannelMessageActionAdapter = {
   resolveExecutionMode: ({ action }) =>
-    action === "read" || action === "search" ? "gateway" : "local",
+    action === "read" || action === "search" || action === "thread-bind-session"
+      ? "gateway"
+      : "local",
   describeMessageTool: describeDiscordMessageTool,
   extractToolSend: ({ args }) => {
     const action = normalizeOptionalString(args.action) ?? "";

@@ -27,6 +27,7 @@ export {
   timeoutMemberDiscord,
 } from "./send.guild.js";
 export {
+  addThreadMemberDiscord,
   createThreadDiscord,
   deleteMessageDiscord,
   DiscordThreadInitialMessageError,
@@ -36,6 +37,7 @@ export {
   listThreadsDiscord,
   pinMessageDiscord,
   readMessagesDiscord,
+  removeThreadMemberDiscord,
   searchMessagesDiscord,
   unpinMessageDiscord,
 } from "./send.messages.js";
