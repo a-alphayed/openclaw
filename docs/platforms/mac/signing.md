@@ -16,6 +16,7 @@ This app is usually built from [`scripts/package-mac-app.sh`](https://github.com
 - inject build metadata into Info.plist: `OpenClawBuildTimestamp` (UTC) and `OpenClawGitCommit` (short hash) so the About pane can show build, git, and debug/release channel.
 - **Packaging defaults to Node 24**: the script runs TS builds and the Control UI build. Node 22 LTS, currently `22.19+`, remains supported for compatibility.
 - reads `SIGN_IDENTITY` from the environment. Add `export SIGN_IDENTITY="Apple Development: Your Name (TEAMID)"` (or your Developer ID Application cert) to your shell rc to always sign with your cert. Ad-hoc signing requires explicit opt-in via `ALLOW_ADHOC_SIGNING=1` or `SIGN_IDENTITY="-"` (not recommended for permission testing).
+- preflights real signing identities by signing a temporary `/bin/echo` copy before mutating the app bundle. If macOS can see the certificate but cannot use its private key, the script fails early with the keychain repair hint.
 - runs a Team ID audit after signing and fails if any Mach-O inside the app bundle is signed by a different Team ID. Set `SKIP_TEAM_ID_CHECK=1` to bypass.
 
 ## Usage
@@ -28,6 +29,17 @@ ALLOW_ADHOC_SIGNING=1 scripts/package-mac-app.sh    # ad-hoc (permissions will n
 SIGN_IDENTITY="-" scripts/package-mac-app.sh        # explicit ad-hoc (same caveat)
 DISABLE_LIBRARY_VALIDATION=1 scripts/package-mac-app.sh   # dev-only Sparkle Team ID mismatch workaround
 ```
+
+## Private key access
+
+For local debug builds, the normal path is a real Apple signing identity in the login keychain. The certificate being listed by `security find-identity` is not enough: `codesign` also needs permission to use the matching private key. If the preflight fails with `errSecInternalComponent`, unlock the login keychain and allow Apple tooling/codesign to use the key, then rerun the packager:
+
+```bash
+security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login-keychain-password> "$HOME/Library/Keychains/login.keychain-db"
+```
+
+If you sign from a `.p12` export instead, keep the `.p12` file and export password as a matched pair. A `SecKeychainItemImport: MAC verification failed during PKCS12 import` error means the password does not match that `.p12` file.
 
 ### Ad-hoc Signing Note
 

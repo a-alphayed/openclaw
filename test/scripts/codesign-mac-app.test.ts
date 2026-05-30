@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,10 @@ function makeTempDir(prefix: string): string {
 
 function entitlementTemps(dir: string): string[] {
   return readdirSync(dir).filter((name) => name.startsWith("openclaw-entitlements"));
+}
+
+function preflightTemps(dir: string): string[] {
+  return readdirSync(dir).filter((name) => name.startsWith("openclaw-codesign-preflight"));
 }
 
 function runCodesign(args: string[], tempRoot: string) {
@@ -81,5 +85,37 @@ describe("codesign-mac-app temp file hygiene", () => {
 
     expect(result.status).not.toBe(0);
     expect(entitlementTemps(tempRoot)).toEqual([]);
+  });
+
+  it("fails before entitlement generation when the private key is inaccessible", () => {
+    const tempRoot = makeTempDir("openclaw-codesign-preflight-");
+    const binDir = path.join(tempRoot, "bin");
+    mkdirSync(binDir);
+    writeFileSync(
+      path.join(binDir, "codesign"),
+      "#!/usr/bin/env bash\nprintf 'mock errSecInternalComponent\\n' >&2\nexit 1\n",
+      { mode: 0o755 },
+    );
+    const app = path.join(tempRoot, "Fake.app");
+    mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
+
+    const result = spawnSync("bash", [scriptPath, app], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        SIGN_IDENTITY: "Apple Development: Example (TEAMID)",
+        TMPDIR: tempRoot,
+      },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "ERROR: Signing identity is visible but codesign could not use its private key.",
+    );
+    expect(result.stderr).toContain("mock errSecInternalComponent");
+    expect(entitlementTemps(tempRoot)).toEqual([]);
+    expect(preflightTemps(tempRoot)).toEqual([]);
   });
 });

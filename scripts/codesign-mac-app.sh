@@ -7,12 +7,17 @@ TIMESTAMP_MODE="${CODESIGN_TIMESTAMP:-auto}"
 DISABLE_LIBRARY_VALIDATION="${DISABLE_LIBRARY_VALIDATION:-0}"
 SKIP_TEAM_ID_CHECK="${SKIP_TEAM_ID_CHECK:-0}"
 ENT_TMP_DIR=""
+SIGNING_PREFLIGHT_TMP_DIR=""
 
 cleanup() {
   if [[ -n "$ENT_TMP_DIR" ]]; then
     rm -rf "$ENT_TMP_DIR"
   fi
+  if [[ -n "$SIGNING_PREFLIGHT_TMP_DIR" ]]; then
+    rm -rf "$SIGNING_PREFLIGHT_TMP_DIR"
+  fi
 }
+trap cleanup EXIT
 
 if [[ "${APP_BUNDLE}" == "--help" || "${APP_BUNDLE}" == "-h" ]]; then
   cat <<'HELP'
@@ -111,6 +116,39 @@ macOS restart.
 WARN
 fi
 
+preflight_signing_identity() {
+  if [[ "$IDENTITY" == "-" ]]; then
+    return 0
+  fi
+
+  SIGNING_PREFLIGHT_TMP_DIR=$(mktemp -d -t openclaw-codesign-preflight.XXXXXX)
+  local probe="$SIGNING_PREFLIGHT_TMP_DIR/echo"
+  local output
+  cp /bin/echo "$probe"
+
+  if output=$(codesign --force --timestamp=none --sign "$IDENTITY" "$probe" 2>&1); then
+    return 0
+  fi
+
+  cat >&2 <<ERROR
+ERROR: Signing identity is visible but codesign could not use its private key.
+
+Identity:
+  $IDENTITY
+
+codesign output:
+$output
+
+Fix: unlock the login keychain and allow codesign to use the private key, then
+rerun this script. For example:
+  security unlock-keychain "\$HOME/Library/Keychains/login.keychain-db"
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login-keychain-password> "\$HOME/Library/Keychains/login.keychain-db"
+
+If you sign through a p12 export, make sure the p12 file and its password match.
+ERROR
+  exit 1
+}
+
 timestamp_arg="--timestamp=none"
 case "$TIMESTAMP_MODE" in
   1|on|yes|true)
@@ -133,8 +171,9 @@ if [[ "$IDENTITY" == "-" ]]; then
   timestamp_arg="--timestamp=none"
 fi
 
+preflight_signing_identity
+
 ENT_TMP_DIR=$(mktemp -d -t openclaw-entitlements.XXXXXX)
-trap cleanup EXIT
 ENT_TMP_APP="$ENT_TMP_DIR/app.plist"
 
 options_args=()
