@@ -1,3 +1,7 @@
+"plugin: mentat-malik-graph-wake":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/mentat-malik-graph-wake/**"
 "plugin: azure-speech":
   - changed-files:
       - any-glob-to-any-file:

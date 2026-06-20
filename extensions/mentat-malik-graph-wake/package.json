@@ -1,0 +1,13 @@
+{
+  "name": "@openclaw/mentat-malik-graph-wake",
+  "version": "2026.6.20",
+  "private": true,
+  "description": "OpenClaw-owned Malik sandbox Microsoft Graph wake bridge",
+  "type": "module",
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}

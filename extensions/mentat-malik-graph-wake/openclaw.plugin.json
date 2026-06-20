@@ -1,0 +1,24 @@
+{
+  "id": "mentat-malik-graph-wake",
+  "activation": {
+    "onStartup": true
+  },
+  "name": "Mentat Malik Graph Wake",
+  "description": "Sandbox-only Microsoft Graph webhook wake bridge for Malik Mentat workflows.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "path": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1064,6 +1064,12 @@ importers:
         specifier: workspace:*
         version: link:../..
 
+  extensions/mentat-malik-graph-wake:
+    devDependencies:
+      '@openclaw/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+
   extensions/microsoft:
     dependencies:
       node-edge-tts:
