@@ -228,6 +228,28 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects reversed approved source time bounds even when a selector is present", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        sourceScope: {
+          selector: "subject:Malik sandbox E2E",
+          receivedAfter: "2026-06-20T18:00:00.000Z",
+          receivedBefore: "2026-06-20T17:00:00.000Z",
+        },
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "source_scope_unavailable",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
   it("fetches only the approved scoped source before posting the bounded wake", async () => {
     const deps = createDeps();
 
@@ -266,6 +288,21 @@ describe("Malik sandbox Graph wake bridge", () => {
       workflowActions: [{ family: "purchase_orders", action: "create_po" }],
       sourceRefs: ["source-ref-redacted"],
     });
+  });
+
+  it("blocks when the approved scoped source is empty", async () => {
+    const deps = createDeps({ sourceRefs: [] });
+
+    const response = await postNotification(deps);
+
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "source_scope_empty",
+    });
+    expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
   it("deduplicates repeated notifications by idempotency key", async () => {

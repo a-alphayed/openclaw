@@ -51,8 +51,15 @@ export type ScopedSourceFetchRequest = {
   notification: GraphNotificationSummary;
 };
 
+export type ScopedSourceBlockReason =
+  | "host_graph_source_unconfigured"
+  | "host_graph_source_unavailable"
+  | "source_outside_approved_scope";
+
 export type ScopedSourceFetchResult = {
   sourceRefs: string[];
+  blockedReason?: ScopedSourceBlockReason;
+  hostStatus?: string;
 };
 
 export type MalikAgentWakeRequest = {
@@ -123,6 +130,7 @@ type BlockReason =
   | "notification_resource_not_approved"
   | "source_scope_unavailable"
   | "source_scope_empty"
+  | ScopedSourceBlockReason
   | "host_poster_rejected";
 
 export function createMalikSandboxGraphWakeState(): MalikSandboxGraphWakeState {
@@ -229,6 +237,13 @@ export async function handleMalikSandboxGraphWakeRequest(
       sourceScope: activeWindow.sourceScope,
       notification: redactNotification(notification.value),
     });
+    if (sourceResult.blockedReason) {
+      return blocked(
+        sourceResult.blockedReason,
+        sourceResult.hostStatus ? { hostStatus: sourceResult.hostStatus } : undefined,
+      );
+    }
+
     const sourceRefs = sourceResult.sourceRefs.filter((ref) => ref.trim().length > 0);
     if (sourceRefs.length === 0) {
       return blocked("source_scope_empty");
@@ -351,21 +366,23 @@ function hasSandboxSafeRecipientPlan(
 }
 
 function hasApprovedSourceScope(sourceScope: MalikSandboxSourceScope): boolean {
-  if (sourceScope.selector?.trim()) {
-    return true;
+  const hasSelector = Boolean(sourceScope.selector?.trim());
+  const hasReceivedAfter = Boolean(sourceScope.receivedAfter?.trim());
+  const hasReceivedBefore = Boolean(sourceScope.receivedBefore?.trim());
+  if (hasReceivedAfter || hasReceivedBefore) {
+    if (!sourceScope.receivedAfter || !sourceScope.receivedBefore) {
+      return false;
+    }
+
+    const receivedAfter = Date.parse(sourceScope.receivedAfter);
+    const receivedBefore = Date.parse(sourceScope.receivedBefore);
+    if (!Number.isFinite(receivedAfter) || !Number.isFinite(receivedBefore)) {
+      return false;
+    }
+    return receivedAfter < receivedBefore;
   }
 
-  if (!sourceScope.receivedAfter || !sourceScope.receivedBefore) {
-    return false;
-  }
-
-  const receivedAfter = Date.parse(sourceScope.receivedAfter);
-  const receivedBefore = Date.parse(sourceScope.receivedBefore);
-  return (
-    Number.isFinite(receivedAfter) &&
-    Number.isFinite(receivedBefore) &&
-    receivedAfter < receivedBefore
-  );
+  return hasSelector;
 }
 
 function buildWakeRequest(params: {

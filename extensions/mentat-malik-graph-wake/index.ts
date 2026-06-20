@@ -3,6 +3,7 @@ import {
   createMalikSandboxGraphWakeHandler,
   createMalikSandboxGraphWakeState,
 } from "./src/bridge.js";
+import { createMalikSandboxGraphWakeHostDependencies } from "./src/host-adapter.js";
 
 const DEFAULT_ROUTE_PATH = "/plugins/mentat/malik-sandbox-graph-wake";
 
@@ -36,15 +37,12 @@ export default definePluginEntry({
       return;
     }
 
-    const handler = createMalikSandboxGraphWakeHandler({
-      state: createMalikSandboxGraphWakeState(),
-      loadActiveWindow: async () => null,
-      fetchScopedSource: async () => ({ sourceRefs: [] }),
-      postAgentWake: async () => ({
-        accepted: false,
-        status: "host_poster_unconfigured",
+    const handler = createMalikSandboxGraphWakeHandler(
+      createMalikSandboxGraphWakeHostDependencies({
+        api,
+        state: createMalikSandboxGraphWakeState(),
       }),
-    });
+    );
 
     api.registerHttpRoute({
       path: config.path,
