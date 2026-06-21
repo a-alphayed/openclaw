@@ -18,6 +18,161 @@
       },
       "description": {
         "type": "string"
+      },
+      "activeWindow": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "approved",
+          "expiresAt",
+          "mailbox",
+          "graphResourcePrefix",
+          "runtimeProfile",
+          "netSuiteTarget",
+          "allowedActions",
+          "sourceScope",
+          "clientStateSha256"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "approved": {
+            "const": true
+          },
+          "expiresAt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "mailbox": {
+            "const": "malik-mentat@outlook.com"
+          },
+          "graphResourcePrefix": {
+            "const": "users/malik-mentat@outlook.com/mailFolders/inbox/messages"
+          },
+          "runtimeProfile": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["environmentClass", "environmentId"],
+            "properties": {
+              "environmentClass": {
+                "const": "sandbox"
+              },
+              "environmentId": {
+                "const": "netsuite-sandbox"
+              }
+            }
+          },
+          "netSuiteTarget": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["environmentClass", "environmentId"],
+            "properties": {
+              "environmentClass": {
+                "const": "sandbox"
+              },
+              "environmentId": {
+                "const": "netsuite-sandbox"
+              }
+            }
+          },
+          "allowedActions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["family", "action"],
+              "properties": {
+                "family": {
+                  "const": "purchase_orders"
+                },
+                "action": {
+                  "const": "create_po"
+                }
+              }
+            }
+          },
+          "sourceScope": {
+            "type": "object",
+            "additionalProperties": false,
+            "anyOf": [
+              {
+                "required": ["selector"]
+              },
+              {
+                "required": ["receivedAfter", "receivedBefore"]
+              }
+            ],
+            "dependentRequired": {
+              "receivedAfter": ["receivedBefore"],
+              "receivedBefore": ["receivedAfter"]
+            },
+            "properties": {
+              "selector": {
+                "type": "string",
+                "minLength": 1
+              },
+              "receivedAfter": {
+                "type": "string",
+                "minLength": 1
+              },
+              "receivedBefore": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "sandboxSafeRecipientPlan": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["enabled", "recipients"],
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "recipients": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          "clientStateSha256": {
+            "type": "string",
+            "pattern": "^[a-fA-F0-9]{64}$"
+          }
+        }
+      },
+      "graph": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bearerTokenRef"],
+        "properties": {
+          "bearerTokenRef": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "provider", "id"],
+            "properties": {
+              "source": {
+                "enum": ["env", "file", "exec"]
+              },
+              "provider": {
+                "type": "string",
+                "minLength": 1
+              },
+              "id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
       }
     }
   }
