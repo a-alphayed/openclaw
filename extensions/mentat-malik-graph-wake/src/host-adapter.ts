@@ -93,7 +93,7 @@ export function createMalikSandboxGraphWakeHostDependencies(
         env,
         fetchGraph,
       }),
-    postAgentWake: async (request) => await postRuntimeSubagentWake(options.api, request),
+    postAgentWake: async (request) => await scheduleHostWake(options.api, request),
   };
 }
 
@@ -211,23 +211,33 @@ async function fetchScopedGraphSource(params: {
   };
 }
 
-async function postRuntimeSubagentWake(
+async function scheduleHostWake(
   api: OpenClawPluginApi,
   request: MalikAgentWakeRequest,
 ): Promise<AgentWakePostResult> {
+  const schedulerAgentId = readDedicatedAgentIdFromSessionKey(request.sessionKey);
+  if (schedulerAgentId !== MALIK_SANDBOX_OPENCLAW_AGENT_ID) {
+    return { accepted: false, status: "host_scheduler_agent_mismatch" };
+  }
+
   try {
-    const result = await api.runtime.subagent.run({
+    const wakeId = sha256Hex(request.idempotencyKey).slice(0, 32);
+    const result = await api.session.workflow.scheduleSessionTurn({
       sessionKey: request.sessionKey,
+      agentId: schedulerAgentId,
       message: buildWakeMessage(request),
-      deliver: false,
-      lane: "subagent",
-      lightContext: true,
-      extraSystemPrompt: SANDBOX_WAKE_EXTRA_SYSTEM_PROMPT,
-      idempotencyKey: request.idempotencyKey,
+      delayMs: 1,
+      deleteAfterRun: true,
+      deliveryMode: "none",
+      name: `malik-sandbox-wake-${wakeId}`,
+      tag: "malik-sandbox-wake",
     });
-    return { accepted: true, runId: result.runId };
+    if (!result?.id) {
+      return { accepted: false, status: "host_scheduler_rejected" };
+    }
+    return { accepted: true, wakeId };
   } catch {
-    return { accepted: false, status: "runtime_subagent_rejected" };
+    return { accepted: false, status: "host_scheduler_rejected" };
   }
 }
 
@@ -307,6 +317,11 @@ function findAgentEntries(list: unknown[], agentId: string): Record<string, unkn
 function readAgentIdFromSessionKey(sessionKey: string): string | undefined {
   const match = /^agent:([^:]+):/.exec(sessionKey.trim().toLowerCase());
   return match?.[1];
+}
+
+function readDedicatedAgentIdFromSessionKey(sessionKey: string): string | undefined {
+  const agentId = readAgentIdFromSessionKey(sessionKey);
+  return agentId === MALIK_SANDBOX_OPENCLAW_AGENT_ID ? agentId : undefined;
 }
 
 function riskyCapabilitiesDenied(deny: string[]): boolean {

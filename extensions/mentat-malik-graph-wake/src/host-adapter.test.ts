@@ -8,6 +8,7 @@ import {
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
   type MalikSandboxGraphWakeDependencies,
+  type MalikAgentWakeRequest,
 } from "./bridge.js";
 import {
   createMalikSandboxGraphWakeHostDependencies,
@@ -136,13 +137,16 @@ function createHarness(params?: {
   graphResponse?: Record<string, unknown>;
   graphOk?: boolean;
   openClawConfig?: Record<string, unknown>;
-  subagentRun?: ReturnType<typeof vi.fn>;
+  scheduleSessionTurn?: ReturnType<typeof vi.fn>;
 }): {
   deps: MalikSandboxGraphWakeDependencies;
   fetchGraph: ReturnType<typeof vi.fn>;
+  scheduleSessionTurn: ReturnType<typeof vi.fn>;
   subagentRun: ReturnType<typeof vi.fn>;
 } {
-  const subagentRun = params?.subagentRun ?? vi.fn(async () => ({ runId: "run-redacted" }));
+  const scheduleSessionTurn =
+    params?.scheduleSessionTurn ?? vi.fn(async () => ({ id: "wake-redacted" }));
+  const subagentRun = vi.fn(async () => ({ runId: "run-redacted" }));
   const fetchGraph = vi.fn(async () => ({
     ok: params?.graphOk ?? true,
     status: params?.graphOk === false ? 404 : 200,
@@ -151,6 +155,7 @@ function createHarness(params?: {
   const api = createTestPluginApi({
     pluginConfig: params?.config ?? pluginConfig(),
     config: (params?.openClawConfig ?? openClawConfigFixture()) as OpenClawPluginApi["config"],
+    scheduleSessionTurn,
     runtime: {
       subagent: {
         run: subagentRun,
@@ -164,7 +169,7 @@ function createHarness(params?: {
     now: () => new Date("2026-06-20T17:30:00.000Z"),
     state: createMalikSandboxGraphWakeState(),
   });
-  return { deps, fetchGraph, subagentRun };
+  return { deps, fetchGraph, scheduleSessionTurn, subagentRun };
 }
 
 async function postNotification(
@@ -472,7 +477,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
 
     const response = await postNotification(deps);
 
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(fetchGraph).toHaveBeenCalledTimes(1);
     expect(fetchGraph).toHaveBeenCalledWith(
       "https://graph.microsoft.com/v1.0/users/malik-mentat%40outlook.com/messages/AAMk-redacted?$select=id,subject,receivedDateTime,internetMessageId",
@@ -498,7 +503,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
       ),
     );
 
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(fetchGraph).toHaveBeenCalledTimes(1);
     const [url] = fetchGraph.mock.calls[0];
     expect(url).toBe(
@@ -517,7 +522,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
       graphNotification(EXPECTED_CLIENT_STATE, "Users/opaque-user/Messages/AAMk%2Fopaque+id"),
     );
 
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(fetchGraph).toHaveBeenCalledTimes(1);
     const [url] = fetchGraph.mock.calls[0];
     expect(url).toBe(
@@ -592,11 +597,11 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(subagentRun).not.toHaveBeenCalled();
   });
 
-  it("blocks when the runtime subagent poster rejects the wake", async () => {
-    const subagentRun = vi.fn(async () => {
-      throw new Error("runtime rejected with raw detail");
+  it("blocks when the host scheduler rejects the wake", async () => {
+    const scheduleSessionTurn = vi.fn(async () => {
+      throw new Error("scheduler rejected with raw detail");
     });
-    const { deps, subagentRun: runMock } = createHarness({ subagentRun });
+    const { deps, scheduleSessionTurn: scheduleMock } = createHarness({ scheduleSessionTurn });
 
     const response = await postNotification(deps);
 
@@ -604,50 +609,149 @@ describe("Malik sandbox Graph wake host adapter", () => {
       ok: false,
       status: "blocked",
       reason: "host_poster_rejected",
-      hostStatus: "runtime_subagent_rejected",
+      hostStatus: "host_scheduler_rejected",
     });
     expect(JSON.stringify(response.body)).not.toContain("raw detail");
-    expect(runMock).toHaveBeenCalledTimes(1);
+    expect(scheduleMock).toHaveBeenCalledTimes(1);
   });
 
-  it("posts the wake through runtime subagent with deliver false and idempotency", async () => {
-    const { deps, subagentRun } = createHarness();
+  it("blocks when the host scheduler returns no handle", async () => {
+    const scheduleSessionTurn = vi.fn(async () => undefined);
+    const { deps } = createHarness({ scheduleSessionTurn });
 
     const response = await postNotification(deps);
 
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
-    expect(subagentRun).toHaveBeenCalledTimes(1);
-    const [runParams] = subagentRun.mock.calls[0];
-    expect(runParams).toMatchObject({
-      sessionKey: "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
-      deliver: false,
-      lane: "subagent",
-      lightContext: true,
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "host_poster_rejected",
+      hostStatus: "host_scheduler_rejected",
     });
-    expect(runParams.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
-    expect(runParams.extraSystemPrompt).toContain("Malik Mentat sandbox Graph wake lane");
-    expect(runParams.extraSystemPrompt).toContain("Do not use old Malik email, Fleet, NetSuite");
-    expect(runParams.extraSystemPrompt).toContain("Do not send vendor/customer email");
-    expect(runParams.extraSystemPrompt).toContain("Graph notifications as wake signals only");
-    expect(runParams.message).toContain("Mentat Malik sandbox Graph webhook wake");
-    expect(runParams.message).toContain("purchase_orders.create_po");
-    expect(runParams.message).toContain('"graphNotificationAuthority":"wake_only"');
-    expect(runParams.message).toContain('"emailSend":false');
-    expect(runParams.message).toContain('"netSuiteMutation":false');
-    expect(runParams.message).toContain("blocked_without_approved_sandbox_safe_recipient_plan");
-    expect(runParams.message).toContain(`"dedicatedAgentId":"${MALIK_SANDBOX_OPENCLAW_AGENT_ID}"`);
-    expect(runParams.message).toContain('"sessionKeyAgentIdMatchesValidatedAgent":true');
-    expect(runParams.message).toContain('"riskyCapabilitiesDenied":true');
-    expect(runParams.message).toContain('"rawValuesRedacted":true');
-    expect(runParams.message).not.toContain(FAKE_GRAPH_TOKEN);
-    expect(runParams.message).not.toContain(EXPECTED_CLIENT_STATE);
-    expect(runParams.message).not.toContain("AAMk-redacted");
-    expect(runParams.message).not.toContain("Malik sandbox E2E");
-    expect(runParams.message).not.toContain("malik-mentat-sandbox-workspace");
-    expect(runParams.message).not.toContain("malik-mentat-sandbox-agent");
-    expect(runParams.extraSystemPrompt).not.toContain(FAKE_GRAPH_TOKEN);
-    expect(runParams.extraSystemPrompt).not.toContain(EXPECTED_CLIENT_STATE);
-    expect(runParams.extraSystemPrompt).not.toContain("AAMk-redacted");
-    expect(runParams.extraSystemPrompt).not.toContain("Malik sandbox E2E");
+  });
+
+  it("fails closed when the scheduler wake session key agent is not dedicated", async () => {
+    const { deps, scheduleSessionTurn } = createHarness();
+
+    const result = await deps.postAgentWake({
+      message: "Mentat Malik sandbox Graph webhook wake",
+      sessionKey: "agent:malik:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+      wakeMode: "isolated",
+      deliver: false,
+      idempotencyKey: "malik-sandbox-graph-wake:test-mismatched-agent",
+      payload: {
+        bridge: "microsoft_graph_webhook",
+        sandboxWindowId: "sandbox-window-2026-06-20",
+        mailbox: MALIK_SANDBOX_MAILBOX,
+        runtimeProfile: {
+          environmentClass: "sandbox",
+          environmentId: "netsuite-sandbox",
+        },
+        netSuiteTarget: {
+          environmentClass: "sandbox",
+          environmentId: "netsuite-sandbox",
+        },
+        workflowActions: [{ family: "purchase_orders", action: "create_po" }],
+        sourceScope: {
+          selector: "subject:Malik sandbox E2E",
+          receivedAfter: "2026-06-20T17:00:00.000Z",
+          receivedBefore: "2026-06-20T18:00:00.000Z",
+        },
+        sourceRefs: ["source-ref-redacted"],
+        notification: {
+          subscriptionId: "subscription-redacted",
+          changeType: "created",
+          resource: GRAPH_RESOURCE,
+        },
+        restrictedWakeTarget: {
+          agentIdValidated: true,
+          sessionKeyAgentIdMatchesValidatedAgent: false,
+          agentEntryPresent: true,
+          dedicatedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+          explicitWorkspace: true,
+          explicitAgentDir: true,
+          workspaceDistinctFromMalik: true,
+          agentDirDistinctFromMalik: true,
+          sandboxEnabled: true,
+          workspaceAccessRestricted: true,
+          toolsProfileMinimal: true,
+          fsWorkspaceOnly: true,
+          riskyCapabilitiesDenied: true,
+          rawValuesRedacted: true,
+        },
+      },
+    } satisfies MalikAgentWakeRequest);
+
+    expect(result).toEqual({ accepted: false, status: "host_scheduler_agent_mismatch" });
+    expect(scheduleSessionTurn).not.toHaveBeenCalled();
+  });
+
+  it("schedules the wake through host scheduler with no delivery and a bounded wake id", async () => {
+    const { deps, scheduleSessionTurn, subagentRun } = createHarness();
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: true,
+      status: "wake_scheduled",
+    });
+    const wakeId = (response.body as { wakeId?: unknown }).wakeId;
+    expect(typeof wakeId).toBe("string");
+    const wakeIdString = wakeId as string;
+    expect(wakeIdString).toMatch(/^[a-f0-9]{32}$/);
+    expect(wakeIdString).not.toBe("wake-redacted");
+    expect(JSON.stringify(response.body)).not.toContain("wake-redacted");
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(1);
+    expect(subagentRun).not.toHaveBeenCalled();
+    const [scheduleParams] = scheduleSessionTurn.mock.calls[0];
+    expect(scheduleParams).toMatchObject({
+      sessionKey: "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+      agentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+      delayMs: 1,
+      deleteAfterRun: true,
+      deliveryMode: "none",
+      tag: "malik-sandbox-wake",
+    });
+    expect(scheduleParams.name).toMatch(/^malik-sandbox-wake-[a-f0-9]{32}$/);
+    expect(scheduleParams.name).toBe(`malik-sandbox-wake-${wakeIdString}`);
+    expect(scheduleParams.name).not.toContain(":");
+    expect(scheduleParams.tag).not.toContain(":");
+    expect(scheduleParams.message).toContain("Mentat Malik sandbox Graph webhook wake");
+    expect(scheduleParams.message).toContain("purchase_orders.create_po");
+    expect(scheduleParams.message).toContain('"graphNotificationAuthority":"wake_only"');
+    expect(scheduleParams.message).toContain('"emailSend":false');
+    expect(scheduleParams.message).toContain('"netSuiteMutation":false');
+    expect(scheduleParams.message).toContain(
+      "blocked_without_approved_sandbox_safe_recipient_plan",
+    );
+    expect(scheduleParams.message).toContain(
+      `"dedicatedAgentId":"${MALIK_SANDBOX_OPENCLAW_AGENT_ID}"`,
+    );
+    expect(scheduleParams.message).toContain('"sessionKeyAgentIdMatchesValidatedAgent":true');
+    expect(scheduleParams.message).toContain('"riskyCapabilitiesDenied":true');
+    expect(scheduleParams.message).toContain('"rawValuesRedacted":true');
+    expect(scheduleParams.message).not.toContain(FAKE_GRAPH_TOKEN);
+    expect(scheduleParams.message).not.toContain(EXPECTED_CLIENT_STATE);
+    expect(scheduleParams.message).not.toContain("AAMk-redacted");
+    expect(scheduleParams.message).not.toContain("Malik sandbox E2E");
+    expect(scheduleParams.message).not.toContain("malik-mentat-sandbox-workspace");
+    expect(scheduleParams.message).not.toContain("malik-mentat-sandbox-agent");
+  });
+
+  it("does not schedule a second turn for duplicate notifications", async () => {
+    const { deps, scheduleSessionTurn } = createHarness();
+
+    const first = await postNotification(deps);
+    const second = await postNotification(deps);
+
+    expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    const wakeId = (first.body as { wakeId?: unknown }).wakeId;
+    expect(typeof wakeId).toBe("string");
+    const wakeIdString = wakeId as string;
+    expect(wakeIdString).toMatch(/^[a-f0-9]{32}$/);
+    expect(wakeIdString).not.toBe("wake-redacted");
+    expect(second.body).toMatchObject({ ok: true, status: "duplicate", wakeId: wakeIdString });
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(second.body)).not.toContain("wake-redacted");
   });
 });

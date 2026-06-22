@@ -107,7 +107,7 @@ function createDeps(params?: {
       }
       return { sourceRefs: params?.sourceRefs ?? ["source-ref-redacted"] };
     }),
-    postAgentWake: vi.fn(async () => ({ accepted: true, runId: "run-redacted" })),
+    postAgentWake: vi.fn(async () => ({ accepted: true, wakeId: "wake-redacted" })),
   };
 }
 
@@ -156,7 +156,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     );
 
     expect(response.statusCode).toBe(202);
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
@@ -328,7 +328,7 @@ describe("Malik sandbox Graph wake bridge", () => {
 
     const response = await postNotification(deps);
 
-    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
@@ -380,8 +380,8 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(response.statusCode).toBe(202);
     expect(response.body).toMatchObject({
       ok: true,
-      status: "wake_posted",
-      runId: "run-redacted",
+      status: "wake_scheduled",
+      wakeId: "wake-redacted",
     });
     expect(deps.fetchScopedSource).toHaveBeenCalledWith({
       mailbox: MALIK_SANDBOX_MAILBOX,
@@ -470,7 +470,11 @@ describe("Malik sandbox Graph wake bridge", () => {
     await postNotification(deps);
     const response = await postNotification(deps);
 
-    expect(response.body).toMatchObject({ ok: true, status: "duplicate" });
+    expect(response.body).toMatchObject({
+      ok: true,
+      status: "duplicate",
+      wakeId: "wake-redacted",
+    });
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
@@ -486,7 +490,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       graphNotification("expected-client-state", "Users/opaque-two/Messages/AAMk-same-message"),
     );
 
-    expect(first.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(second.body).toMatchObject({ ok: true, status: "duplicate" });
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
     expect((second.body as Record<string, unknown>).idempotencyKey).toBe(
@@ -507,7 +511,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     const firstResponse = await first;
 
     expect(second.body).toMatchObject({ ok: true, status: "coalesced" });
-    expect(firstResponse.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(firstResponse.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });

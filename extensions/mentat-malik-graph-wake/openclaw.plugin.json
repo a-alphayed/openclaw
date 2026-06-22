@@ -3,9 +3,6 @@
   "activation": {
     "onStartup": true
   },
-  "contracts": {
-    "gatewayMethodDispatch": ["authenticated-request"]
-  },
   "name": "Mentat Malik Graph Wake",
   "description": "Sandbox-only Microsoft Graph webhook wake bridge for Malik Mentat workflows.",
   "configSchema": {

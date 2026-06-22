@@ -119,13 +119,13 @@ export type MalikAgentWakeRequest = {
 
 export type AgentWakePostResult = {
   accepted: boolean;
-  runId?: string;
+  wakeId?: string;
   status?: string;
 };
 
 export type MalikSandboxGraphWakeState = {
   inFlightScopes: Set<string>;
-  completedByIdempotencyKey: Map<string, { runId?: string }>;
+  completedByIdempotencyKey: Map<string, { wakeId?: string }>;
 };
 
 export type MalikSandboxGraphWakeDependencies = {
@@ -282,7 +282,7 @@ export async function handleMalikSandboxGraphWakeRequest(
     return jsonResponse(202, {
       ok: true,
       status: "duplicate",
-      runId: previous.runId,
+      wakeId: previous.wakeId,
       idempotencyKey,
     });
   }
@@ -326,11 +326,11 @@ export async function handleMalikSandboxGraphWakeRequest(
     if (!postResult.accepted) {
       return blocked("host_poster_rejected", { hostStatus: postResult.status ?? "rejected" });
     }
-    deps.state.completedByIdempotencyKey.set(idempotencyKey, { runId: postResult.runId });
+    deps.state.completedByIdempotencyKey.set(idempotencyKey, { wakeId: postResult.wakeId });
     return jsonResponse(202, {
       ok: true,
-      status: "wake_posted",
-      runId: postResult.runId,
+      status: "wake_scheduled",
+      wakeId: postResult.wakeId,
       idempotencyKey,
       restrictedWakeTarget: targetValidation.proof,
     });
