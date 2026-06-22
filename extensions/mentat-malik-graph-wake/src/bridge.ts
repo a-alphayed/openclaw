@@ -112,8 +112,16 @@ export type GraphWakeHttpResponse = {
   body: string | Record<string, unknown>;
 };
 
-type ParsedGraphNotification = GraphNotificationSummary & {
+type RawGraphNotification = GraphNotificationSummary & {
   clientState: string;
+};
+
+type ParsedGraphNotification = RawGraphNotification & {
+  messageId: string;
+};
+
+export type OutlookMessageNotificationResource = {
+  messageId: string;
 };
 
 type BlockReason =
@@ -209,9 +217,10 @@ export async function handleMalikSandboxGraphWakeRequest(
   if (!windowCheck.ok) {
     return blocked(windowCheck.reason);
   }
+  const parsedNotification = windowCheck.notification;
 
   const scopeKey = buildScopeKey(activeWindow);
-  const idempotencyKey = buildIdempotencyKey(activeWindow, notification.value);
+  const idempotencyKey = buildIdempotencyKey(activeWindow, parsedNotification);
   const previous = deps.state.completedByIdempotencyKey.get(idempotencyKey);
   if (previous) {
     return jsonResponse(202, {
@@ -235,7 +244,7 @@ export async function handleMalikSandboxGraphWakeRequest(
       sandboxWindowId: activeWindow.id,
       mailbox: MALIK_SANDBOX_MAILBOX,
       sourceScope: activeWindow.sourceScope,
-      notification: redactNotification(notification.value),
+      notification: redactNotification(parsedNotification),
     });
     if (sourceResult.blockedReason) {
       return blocked(
@@ -252,7 +261,7 @@ export async function handleMalikSandboxGraphWakeRequest(
     const wakeRequest = buildWakeRequest({
       activeWindow,
       idempotencyKey,
-      notification: redactNotification(notification.value),
+      notification: redactNotification(parsedNotification),
       sourceRefs,
     });
     const postResult = await deps.postAgentWake(wakeRequest);
@@ -273,7 +282,7 @@ export async function handleMalikSandboxGraphWakeRequest(
 
 function parseGraphNotification(
   body: string,
-): { ok: true; value: ParsedGraphNotification } | { ok: false; reason: BlockReason } {
+): { ok: true; value: RawGraphNotification } | { ok: false; reason: BlockReason } {
   let parsed: unknown;
   try {
     parsed = body.trim() ? JSON.parse(body) : null;
@@ -308,9 +317,9 @@ function parseGraphNotification(
 
 function validateActiveWindow(
   activeWindow: MalikSandboxGraphWakeWindow | null,
-  notification: ParsedGraphNotification,
+  notification: RawGraphNotification,
   now: Date,
-): { ok: true } | { ok: false; reason: BlockReason } {
+): { ok: true; notification: ParsedGraphNotification } | { ok: false; reason: BlockReason } {
   if (!activeWindow || !activeWindow.approved) {
     return { ok: false, reason: "sandbox_window_unavailable" };
   }
@@ -347,16 +356,20 @@ function validateActiveWindow(
   if (!activeWindow.verifyClientState(notification.clientState)) {
     return { ok: false, reason: "client_state_mismatch" };
   }
-  if (
-    !activeWindow.graphResourcePrefix ||
-    !notification.resource.startsWith(activeWindow.graphResourcePrefix)
-  ) {
+
+  // graphResourcePrefix is the approved subscription scope, not a byte-prefix
+  // assertion against Graph's delivered changed-resource path.
+  if (!activeWindow.graphResourcePrefix) {
+    return { ok: false, reason: "notification_resource_not_approved" };
+  }
+  const parsedResource = parseOutlookMessageNotificationResource(notification.resource);
+  if (!parsedResource) {
     return { ok: false, reason: "notification_resource_not_approved" };
   }
   if (!hasApprovedSourceScope(activeWindow.sourceScope)) {
     return { ok: false, reason: "source_scope_unavailable" };
   }
-  return { ok: true };
+  return { ok: true, notification: { ...notification, messageId: parsedResource.messageId } };
 }
 
 function hasSandboxSafeRecipientPlan(
@@ -434,7 +447,7 @@ function buildIdempotencyKey(
         windowId: activeWindow.id,
         mailbox: MALIK_SANDBOX_MAILBOX,
         subscriptionId: notification.subscriptionId,
-        resource: notification.resource,
+        messageId: notification.messageId,
         changeType: notification.changeType,
       }),
     )
@@ -489,6 +502,75 @@ async function readIncomingRequestBody(req: IncomingMessage): Promise<string> {
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+export function parseOutlookMessageNotificationResource(
+  resource: string,
+): OutlookMessageNotificationResource | null {
+  const normalized = normalizeGraphNotificationResource(resource);
+  if (!normalized) {
+    return null;
+  }
+
+  const segments = normalized.split("/");
+  if (segments.length === 4) {
+    const [usersSegment, userSegment, messagesSegment, messageIdSegment] = segments;
+    if (
+      matchesGraphFixedSegment(usersSegment, "users") &&
+      userSegment &&
+      matchesGraphFixedSegment(messagesSegment, "messages")
+    ) {
+      return parseMessageIdSegment(messageIdSegment);
+    }
+    return null;
+  }
+
+  if (segments.length === 6) {
+    const [
+      usersSegment,
+      mailboxSegment,
+      mailFoldersSegment,
+      folderSegment,
+      messagesSegment,
+      messageIdSegment,
+    ] = segments;
+    if (
+      matchesGraphFixedSegment(usersSegment, "users") &&
+      mailboxSegment.toLowerCase() === MALIK_SANDBOX_MAILBOX &&
+      matchesGraphFixedSegment(mailFoldersSegment, "mailFolders") &&
+      matchesGraphFixedSegment(folderSegment, "inbox") &&
+      matchesGraphFixedSegment(messagesSegment, "messages")
+    ) {
+      return parseMessageIdSegment(messageIdSegment);
+    }
+  }
+
+  return null;
+}
+
+function normalizeGraphNotificationResource(resource: string): string | null {
+  const trimmed = resource.trim();
+  if (!trimmed || trimmed.includes("?") || trimmed.endsWith("/")) {
+    return null;
+  }
+  const normalized = trimmed.replace(/^\/+/, "");
+  return normalized && !normalized.includes("//") ? normalized : null;
+}
+
+function matchesGraphFixedSegment(value: string, expected: string): boolean {
+  return value.toLowerCase() === expected.toLowerCase();
+}
+
+function parseMessageIdSegment(value: string): OutlookMessageNotificationResource | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const messageId = decodeURIComponent(value);
+    return messageId.trim() ? { messageId } : null;
+  } catch {
+    return null;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -221,7 +221,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
     }
   });
 
-  it("builds a narrow Graph message request for the approved Malik mailbox", async () => {
+  it("still accepts the old no-live fixture path and fetches through the approved mailbox", async () => {
     const { deps, fetchGraph } = createHarness();
 
     const response = await postNotification(deps);
@@ -229,7 +229,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
     expect(fetchGraph).toHaveBeenCalledTimes(1);
     expect(fetchGraph).toHaveBeenCalledWith(
-      "https://graph.microsoft.com/v1.0/users/malik-mentat%40outlook.com/mailFolders/inbox/messages/AAMk-redacted?$select=id,subject,receivedDateTime,internetMessageId",
+      "https://graph.microsoft.com/v1.0/users/malik-mentat%40outlook.com/messages/AAMk-redacted?$select=id,subject,receivedDateTime,internetMessageId",
       {
         method: "GET",
         headers: {
@@ -238,6 +238,65 @@ describe("Malik sandbox Graph wake host adapter", () => {
         },
       },
     );
+  });
+
+  it("fetches canonical notification message ids through the approved mailbox", async () => {
+    const { deps, fetchGraph } = createHarness();
+    const divergentUserSegment = "divergent-user@opaque-tenant";
+
+    const response = await postNotification(
+      deps,
+      graphNotification(
+        EXPECTED_CLIENT_STATE,
+        `users/${divergentUserSegment}/messages/AAMk-redacted`,
+      ),
+    );
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(fetchGraph).toHaveBeenCalledTimes(1);
+    const [url] = fetchGraph.mock.calls[0];
+    expect(url).toBe(
+      "https://graph.microsoft.com/v1.0/users/malik-mentat%40outlook.com/messages/AAMk-redacted?$select=id,subject,receivedDateTime,internetMessageId",
+    );
+    expect(url).not.toContain(divergentUserSegment);
+  });
+
+  it("URL-encodes opaque notification message ids in the Graph GET URL", async () => {
+    const { deps, fetchGraph } = createHarness({
+      graphResponse: graphMessage({ id: "AAMk/opaque+id" }),
+    });
+
+    const response = await postNotification(
+      deps,
+      graphNotification(EXPECTED_CLIENT_STATE, "Users/opaque-user/Messages/AAMk%2Fopaque+id"),
+    );
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(fetchGraph).toHaveBeenCalledTimes(1);
+    const [url] = fetchGraph.mock.calls[0];
+    expect(url).toBe(
+      "https://graph.microsoft.com/v1.0/users/malik-mentat%40outlook.com/messages/AAMk%2Fopaque%2Bid?$select=id,subject,receivedDateTime,internetMessageId",
+    );
+  });
+
+  it("rejects malformed notification resources before Graph fetch", async () => {
+    const { deps, fetchGraph, subagentRun } = createHarness();
+
+    const response = await postNotification(
+      deps,
+      graphNotification(
+        EXPECTED_CLIENT_STATE,
+        "users/malik-mentat@outlook.com/mailFolders/archive/messages/AAMk-redacted",
+      ),
+    );
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "notification_resource_not_approved",
+    });
+    expect(fetchGraph).not.toHaveBeenCalled();
+    expect(subagentRun).not.toHaveBeenCalled();
   });
 
   it("blocks Graph source results outside the approved selector before wake", async () => {

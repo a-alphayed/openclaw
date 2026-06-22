@@ -10,6 +10,7 @@ import {
   type MalikSandboxGraphWakeState,
   type MalikSandboxGraphWakeWindow,
   type MalikSandboxSourceScope,
+  parseOutlookMessageNotificationResource,
   type RuntimeProfileRef,
   type ScopedSourceFetchRequest,
   type ScopedSourceFetchResult,
@@ -45,10 +46,6 @@ export type MalikSandboxGraphWakeHostAdapterOptions = {
 
 type GraphConfig = {
   bearerTokenRef: unknown;
-};
-
-type ParsedGraphMessageResource = {
-  messageId: string;
 };
 
 export function createMalikSandboxGraphWakeHostDependencies(
@@ -140,7 +137,9 @@ async function fetchScopedGraphSource(params: {
     return { sourceRefs: [], blockedReason: "host_graph_source_unconfigured" };
   }
 
-  const parsedResource = parseGraphMessageResource(params.request.notification.resource);
+  const parsedResource = parseOutlookMessageNotificationResource(
+    params.request.notification.resource,
+  );
   if (!parsedResource) {
     return { sourceRefs: [], blockedReason: "source_outside_approved_scope" };
   }
@@ -299,27 +298,12 @@ function readSandboxSafeRecipientPlan(
   };
 }
 
-function parseGraphMessageResource(resource: string): ParsedGraphMessageResource | null {
-  const prefix = `users/${MALIK_SANDBOX_MAILBOX}/mailFolders/inbox/messages/`;
-  const normalized = normalizeGraphResourcePrefix(resource);
-  if (!normalized?.startsWith(prefix)) {
-    return null;
-  }
-  const messageId = normalized.slice(prefix.length);
-  if (!messageId || messageId.includes("/") || messageId.includes("?")) {
-    return null;
-  }
-  return { messageId };
-}
-
 function buildGraphMessageUrl(messageId: string): string {
   return (
     [
       GRAPH_BASE_URL,
       "users",
       encodeURIComponent(MALIK_SANDBOX_MAILBOX),
-      "mailFolders",
-      "inbox",
       "messages",
       encodeURIComponent(messageId),
     ].join("/") + `?$select=${GRAPH_SELECT_FIELDS}`

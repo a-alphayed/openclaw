@@ -35,14 +35,17 @@ function windowFixture(
   };
 }
 
-function graphNotification(clientState = "expected-client-state") {
+function graphNotification(
+  clientState = "expected-client-state",
+  resource = "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-redacted",
+) {
   return {
     value: [
       {
         subscriptionId: "subscription-redacted",
         clientState,
         changeType: "created",
-        resource: "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-redacted",
+        resource,
       },
     ],
   };
@@ -99,6 +102,23 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(response.body).toBe("hello sandbox");
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("accepts Graph message resources even though graphResourcePrefix is subscription scope", async () => {
+    const deps = createDeps();
+
+    const response = await postNotification(
+      deps,
+      graphNotification(
+        "expected-client-state",
+        "users/opaque-user-segment/messages/AAMk-redacted",
+      ),
+    );
+
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when there is no active approved sandbox window", async () => {
@@ -228,6 +248,23 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects non-message Graph resources before fetching source", async () => {
+    const deps = createDeps();
+
+    const response = await postNotification(
+      deps,
+      graphNotification("expected-client-state", "users/opaque-user-segment/events/AAMk-redacted"),
+    );
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "notification_resource_not_approved",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
   it("rejects reversed approved source time bounds even when a selector is present", async () => {
     const deps = createDeps({
       window: windowFixture({
@@ -313,6 +350,26 @@ describe("Malik sandbox Graph wake bridge", () => {
 
     expect(response.body).toMatchObject({ ok: true, status: "duplicate" });
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates accepted resource shape variants by parsed message id", async () => {
+    const deps = createDeps();
+
+    const first = await postNotification(
+      deps,
+      graphNotification("expected-client-state", "users/opaque-one/messages/AAMk-same-message"),
+    );
+    const second = await postNotification(
+      deps,
+      graphNotification("expected-client-state", "Users/opaque-two/Messages/AAMk-same-message"),
+    );
+
+    expect(first.body).toMatchObject({ ok: true, status: "wake_posted" });
+    expect(second.body).toMatchObject({ ok: true, status: "duplicate" });
+    expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
+    expect((second.body as Record<string, unknown>).idempotencyKey).toBe(
+      (first.body as Record<string, unknown>).idempotencyKey,
+    );
   });
 
   it("coalesces concurrent notifications through single-flight", async () => {
