@@ -40,6 +40,11 @@ function readManifestConfigSchema(): JsonRecord {
   return requireRecord(manifest.configSchema, "configSchema");
 }
 
+function readManifestContracts(): JsonRecord {
+  const manifest = readJsonRecord(new URL("./openclaw.plugin.json", import.meta.url));
+  return requireRecord(manifest.contracts, "contracts");
+}
+
 function readJsonRecord(url: URL): JsonRecord {
   return requireRecord(JSON.parse(readFileSync(url, "utf8")), url.pathname);
 }
@@ -257,6 +262,11 @@ describe("mentat malik graph wake plugin registration", () => {
     expect(route.auth).toBe("plugin");
     expect(route.match).toBe("exact");
   });
+});
+
+it("declares Gateway method dispatch for route-local sandbox wake posting", () => {
+  const contracts = readManifestContracts();
+  expect(contracts.gatewayMethodDispatch).toEqual(["authenticated-request"]);
 });
 
 describe("mentat malik graph wake manifest config schema", () => {
