@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 export const MALIK_SANDBOX_MAILBOX = "malik-mentat@outlook.com";
+// Private sandbox bridge target: the host config currently uses Malik's agent id.
+const MALIK_OPENCLAW_AGENT_ID = "malik";
 const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -406,7 +408,7 @@ function buildWakeRequest(params: {
 }): MalikAgentWakeRequest {
   return {
     message: "Mentat Malik sandbox Graph webhook wake",
-    sessionKey: `mentat:malik:sandbox:${params.activeWindow.id}`,
+    sessionKey: `agent:${MALIK_OPENCLAW_AGENT_ID}:mentat-sandbox:${params.activeWindow.id}`,
     wakeMode: "isolated",
     deliver: false,
     idempotencyKey: params.idempotencyKey,

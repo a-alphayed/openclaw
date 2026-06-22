@@ -373,7 +373,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const [runParams] = subagentRun.mock.calls[0];
     expect(runParams).toMatchObject({
-      sessionKey: "mentat:malik:sandbox:sandbox-window-2026-06-20",
+      sessionKey: "agent:malik:mentat-sandbox:sandbox-window-2026-06-20",
       deliver: false,
     });
     expect(runParams.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);

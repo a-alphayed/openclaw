@@ -315,7 +315,10 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
     const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
     expect(wakeRequest.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
-    expect(wakeRequest.sessionKey).toBe("mentat:malik:sandbox:sandbox-window-2026-06-20");
+    expect(wakeRequest.sessionKey).toBe("agent:malik:mentat-sandbox:sandbox-window-2026-06-20");
+    // OpenClaw src/routing/session-key.ts treats only agent:<id>:<rest> as
+    // agent-scoped; the old mentat:malik:sandbox alias falls to the default agent.
+    expect(wakeRequest.sessionKey).toMatch(/^agent:malik:mentat-sandbox:[A-Za-z0-9._:-]+$/);
     expect(wakeRequest.payload).toMatchObject({
       mailbox: MALIK_SANDBOX_MAILBOX,
       runtimeProfile: {
