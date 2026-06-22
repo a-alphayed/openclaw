@@ -3,6 +3,7 @@ import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "../api.js";
 import {
+  MALIK_SANDBOX_OPENCLAW_AGENT_ID,
   MALIK_SANDBOX_MAILBOX,
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
@@ -62,6 +63,50 @@ function pluginConfig(overrides?: Record<string, unknown>): Record<string, unkno
   };
 }
 
+function sandboxAgentConfig(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+    workspace: "~/openclaw/malik-mentat-sandbox-workspace",
+    agentDir: "~/openclaw/malik-mentat-sandbox-agent",
+    sandbox: {
+      mode: "all",
+      workspaceAccess: "none",
+    },
+    tools: {
+      profile: "minimal",
+      fs: {
+        workspaceOnly: true,
+      },
+      deny: ["group:messaging", "group:runtime", "group:web", "group:sessions"],
+    },
+    ...overrides,
+  };
+}
+
+function openClawConfigFixture(params?: {
+  sandboxAgent?: Record<string, unknown> | null;
+  sandboxAgents?: Record<string, unknown>[];
+  legacyAgent?: Record<string, unknown> | null;
+}): Record<string, unknown> {
+  const legacyAgent =
+    params && "legacyAgent" in params
+      ? params.legacyAgent
+      : {
+          id: "malik",
+          workspace: "~/openclaw/malik-legacy-workspace",
+          agentDir: "~/openclaw/malik-legacy-agent",
+        };
+  const sandboxAgent =
+    params && "sandboxAgent" in params ? params.sandboxAgent : sandboxAgentConfig();
+  const sandboxAgents =
+    params && "sandboxAgents" in params ? params.sandboxAgents : sandboxAgent ? [sandboxAgent] : [];
+  return {
+    agents: {
+      list: [legacyAgent, ...sandboxAgents].filter(Boolean),
+    },
+  };
+}
+
 function graphNotification(clientState = EXPECTED_CLIENT_STATE, resource = GRAPH_RESOURCE) {
   return {
     value: [
@@ -90,6 +135,7 @@ function createHarness(params?: {
   env?: NodeJS.ProcessEnv;
   graphResponse?: Record<string, unknown>;
   graphOk?: boolean;
+  openClawConfig?: Record<string, unknown>;
   subagentRun?: ReturnType<typeof vi.fn>;
 }): {
   deps: MalikSandboxGraphWakeDependencies;
@@ -104,7 +150,7 @@ function createHarness(params?: {
   })) satisfies MalikSandboxGraphFetch;
   const api = createTestPluginApi({
     pluginConfig: params?.config ?? pluginConfig(),
-    config: {} as OpenClawPluginApi["config"],
+    config: (params?.openClawConfig ?? openClawConfigFixture()) as OpenClawPluginApi["config"],
     runtime: {
       subagent: {
         run: subagentRun,
@@ -164,6 +210,202 @@ describe("Malik sandbox Graph wake host adapter", () => {
     });
     expect(fetchGraph).not.toHaveBeenCalled();
     expect(subagentRun).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before Graph fetch when the dedicated sandbox agent is missing", async () => {
+    const { deps, fetchGraph, subagentRun } = createHarness({
+      openClawConfig: openClawConfigFixture({ sandboxAgent: null }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_wake_target_unavailable",
+      restrictedWakeTarget: {
+        agentEntryPresent: false,
+        dedicatedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+        rawValuesRedacted: true,
+      },
+    });
+    expect(fetchGraph).not.toHaveBeenCalled();
+    expect(subagentRun).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before Graph fetch when dedicated sandbox agent entries are duplicated", async () => {
+    const { deps, fetchGraph, subagentRun } = createHarness({
+      openClawConfig: openClawConfigFixture({
+        sandboxAgents: [
+          sandboxAgentConfig({ workspace: "~/openclaw/first-sandbox-workspace" }),
+          sandboxAgentConfig({ workspace: "~/openclaw/second-sandbox-workspace" }),
+        ],
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_wake_target_not_restricted",
+      restrictedWakeTarget: {
+        agentEntryPresent: true,
+        agentIdValidated: false,
+        rawValuesRedacted: true,
+      },
+    });
+    const body = JSON.stringify(response.body);
+    expect(body).not.toContain("first-sandbox-workspace");
+    expect(body).not.toContain("second-sandbox-workspace");
+    expect(fetchGraph).not.toHaveBeenCalled();
+    expect(subagentRun).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the dedicated sandbox agent shares legacy Malik paths", async () => {
+    const { deps, fetchGraph, subagentRun } = createHarness({
+      openClawConfig: openClawConfigFixture({
+        legacyAgent: {
+          id: "malik",
+          workspace: "~/openclaw/shared-malik-workspace",
+          agentDir: "~/openclaw/shared-malik-agent",
+        },
+        sandboxAgent: sandboxAgentConfig({
+          workspace: "~/openclaw/shared-malik-workspace",
+          agentDir: "~/openclaw/shared-malik-agent",
+        }),
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_wake_target_not_restricted",
+      restrictedWakeTarget: {
+        workspaceDistinctFromMalik: false,
+        agentDirDistinctFromMalik: false,
+        rawValuesRedacted: true,
+      },
+    });
+    const body = JSON.stringify(response.body);
+    expect(body).not.toContain("shared-malik-workspace");
+    expect(body).not.toContain("shared-malik-agent");
+    expect(fetchGraph).not.toHaveBeenCalled();
+    expect(subagentRun).not.toHaveBeenCalled();
+  });
+
+  it("requires absolute sandbox and tool guardrails on the dedicated agent", async () => {
+    const cases = [
+      {
+        label: "writable workspace access",
+        sandboxAgent: sandboxAgentConfig({ sandbox: { mode: "all", workspaceAccess: "rw" } }),
+        expected: { workspaceAccessRestricted: false },
+      },
+      {
+        label: "sandbox off",
+        sandboxAgent: sandboxAgentConfig({ sandbox: { mode: "off", workspaceAccess: "none" } }),
+        expected: { sandboxEnabled: false },
+      },
+      {
+        label: "non-minimal tools",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "coding",
+            fs: { workspaceOnly: true },
+            deny: ["group:messaging", "group:runtime", "group:web", "group:sessions"],
+          },
+        }),
+        expected: { toolsProfileMinimal: false },
+      },
+      {
+        label: "filesystem not workspace-only",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: false },
+            deny: ["group:messaging", "group:runtime", "group:web", "group:sessions"],
+          },
+        }),
+        expected: { fsWorkspaceOnly: false },
+      },
+      {
+        label: "missing concrete risky capability denial",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: true },
+            deny: ["group:messaging", "group:runtime", "group:web"],
+          },
+        }),
+        expected: { riskyCapabilitiesDenied: false },
+      },
+      {
+        label: "partial outbound send denial",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: true },
+            deny: ["message", "group:runtime", "group:web", "group:sessions"],
+          },
+        }),
+        expected: { riskyCapabilitiesDenied: false },
+      },
+      {
+        label: "partial runtime denial",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: true },
+            deny: ["group:messaging", "exec", "group:web", "group:sessions"],
+          },
+        }),
+        expected: { riskyCapabilitiesDenied: false },
+      },
+      {
+        label: "partial egress denial",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: true },
+            deny: ["group:messaging", "group:runtime", "browser", "group:sessions"],
+          },
+        }),
+        expected: { riskyCapabilitiesDenied: false },
+      },
+      {
+        label: "partial spawn denial",
+        sandboxAgent: sandboxAgentConfig({
+          tools: {
+            profile: "minimal",
+            fs: { workspaceOnly: true },
+            deny: ["group:messaging", "group:runtime", "group:web", "subagents"],
+          },
+        }),
+        expected: { riskyCapabilitiesDenied: false },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { deps, fetchGraph, subagentRun } = createHarness({
+        openClawConfig: openClawConfigFixture({ sandboxAgent: testCase.sandboxAgent }),
+      });
+
+      const response = await postNotification(deps);
+
+      expect(response.body, testCase.label).toMatchObject({
+        ok: false,
+        status: "blocked",
+        reason: "sandbox_wake_target_not_restricted",
+        restrictedWakeTarget: {
+          ...testCase.expected,
+          rawValuesRedacted: true,
+        },
+      });
+      expect(fetchGraph).not.toHaveBeenCalled();
+      expect(subagentRun).not.toHaveBeenCalled();
+    }
   });
 
   it("verifies clientState by digest without echoing mismatched values", async () => {
@@ -377,7 +619,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const [runParams] = subagentRun.mock.calls[0];
     expect(runParams).toMatchObject({
-      sessionKey: "agent:malik:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+      sessionKey: "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
       deliver: false,
       lane: "subagent",
       lightContext: true,
@@ -393,10 +635,16 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(runParams.message).toContain('"emailSend":false');
     expect(runParams.message).toContain('"netSuiteMutation":false');
     expect(runParams.message).toContain("blocked_without_approved_sandbox_safe_recipient_plan");
+    expect(runParams.message).toContain(`"dedicatedAgentId":"${MALIK_SANDBOX_OPENCLAW_AGENT_ID}"`);
+    expect(runParams.message).toContain('"sessionKeyAgentIdMatchesValidatedAgent":true');
+    expect(runParams.message).toContain('"riskyCapabilitiesDenied":true');
+    expect(runParams.message).toContain('"rawValuesRedacted":true');
     expect(runParams.message).not.toContain(FAKE_GRAPH_TOKEN);
     expect(runParams.message).not.toContain(EXPECTED_CLIENT_STATE);
     expect(runParams.message).not.toContain("AAMk-redacted");
     expect(runParams.message).not.toContain("Malik sandbox E2E");
+    expect(runParams.message).not.toContain("malik-mentat-sandbox-workspace");
+    expect(runParams.message).not.toContain("malik-mentat-sandbox-agent");
     expect(runParams.extraSystemPrompt).not.toContain(FAKE_GRAPH_TOKEN);
     expect(runParams.extraSystemPrompt).not.toContain(EXPECTED_CLIENT_STATE);
     expect(runParams.extraSystemPrompt).not.toContain("AAMk-redacted");

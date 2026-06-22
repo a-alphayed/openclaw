@@ -2,8 +2,7 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 export const MALIK_SANDBOX_MAILBOX = "malik-mentat@outlook.com";
-// Private sandbox bridge target: the host config currently uses Malik's agent id.
-const MALIK_OPENCLAW_AGENT_ID = "malik";
+export const MALIK_SANDBOX_OPENCLAW_AGENT_ID = "malik-mentat-sandbox";
 export const MALIK_SANDBOX_WINDOW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -65,6 +64,39 @@ export type ScopedSourceFetchResult = {
   hostStatus?: string;
 };
 
+export type RestrictedWakeTargetProof = {
+  agentIdValidated: boolean;
+  sessionKeyAgentIdMatchesValidatedAgent: boolean;
+  agentEntryPresent: boolean;
+  dedicatedAgentId: typeof MALIK_SANDBOX_OPENCLAW_AGENT_ID;
+  explicitWorkspace: boolean;
+  explicitAgentDir: boolean;
+  workspaceDistinctFromMalik: boolean;
+  agentDirDistinctFromMalik: boolean;
+  sandboxEnabled: boolean;
+  workspaceAccessRestricted: boolean;
+  toolsProfileMinimal: boolean;
+  fsWorkspaceOnly: boolean;
+  riskyCapabilitiesDenied: boolean;
+  rawValuesRedacted: true;
+};
+
+export type RestrictedWakeTargetValidationResult =
+  | {
+      ok: true;
+      proof: RestrictedWakeTargetProof;
+    }
+  | {
+      ok: false;
+      reason: "sandbox_wake_target_unavailable" | "sandbox_wake_target_not_restricted";
+      proof: RestrictedWakeTargetProof;
+    };
+
+export type RestrictedWakeTargetValidationRequest = {
+  sessionKey: string;
+  expectedAgentId: typeof MALIK_SANDBOX_OPENCLAW_AGENT_ID;
+};
+
 export type MalikAgentWakeRequest = {
   message: string;
   sessionKey: string;
@@ -81,6 +113,7 @@ export type MalikAgentWakeRequest = {
     sourceScope: MalikSandboxSourceScope;
     sourceRefs: string[];
     notification: GraphNotificationSummary;
+    restrictedWakeTarget: RestrictedWakeTargetProof;
   };
 };
 
@@ -98,6 +131,9 @@ export type MalikSandboxGraphWakeState = {
 export type MalikSandboxGraphWakeDependencies = {
   state: MalikSandboxGraphWakeState;
   loadActiveWindow: () => Promise<MalikSandboxGraphWakeWindow | null>;
+  validateWakeTarget: (
+    request: RestrictedWakeTargetValidationRequest,
+  ) => Promise<RestrictedWakeTargetValidationResult>;
   fetchScopedSource: (request: ScopedSourceFetchRequest) => Promise<ScopedSourceFetchResult>;
   postAgentWake: (request: MalikAgentWakeRequest) => Promise<AgentWakePostResult>;
   now?: () => Date;
@@ -142,6 +178,8 @@ type BlockReason =
   | "notification_resource_not_approved"
   | "source_scope_unavailable"
   | "source_scope_empty"
+  | "sandbox_wake_target_unavailable"
+  | "sandbox_wake_target_not_restricted"
   | ScopedSourceBlockReason
   | "host_poster_rejected";
 
@@ -226,6 +264,16 @@ export async function handleMalikSandboxGraphWakeRequest(
     return blocked(windowCheck.reason);
   }
   const parsedNotification = windowCheck.notification;
+  const sessionKey = buildSandboxWakeSessionKey(activeWindow.id);
+  const targetValidation = await deps.validateWakeTarget({
+    sessionKey,
+    expectedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+  });
+  if (!targetValidation.ok) {
+    return blocked(targetValidation.reason, {
+      restrictedWakeTarget: targetValidation.proof,
+    });
+  }
 
   const scopeKey = buildScopeKey(activeWindow);
   const idempotencyKey = buildIdempotencyKey(activeWindow, parsedNotification);
@@ -270,6 +318,8 @@ export async function handleMalikSandboxGraphWakeRequest(
       activeWindow,
       idempotencyKey,
       notification: redactNotification(parsedNotification),
+      restrictedWakeTarget: targetValidation.proof,
+      sessionKey,
       sourceRefs,
     });
     const postResult = await deps.postAgentWake(wakeRequest);
@@ -282,6 +332,7 @@ export async function handleMalikSandboxGraphWakeRequest(
       status: "wake_posted",
       runId: postResult.runId,
       idempotencyKey,
+      restrictedWakeTarget: targetValidation.proof,
     });
   } finally {
     deps.state.inFlightScopes.delete(scopeKey);
@@ -413,11 +464,13 @@ function buildWakeRequest(params: {
   activeWindow: MalikSandboxGraphWakeWindow;
   idempotencyKey: string;
   notification: GraphNotificationSummary;
+  restrictedWakeTarget: RestrictedWakeTargetProof;
+  sessionKey: string;
   sourceRefs: string[];
 }): MalikAgentWakeRequest {
   return {
     message: "Mentat Malik sandbox Graph webhook wake",
-    sessionKey: `agent:${MALIK_OPENCLAW_AGENT_ID}:subagent:mentat-sandbox-${params.activeWindow.id}`,
+    sessionKey: params.sessionKey,
     wakeMode: "isolated",
     deliver: false,
     idempotencyKey: params.idempotencyKey,
@@ -431,8 +484,13 @@ function buildWakeRequest(params: {
       sourceScope: { ...params.activeWindow.sourceScope },
       sourceRefs: [...params.sourceRefs],
       notification: params.notification,
+      restrictedWakeTarget: params.restrictedWakeTarget,
     },
   };
+}
+
+export function buildSandboxWakeSessionKey(windowId: string): string {
+  return `agent:${MALIK_SANDBOX_OPENCLAW_AGENT_ID}:subagent:mentat-sandbox-${windowId}`;
 }
 
 function buildScopeKey(activeWindow: MalikSandboxGraphWakeWindow): string {

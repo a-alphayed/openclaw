@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  MALIK_SANDBOX_OPENCLAW_AGENT_ID,
   MALIK_SANDBOX_MAILBOX,
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
   isSafeSandboxWindowId,
   type MalikSandboxGraphWakeDependencies,
   type MalikSandboxGraphWakeWindow,
+  type RestrictedWakeTargetProof,
 } from "./bridge.js";
 
 function windowFixture(
@@ -52,16 +54,53 @@ function graphNotification(
   };
 }
 
+function restrictedWakeTargetProof(
+  overrides?: Partial<RestrictedWakeTargetProof>,
+): RestrictedWakeTargetProof {
+  return {
+    agentIdValidated: true,
+    sessionKeyAgentIdMatchesValidatedAgent: true,
+    agentEntryPresent: true,
+    dedicatedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+    explicitWorkspace: true,
+    explicitAgentDir: true,
+    workspaceDistinctFromMalik: true,
+    agentDirDistinctFromMalik: true,
+    sandboxEnabled: true,
+    workspaceAccessRestricted: true,
+    toolsProfileMinimal: true,
+    fsWorkspaceOnly: true,
+    riskyCapabilitiesDenied: true,
+    rawValuesRedacted: true,
+    ...overrides,
+  };
+}
+
 function createDeps(params?: {
   window?: MalikSandboxGraphWakeWindow | null;
   sourceRefs?: string[];
   fetchDelay?: Promise<void>;
+  targetProof?: RestrictedWakeTargetProof;
+  targetValidationOk?: boolean;
 }): MalikSandboxGraphWakeDependencies {
   const activeWindow = params && "window" in params ? params.window : windowFixture();
+  const targetProof = params?.targetProof ?? restrictedWakeTargetProof();
   return {
     state: createMalikSandboxGraphWakeState(),
     now: () => new Date("2026-06-20T17:30:00.000Z"),
     loadActiveWindow: vi.fn(async () => activeWindow),
+    validateWakeTarget: vi.fn(async () =>
+      params?.targetValidationOk === false
+        ? {
+            ok: false,
+            reason: "sandbox_wake_target_not_restricted",
+            proof: targetProof,
+          }
+        : {
+            ok: true,
+            proof: targetProof,
+          },
+    ),
     fetchScopedSource: vi.fn(async () => {
       if (params?.fetchDelay) {
         await params.fetchDelay;
@@ -231,6 +270,32 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
+  it("validates the restricted wake target before fetching source", async () => {
+    const targetProof = restrictedWakeTargetProof({ riskyCapabilitiesDenied: false });
+    const deps = createDeps({
+      targetProof,
+      targetValidationOk: false,
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_wake_target_not_restricted",
+      restrictedWakeTarget: {
+        riskyCapabilitiesDenied: false,
+        rawValuesRedacted: true,
+      },
+    });
+    expect(deps.validateWakeTarget).toHaveBeenCalledWith({
+      expectedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+      sessionKey: "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
   it("requires a complete approved source time window when no selector is present", async () => {
     const deps = createDeps({
       window: windowFixture({
@@ -336,10 +401,10 @@ describe("Malik sandbox Graph wake bridge", () => {
     const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
     expect(wakeRequest.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
     expect(wakeRequest.sessionKey).toBe(
-      "agent:malik:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+      "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
     );
     expect(wakeRequest.sessionKey).toMatch(
-      /^agent:malik:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
+      /^agent:malik-mentat-sandbox:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
     );
     expect(wakeRequest.sessionKey).not.toContain("agent:malik:mentat-sandbox:");
     expect(wakeRequest.payload).toMatchObject({
@@ -350,6 +415,10 @@ describe("Malik sandbox Graph wake bridge", () => {
       },
       workflowActions: [{ family: "purchase_orders", action: "create_po" }],
       sourceRefs: ["source-ref-redacted"],
+      restrictedWakeTarget: restrictedWakeTargetProof(),
+    });
+    expect(response.body).toMatchObject({
+      restrictedWakeTarget: restrictedWakeTargetProof(),
     });
   });
 
@@ -366,11 +435,17 @@ describe("Malik sandbox Graph wake bridge", () => {
 
     const firstWake = vi.mocked(firstDeps.postAgentWake).mock.calls[0][0];
     const secondWake = vi.mocked(secondDeps.postAgentWake).mock.calls[0][0];
-    expect(firstWake.sessionKey).toBe("agent:malik:subagent:mentat-sandbox-sandbox-window-A");
-    expect(secondWake.sessionKey).toBe("agent:malik:subagent:mentat-sandbox-sandbox-window-B");
+    expect(firstWake.sessionKey).toBe(
+      "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-A",
+    );
+    expect(secondWake.sessionKey).toBe(
+      "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-B",
+    );
     expect(firstWake.sessionKey).not.toBe(secondWake.sessionKey);
     for (const key of [firstWake.sessionKey, secondWake.sessionKey]) {
-      expect(key).toMatch(/^agent:malik:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
+      expect(key).toMatch(
+        /^agent:malik-mentat-sandbox:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
+      );
     }
   });
 

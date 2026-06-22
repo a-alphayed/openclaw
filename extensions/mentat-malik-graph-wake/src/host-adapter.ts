@@ -3,6 +3,7 @@ import { isSecretRef } from "openclaw/plugin-sdk/secret-input";
 import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/secret-input-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import {
+  MALIK_SANDBOX_OPENCLAW_AGENT_ID,
   MALIK_SANDBOX_MAILBOX,
   isSafeSandboxWindowId,
   parseOutlookMessageNotificationResource,
@@ -12,6 +13,9 @@ import {
   type MalikSandboxGraphWakeState,
   type MalikSandboxGraphWakeWindow,
   type MalikSandboxSourceScope,
+  type RestrictedWakeTargetProof,
+  type RestrictedWakeTargetValidationRequest,
+  type RestrictedWakeTargetValidationResult,
   type RuntimeProfileRef,
   type ScopedSourceFetchRequest,
   type ScopedSourceFetchResult,
@@ -31,6 +35,17 @@ const SANDBOX_WAKE_EXTRA_SYSTEM_PROMPT = [
 ].join(" ");
 const GRAPH_TOKEN_CONFIG_PATH =
   "plugins.entries.mentat-malik-graph-wake.config.graph.bearerTokenRef";
+const LEGACY_MALIK_OPENCLAW_AGENT_ID = "malik";
+
+const RISKY_TOOL_DENY_COVERAGE: Record<string, { group: string; concrete: string[] }> = {
+  outboundSend: { group: "group:messaging", concrete: ["message", "send", "poll"] },
+  runtime: { group: "group:runtime", concrete: ["exec", "process", "code_execution"] },
+  egress: {
+    group: "group:web",
+    concrete: ["web_search", "web_fetch", "x_search", "browser", "nodes", "gateway"],
+  },
+  spawn: { group: "group:sessions", concrete: ["sessions_spawn", "subagents"] },
+};
 
 type FetchInit = {
   method: "GET";
@@ -66,6 +81,11 @@ export function createMalikSandboxGraphWakeHostDependencies(
     state: options.state,
     now: options.now,
     loadActiveWindow: async () => loadActiveWindow(options.api.pluginConfig),
+    validateWakeTarget: async (request) =>
+      validateRestrictedWakeTarget({
+        config: options.api.config,
+        request,
+      }),
     fetchScopedSource: async (request) =>
       await fetchScopedGraphSource({
         request,
@@ -211,6 +231,93 @@ async function postRuntimeSubagentWake(
   }
 }
 
+function validateRestrictedWakeTarget(params: {
+  config: OpenClawPluginApi["config"];
+  request: RestrictedWakeTargetValidationRequest;
+}): RestrictedWakeTargetValidationResult {
+  const sessionKeyAgentId = readAgentIdFromSessionKey(params.request.sessionKey);
+  const agents = asRecord(params.config)?.agents;
+  const agentsRecord = asRecord(agents);
+  const agentList = Array.isArray(agentsRecord?.list) ? agentsRecord.list : [];
+  const dedicatedAgents = findAgentEntries(agentList, MALIK_SANDBOX_OPENCLAW_AGENT_ID);
+  const dedicatedAgent = dedicatedAgents.length === 1 ? dedicatedAgents[0] : null;
+  const legacyAgent = findAgentEntries(agentList, LEGACY_MALIK_OPENCLAW_AGENT_ID)[0] ?? null;
+
+  const dedicatedWorkspace = readString(dedicatedAgent?.workspace);
+  const dedicatedAgentDir = readString(dedicatedAgent?.agentDir);
+  const legacyWorkspace = readString(legacyAgent?.workspace);
+  const legacyAgentDir = readString(legacyAgent?.agentDir);
+  const sandbox = asRecord(dedicatedAgent?.sandbox);
+  const tools = asRecord(dedicatedAgent?.tools);
+  const fs = asRecord(tools?.fs);
+  const deny = readStringArray(tools?.deny);
+
+  const proof: RestrictedWakeTargetProof = {
+    agentIdValidated:
+      dedicatedAgents.length === 1 &&
+      readString(dedicatedAgent?.id) === MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+    sessionKeyAgentIdMatchesValidatedAgent:
+      sessionKeyAgentId === MALIK_SANDBOX_OPENCLAW_AGENT_ID &&
+      params.request.expectedAgentId === MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+    agentEntryPresent: dedicatedAgents.length > 0,
+    dedicatedAgentId: MALIK_SANDBOX_OPENCLAW_AGENT_ID,
+    explicitWorkspace: Boolean(dedicatedWorkspace),
+    explicitAgentDir: Boolean(dedicatedAgentDir),
+    workspaceDistinctFromMalik: Boolean(
+      dedicatedWorkspace && (!legacyWorkspace || dedicatedWorkspace !== legacyWorkspace),
+    ),
+    agentDirDistinctFromMalik: Boolean(
+      dedicatedAgentDir && (!legacyAgentDir || dedicatedAgentDir !== legacyAgentDir),
+    ),
+    sandboxEnabled: sandbox?.mode === "all" || sandbox?.mode === "non-main",
+    workspaceAccessRestricted:
+      sandbox?.workspaceAccess === "none" || sandbox?.workspaceAccess === "ro",
+    toolsProfileMinimal: tools?.profile === "minimal",
+    fsWorkspaceOnly: fs?.workspaceOnly === true,
+    riskyCapabilitiesDenied: riskyCapabilitiesDenied(deny),
+    rawValuesRedacted: true,
+  };
+
+  const ok = Object.entries(proof)
+    .filter(([key]) => key !== "dedicatedAgentId" && key !== "rawValuesRedacted")
+    .every(([, value]) => value === true);
+  if (ok) {
+    return { ok: true, proof };
+  }
+  return {
+    ok: false,
+    reason: proof.agentEntryPresent
+      ? "sandbox_wake_target_not_restricted"
+      : "sandbox_wake_target_unavailable",
+    proof,
+  };
+}
+
+function findAgentEntries(list: unknown[], agentId: string): Record<string, unknown>[] {
+  const matches: Record<string, unknown>[] = [];
+  for (const entry of list) {
+    const record = asRecord(entry);
+    if (readString(record?.id) === agentId) {
+      matches.push(record);
+    }
+  }
+  return matches;
+}
+
+function readAgentIdFromSessionKey(sessionKey: string): string | undefined {
+  const match = /^agent:([^:]+):/.exec(sessionKey.trim().toLowerCase());
+  return match?.[1];
+}
+
+function riskyCapabilitiesDenied(deny: string[]): boolean {
+  const normalized = new Set(deny.map((entry) => entry.trim().toLowerCase()).filter(Boolean));
+  return Object.values(RISKY_TOOL_DENY_COVERAGE).every(
+    (category) =>
+      normalized.has(category.group) ||
+      category.concrete.every((candidate) => normalized.has(candidate)),
+  );
+}
+
 function buildWakeMessage(request: MalikAgentWakeRequest): string {
   const redactedNotification = {
     subscriptionIdHash: sha256Hex(request.payload.notification.subscriptionId).slice(0, 16),
@@ -228,6 +335,7 @@ function buildWakeMessage(request: MalikAgentWakeRequest): string {
     sourceScope: summarizeSourceScope(request.payload.sourceScope),
     sourceRefs: request.payload.sourceRefs,
     notification: redactedNotification,
+    restrictedWakeTarget: request.payload.restrictedWakeTarget,
     sandboxHandoff: {
       workflowAction: "purchase_orders.create_po",
       graphNotificationAuthority: "wake_only",
@@ -420,4 +528,14 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    const normalized = readString(entry);
+    return normalized ? [normalized] : [];
+  });
 }
