@@ -285,6 +285,7 @@ describe("mentat malik graph wake manifest config schema", () => {
     const activeWindowProperties = propertiesOf(
       requireRecord(propertiesOf(readManifestConfigSchema()).activeWindow, "activeWindow"),
     );
+    const activeWindowId = requireRecord(activeWindowProperties.id, "activeWindow.id");
     const runtimeProfileProperties = propertiesOf(
       requireRecord(activeWindowProperties.runtimeProfile, "runtimeProfile"),
     );
@@ -292,6 +293,11 @@ describe("mentat malik graph wake manifest config schema", () => {
       requireRecord(activeWindowProperties.netSuiteTarget, "netSuiteTarget"),
     );
 
+    expect(activeWindowId.pattern).toBe("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$");
+    expect(validateAgainstSchema(activeWindowId, "sandbox-window-2026-06-20")).toEqual([]);
+    expect(validateAgainstSchema(activeWindowId, "sandbox-window:unsafe")).toContain(
+      "$ must match pattern",
+    );
     expect(requireRecord(activeWindowProperties.approved, "approved").const).toBe(true);
     expect(requireRecord(activeWindowProperties.mailbox, "mailbox").const).toBe(
       MALIK_SANDBOX_MAILBOX,

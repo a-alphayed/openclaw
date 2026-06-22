@@ -3,6 +3,7 @@ import {
   MALIK_SANDBOX_MAILBOX,
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
+  isSafeSandboxWindowId,
   type MalikSandboxGraphWakeDependencies,
   type MalikSandboxGraphWakeWindow,
 } from "./bridge.js";
@@ -132,6 +133,25 @@ describe("Malik sandbox Graph wake bridge", () => {
       status: "blocked",
       reason: "sandbox_window_unavailable",
     });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("rejects unsafe sandbox window ids before fetching source", async () => {
+    const deps = createDeps({
+      window: windowFixture({ id: "sandbox-window:unsafe" }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_window_id_invalid",
+    });
+    expect(isSafeSandboxWindowId("sandbox-window-2026-06-20")).toBe(true);
+    expect(isSafeSandboxWindowId("sandbox-window:unsafe")).toBe(false);
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
@@ -315,10 +335,13 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
     const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
     expect(wakeRequest.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
-    expect(wakeRequest.sessionKey).toBe("agent:malik:mentat-sandbox:sandbox-window-2026-06-20");
-    // OpenClaw src/routing/session-key.ts treats only agent:<id>:<rest> as
-    // agent-scoped; the old mentat:malik:sandbox alias falls to the default agent.
-    expect(wakeRequest.sessionKey).toMatch(/^agent:malik:mentat-sandbox:[A-Za-z0-9._:-]+$/);
+    expect(wakeRequest.sessionKey).toBe(
+      "agent:malik:subagent:mentat-sandbox-sandbox-window-2026-06-20",
+    );
+    expect(wakeRequest.sessionKey).toMatch(
+      /^agent:malik:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
+    );
+    expect(wakeRequest.sessionKey).not.toContain("agent:malik:mentat-sandbox:");
     expect(wakeRequest.payload).toMatchObject({
       mailbox: MALIK_SANDBOX_MAILBOX,
       runtimeProfile: {
@@ -328,6 +351,27 @@ describe("Malik sandbox Graph wake bridge", () => {
       workflowActions: [{ family: "purchase_orders", action: "create_po" }],
       sourceRefs: ["source-ref-redacted"],
     });
+  });
+
+  it("keeps sandbox subagent keys unique per approved window id", async () => {
+    const firstDeps = createDeps({
+      window: windowFixture({ id: "sandbox-window-A" }),
+    });
+    const secondDeps = createDeps({
+      window: windowFixture({ id: "sandbox-window-B" }),
+    });
+
+    await postNotification(firstDeps);
+    await postNotification(secondDeps);
+
+    const firstWake = vi.mocked(firstDeps.postAgentWake).mock.calls[0][0];
+    const secondWake = vi.mocked(secondDeps.postAgentWake).mock.calls[0][0];
+    expect(firstWake.sessionKey).toBe("agent:malik:subagent:mentat-sandbox-sandbox-window-A");
+    expect(secondWake.sessionKey).toBe("agent:malik:subagent:mentat-sandbox-sandbox-window-B");
+    expect(firstWake.sessionKey).not.toBe(secondWake.sessionKey);
+    for (const key of [firstWake.sessionKey, secondWake.sessionKey]) {
+      expect(key).toMatch(/^agent:malik:subagent:mentat-sandbox-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
+    }
   });
 
   it("blocks when the approved scoped source is empty", async () => {

@@ -188,6 +188,10 @@ describe("Malik sandbox Graph wake host adapter", () => {
         reason: "sandbox_window_unavailable",
       },
       {
+        activeWindow: activeWindowConfig({ id: "sandbox-window:unsafe" }),
+        reason: "sandbox_window_unavailable",
+      },
+      {
         activeWindow: activeWindowConfig({
           sourceScope: { receivedAfter: "2026-06-20T17:00:00.000Z" },
         }),
@@ -373,14 +377,29 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const [runParams] = subagentRun.mock.calls[0];
     expect(runParams).toMatchObject({
-      sessionKey: "agent:malik:mentat-sandbox:sandbox-window-2026-06-20",
+      sessionKey: "agent:malik:subagent:mentat-sandbox-sandbox-window-2026-06-20",
       deliver: false,
+      lane: "subagent",
+      lightContext: true,
     });
     expect(runParams.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
+    expect(runParams.extraSystemPrompt).toContain("Malik Mentat sandbox Graph wake lane");
+    expect(runParams.extraSystemPrompt).toContain("Do not use old Malik email, Fleet, NetSuite");
+    expect(runParams.extraSystemPrompt).toContain("Do not send vendor/customer email");
+    expect(runParams.extraSystemPrompt).toContain("Graph notifications as wake signals only");
     expect(runParams.message).toContain("Mentat Malik sandbox Graph webhook wake");
+    expect(runParams.message).toContain("purchase_orders.create_po");
+    expect(runParams.message).toContain('"graphNotificationAuthority":"wake_only"');
+    expect(runParams.message).toContain('"emailSend":false');
+    expect(runParams.message).toContain('"netSuiteMutation":false');
+    expect(runParams.message).toContain("blocked_without_approved_sandbox_safe_recipient_plan");
     expect(runParams.message).not.toContain(FAKE_GRAPH_TOKEN);
     expect(runParams.message).not.toContain(EXPECTED_CLIENT_STATE);
     expect(runParams.message).not.toContain("AAMk-redacted");
     expect(runParams.message).not.toContain("Malik sandbox E2E");
+    expect(runParams.extraSystemPrompt).not.toContain(FAKE_GRAPH_TOKEN);
+    expect(runParams.extraSystemPrompt).not.toContain(EXPECTED_CLIENT_STATE);
+    expect(runParams.extraSystemPrompt).not.toContain("AAMk-redacted");
+    expect(runParams.extraSystemPrompt).not.toContain("Malik sandbox E2E");
   });
 });

@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 export const MALIK_SANDBOX_MAILBOX = "malik-mentat@outlook.com";
 // Private sandbox bridge target: the host config currently uses Malik's agent id.
 const MALIK_OPENCLAW_AGENT_ID = "malik";
+export const MALIK_SANDBOX_WINDOW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -130,6 +131,7 @@ type BlockReason =
   | "invalid_json"
   | "invalid_graph_notification"
   | "sandbox_window_unavailable"
+  | "sandbox_window_id_invalid"
   | "sandbox_window_expired"
   | "mailbox_not_approved"
   | "runtime_profile_not_sandbox"
@@ -142,6 +144,10 @@ type BlockReason =
   | "source_scope_empty"
   | ScopedSourceBlockReason
   | "host_poster_rejected";
+
+export function isSafeSandboxWindowId(value: string): boolean {
+  return MALIK_SANDBOX_WINDOW_ID_PATTERN.test(value);
+}
 
 export function createMalikSandboxGraphWakeState(): MalikSandboxGraphWakeState {
   return {
@@ -325,6 +331,9 @@ function validateActiveWindow(
   if (!activeWindow || !activeWindow.approved) {
     return { ok: false, reason: "sandbox_window_unavailable" };
   }
+  if (!isSafeSandboxWindowId(activeWindow.id)) {
+    return { ok: false, reason: "sandbox_window_id_invalid" };
+  }
   const expiresAt = Date.parse(activeWindow.expiresAt);
   if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
     return { ok: false, reason: "sandbox_window_expired" };
@@ -408,7 +417,7 @@ function buildWakeRequest(params: {
 }): MalikAgentWakeRequest {
   return {
     message: "Mentat Malik sandbox Graph webhook wake",
-    sessionKey: `agent:${MALIK_OPENCLAW_AGENT_ID}:mentat-sandbox:${params.activeWindow.id}`,
+    sessionKey: `agent:${MALIK_OPENCLAW_AGENT_ID}:subagent:mentat-sandbox-${params.activeWindow.id}`,
     wakeMode: "isolated",
     deliver: false,
     idempotencyKey: params.idempotencyKey,
