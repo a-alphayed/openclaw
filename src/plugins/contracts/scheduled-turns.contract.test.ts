@@ -24,7 +24,12 @@ import {
 import { clearPluginLoaderCache, loadOpenClawPlugins } from "../loader.js";
 import { makeTempDir, writePlugin } from "../loader.test-fixtures.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
-import { setActivePluginRegistry } from "../runtime.js";
+import { isPluginRegistryRetired } from "../registry-lifecycle.js";
+import {
+  pinActivePluginHttpRouteRegistry,
+  releasePinnedPluginHttpRouteRegistry,
+  setActivePluginRegistry,
+} from "../runtime.js";
 import { createPluginRecord } from "../status.test-helpers.js";
 import type { OpenClawPluginApi } from "../types.js";
 
@@ -202,6 +207,7 @@ describe("plugin scheduled turns", () => {
     vi.useRealTimers();
     clearPluginLoaderCache();
     clearPluginHostRuntimeState();
+    releasePinnedPluginHttpRouteRegistry();
     setActivePluginRegistry(createEmptyPluginRegistry());
   });
 
@@ -1083,6 +1089,92 @@ describe("plugin scheduled turns", () => {
         tag: "nudge",
       }),
     ).resolves.toEqual({ removed: 0, failed: 0 });
+  });
+
+  it("keeps pinned HTTP-route scheduled-turn APIs live until route registry release", async () => {
+    const sessionKey = "agent:malik-mentat-sandbox:subagent:mentat-sandbox-window";
+    const schedule = {
+      sessionKey,
+      agentId: "malik-mentat-sandbox",
+      message: "sandbox wake",
+      delayMs: 1,
+      deleteAfterRun: true,
+      deliveryMode: "none",
+      name: "malik-sandbox-wake-test",
+      tag: "malik-sandbox-wake",
+    } as const;
+    workflowMocks.cronAdd.mockImplementation(async (body: CronJobCreate) =>
+      makeCronJob({ id: "malik-sandbox-wake-job", ...body }),
+    );
+    const { config, registry } = createPluginRegistryFixture({}, { hostServices: { cron } });
+    let capturedApi: OpenClawPluginApi | undefined;
+    registerTestPlugin({
+      registry,
+      config,
+      record: createPluginRecord({
+        id: "http-route-scheduler",
+        name: "HTTP Route Scheduler",
+        origin: "bundled",
+      }),
+      register(api) {
+        capturedApi = api;
+        api.registerHttpRoute({
+          path: "/plugins/http-route-scheduler/wake",
+          auth: "gateway",
+          handler(_req, res) {
+            res.statusCode = 202;
+            res.end("ok");
+            return true;
+          },
+        });
+      },
+    });
+
+    expect(
+      (registry.registry.httpRoutes as Array<{ pluginId?: unknown }>).some(
+        (route) => route.pluginId === "http-route-scheduler",
+      ),
+    ).toBe(true);
+
+    setActivePluginRegistry(registry.registry);
+    pinActivePluginHttpRouteRegistry(registry.registry);
+    setActivePluginRegistry(createEmptyPluginRegistry());
+
+    expect(isPluginRegistryRetired(registry.registry)).toBe(false);
+
+    const liveHandle = await capturedApi?.session.workflow.scheduleSessionTurn(schedule);
+    expectSessionTurnHandle(
+      liveHandle,
+      "malik-sandbox-wake-job",
+      "http-route-scheduler",
+      sessionKey,
+    );
+    expect(workflowMocks.cronAdd).toHaveBeenCalledTimes(1);
+    const { name, schedule: cronSchedule, ...stableCronAddBody } = getCronAddBody();
+    expect(name).toBe(
+      "plugin:http-route-scheduler:tag:malik-sandbox-wake:agent:malik-mentat-sandbox:subagent:mentat-sandbox-window:malik-sandbox-wake-test",
+    );
+    if (cronSchedule.kind !== "at") {
+      throw new Error(`Expected one-shot scheduled turn, got ${cronSchedule.kind}`);
+    }
+    expect(typeof cronSchedule.at).toBe("string");
+    expect(stableCronAddBody).toEqual({
+      enabled: true,
+      sessionTarget: `session:${sessionKey}`,
+      payload: { kind: "agentTurn", message: "sandbox wake" },
+      agentId: "malik-mentat-sandbox",
+      deleteAfterRun: true,
+      wakeMode: "now",
+      delivery: { mode: "none" },
+    });
+
+    releasePinnedPluginHttpRouteRegistry(registry.registry);
+
+    expect(isPluginRegistryRetired(registry.registry)).toBe(true);
+    await expect(
+      capturedApi?.session.workflow.scheduleSessionTurn(schedule),
+    ).resolves.toBeUndefined();
+    expect(workflowMocks.cronAdd).toHaveBeenCalledTimes(1);
   });
 
   it("resolves live cron service for captured plugin scheduled-turn APIs", async () => {

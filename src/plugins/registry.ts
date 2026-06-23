@@ -2950,7 +2950,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
                   origin: record.origin,
                   schedule,
                   cron: getHostCronService(),
-                  shouldCommit: isLoadedRecordInActiveRegistry,
+                  shouldCommit: shouldCommitWorkflowSideEffect,
                   ownerRegistry: registry,
                 });
               },
