@@ -424,6 +424,69 @@ describe("mentat malik graph wake manifest config schema", () => {
     ).toContain("$.token is not allowed");
   });
 
+  it("accepts only the closed sandboxFixtureSource shape under activeWindow", () => {
+    const activeWindowProperties = propertiesOf(
+      requireRecord(propertiesOf(readManifestConfigSchema()).activeWindow, "activeWindow"),
+    );
+    const sandboxFixtureSource = requireRecord(
+      activeWindowProperties.sandboxFixtureSource,
+      "sandboxFixtureSource",
+    );
+    const fixtureProperties = propertiesOf(sandboxFixtureSource);
+
+    expect(sandboxFixtureSource.additionalProperties).toBe(false);
+    expect(requiredOf(sandboxFixtureSource)).toEqual(["enabled", "sourceId", "fixtureClass"]);
+    expect(requireRecord(fixtureProperties.sourceId, "sourceId").const).toBe(
+      "source-po-new-millenium-1129895-enriched",
+    );
+    expect(requireRecord(fixtureProperties.fixtureClass, "fixtureClass").const).toBe(
+      "role_pack_sanitized_po_create_fixture",
+    );
+
+    expect(
+      validateAgainstSchema(sandboxFixtureSource, {
+        enabled: true,
+        sourceId: "source-po-new-millenium-1129895-enriched",
+        fixtureClass: "role_pack_sanitized_po_create_fixture",
+      }),
+    ).toEqual([]);
+    expect(
+      validateAgainstSchema(sandboxFixtureSource, {
+        enabled: true,
+        sourceId: "some-other-source",
+        fixtureClass: "role_pack_sanitized_po_create_fixture",
+      }),
+    ).toContain("$.sourceId must equal configured const");
+    expect(
+      validateAgainstSchema(sandboxFixtureSource, {
+        enabled: true,
+        sourceId: "source-po-new-millenium-1129895-enriched",
+        fixtureClass: "arbitrary-fixture-class",
+      }),
+    ).toContain("$.fixtureClass must equal configured const");
+    expect(
+      validateAgainstSchema(sandboxFixtureSource, {
+        enabled: true,
+        sourceId: "source-po-new-millenium-1129895-enriched",
+        fixtureClass: "role_pack_sanitized_po_create_fixture",
+        extra: "nope",
+      }),
+    ).toContain("$.extra is not allowed");
+  });
+
+  it("keeps sandboxFixtureSource optional on the approved window fixture", () => {
+    const schema = readManifestConfigSchema();
+    const withFixtureSource = approvedWindowFixture();
+    (withFixtureSource.activeWindow as JsonRecord).sandboxFixtureSource = {
+      enabled: true,
+      sourceId: "source-po-new-millenium-1129895-enriched",
+      fixtureClass: "role_pack_sanitized_po_create_fixture",
+    };
+
+    expect(validateAgainstSchema(schema, approvedWindowFixture())).toEqual([]);
+    expect(validateAgainstSchema(schema, withFixtureSource)).toEqual([]);
+  });
+
   it("validates the approved host-proof window fixture with only a SecretRef token reference", () => {
     const schema = readManifestConfigSchema();
 

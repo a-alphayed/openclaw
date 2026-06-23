@@ -2,15 +2,27 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MALIK_SANDBOX_OPENCLAW_AGENT_ID,
   MALIK_SANDBOX_MAILBOX,
+  MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+  MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
   isSafeSandboxWindowId,
+  resolveSandboxFixtureSource,
+  type MalikSandboxFixtureSourceConfig,
   type MalikSandboxGraphWakeDependencies,
   type MalikSandboxGraphWakeWindow,
   type RestrictedWakeTargetProof,
   type ScopedMentatSourceRecord,
   type MentatSandboxWorkflowRunResult,
 } from "./bridge.js";
+
+function validFixtureSourceConfig(): MalikSandboxFixtureSourceConfig {
+  return {
+    enabled: true,
+    sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+    fixtureClass: MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
+  };
+}
 
 function windowFixture(
   overrides?: Partial<MalikSandboxGraphWakeWindow>,
@@ -98,6 +110,22 @@ function runnerResult(
     proofScope: "graph_wake_to_mentat_no_live_workflow",
     handlingStage: "created_waiting_on_approval",
     ...overrides,
+  };
+}
+
+function safeRunnerRuntimeFacts(): NonNullable<MentatSandboxWorkflowRunResult["runtime"]> {
+  return { scanRecorded: 1, workflowsCreated: 1, workersDispatched: 0 };
+}
+
+function safeRunnerDisabledLiveActions(): NonNullable<
+  MentatSandboxWorkflowRunResult["disabledLiveActions"]
+> {
+  return {
+    emailSend: false,
+    vendorOrCustomerContact: false,
+    netSuiteMutation: false,
+    productionRuntimeOrAccess: false,
+    oldRuntimeFallback: false,
   };
 }
 
@@ -669,5 +697,263 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
     expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Malik sandbox fixture-source mapping", () => {
+  function runnerInputSourceId(deps: MalikSandboxGraphWakeDependencies): string {
+    const runnerInput = vi.mocked(deps.runMentatSandboxWorkflow).mock.calls[0][0];
+    return runnerInput.sources[0].id;
+  }
+
+  it("leaves the hashed source id unchanged when sandboxFixtureSource is absent", async () => {
+    const deps = createDeps();
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(runnerInputSourceId(deps)).toBe("graph-wake-source-redacted");
+    expect(response.body).not.toHaveProperty("sandboxFixtureSourceMapping");
+    const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
+    expect(wakeRequest.payload).not.toHaveProperty("sandboxFixtureSourceMapping");
+  });
+
+  it("maps the scanned source id to the allowlisted fixture source when valid", async () => {
+    const deps = createDeps({
+      window: windowFixture({ sandboxFixtureSource: validFixtureSourceConfig() }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(runnerInputSourceId(deps)).toBe(MALIK_SANDBOX_FIXTURE_SOURCE_ID);
+    const runnerInput = vi.mocked(deps.runMentatSandboxWorkflow).mock.calls[0][0];
+    const mappedSource = runnerInput.sources[0];
+    // Hashed external/raw refs and thread/message ids are preserved unchanged.
+    expect(mappedSource.externalId).toBe("graph-message:redacted");
+    expect(mappedSource.rawRef).toBe("graph-message:redacted");
+    expect(mappedSource.metadata.email.threadId).toBe("thread-redacted");
+    expect(mappedSource.metadata.email.messageIds).toEqual(["message-redacted"]);
+    // Fixed redacted summary + evidence metadata, declaring no source authority.
+    expect(mappedSource.summary).toMatch(/approved sandbox fixture-source proof bridge/i);
+    expect(mappedSource.summary).toMatch(/not raw source authority/i);
+    expect(mappedSource.metadata.sandboxFixtureSource).toEqual({
+      sourceAuthority: false,
+      fixtureClass: MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
+      sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+      label: "sandbox_fixture_source_mapping",
+    });
+    // Evidence surfaced on the HTTP response and wake payload.
+    expect(response.body).toMatchObject({
+      sandboxFixtureSourceMapping: {
+        applied: true,
+        sourceAuthority: false,
+        fixtureClass: MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
+        sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+        label: "sandbox_fixture_source_mapping",
+      },
+    });
+    const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
+    expect(wakeRequest.payload.sandboxFixtureSourceMapping).toMatchObject({
+      applied: true,
+      sourceAuthority: false,
+    });
+  });
+
+  it("fails closed for each invalid sandboxFixtureSource condition without overriding", async () => {
+    const cases: Array<{ label: string; window: Partial<MalikSandboxGraphWakeWindow> }> = [
+      {
+        label: "unapproved sourceId",
+        window: {
+          sandboxFixtureSource: { ...validFixtureSourceConfig(), sourceId: "source-not-allowed" },
+        },
+      },
+      {
+        label: "wrong fixtureClass",
+        window: {
+          sandboxFixtureSource: {
+            ...validFixtureSourceConfig(),
+            fixtureClass: "arbitrary-fixture-class",
+          },
+        },
+      },
+      {
+        label: "enabled false",
+        window: {
+          sandboxFixtureSource: { ...validFixtureSourceConfig(), enabled: false },
+        },
+      },
+      {
+        label: "non-create_po action",
+        window: {
+          allowedActions: [{ family: "purchase_orders", action: "receive_po" }],
+          sandboxFixtureSource: validFixtureSourceConfig(),
+        },
+      },
+      {
+        label: "vendor safe-recipient plan enabled",
+        window: {
+          allowedActions: [{ family: "purchase_orders", action: "create_po" }],
+          sandboxSafeRecipientPlan: { enabled: true, recipients: ["malik-mentat@outlook.com"] },
+          sandboxFixtureSource: validFixtureSourceConfig(),
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const deps = createDeps({ window: windowFixture(testCase.window) });
+
+      const response = await postNotification(deps);
+
+      expect(response.body, testCase.label).toMatchObject({
+        ok: false,
+        status: "blocked",
+        reason: "sandbox_fixture_source_rejected",
+      });
+      expect(deps.runMentatSandboxWorkflow, testCase.label).not.toHaveBeenCalled();
+      expect(deps.postAgentWake, testCase.label).not.toHaveBeenCalled();
+    }
+  });
+
+  it("resolves fail-closed via the pure helper for the wrong mailbox", () => {
+    const resolution = resolveSandboxFixtureSource(
+      windowFixture({
+        mailbox: "intruder@outlook.com",
+        sandboxFixtureSource: validFixtureSourceConfig(),
+      }),
+    );
+
+    expect(resolution).toEqual({ applied: false, reason: "fail_closed" });
+  });
+
+  it("resolves applied via the pure helper for an exact valid window", () => {
+    const resolution = resolveSandboxFixtureSource(
+      windowFixture({ sandboxFixtureSource: validFixtureSourceConfig() }),
+    );
+
+    expect(resolution).toMatchObject({ applied: true, sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID });
+  });
+
+  it("resolves absent (no override) when sandboxFixtureSource is missing", () => {
+    const resolution = resolveSandboxFixtureSource(windowFixture());
+
+    expect(resolution).toEqual({ applied: false, reason: "absent" });
+  });
+});
+
+describe("Malik sandbox runner summary whitelist", () => {
+  it("admits only the safe whitelisted runtime and disabled-action facts", async () => {
+    const deps = createDeps({
+      runner: runnerResult({
+        runtime: safeRunnerRuntimeFacts(),
+        disabledLiveActions: safeRunnerDisabledLiveActions(),
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: true,
+      status: "wake_scheduled",
+      mentatRunner: {
+        status: "open",
+        redacted: true,
+        runtime: { scanRecorded: 1, workflowsCreated: 1, workersDispatched: 0 },
+        disabledLiveActions: {
+          emailSend: false,
+          vendorOrCustomerContact: false,
+          netSuiteMutation: false,
+          productionRuntimeOrAccess: false,
+          oldRuntimeFallback: false,
+        },
+      },
+    });
+    const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
+    expect(wakeRequest.payload.mentatRunner.runtime).toEqual({
+      scanRecorded: 1,
+      workflowsCreated: 1,
+      workersDispatched: 0,
+    });
+  });
+
+  it("omits runtime facts when workersDispatched is non-zero", async () => {
+    const deps = createDeps({
+      runner: runnerResult({
+        runtime: { scanRecorded: 1, workflowsCreated: 1, workersDispatched: 1 },
+        disabledLiveActions: safeRunnerDisabledLiveActions(),
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    const mentatRunner = (response.body as { mentatRunner?: Record<string, unknown> }).mentatRunner;
+    expect(mentatRunner).toMatchObject({ status: "open", redacted: true });
+    expect(mentatRunner).not.toHaveProperty("runtime");
+    // Disabled-action booleans remain admissible independently.
+    expect(mentatRunner).toHaveProperty("disabledLiveActions");
+  });
+
+  it("omits runtime facts when a count is negative, non-integer, or out of bounds", async () => {
+    for (const runtime of [
+      { scanRecorded: -1, workflowsCreated: 1, workersDispatched: 0 },
+      { scanRecorded: 1.5, workflowsCreated: 1, workersDispatched: 0 },
+      { scanRecorded: 1, workflowsCreated: 9999, workersDispatched: 0 },
+    ]) {
+      const deps = createDeps({ runner: runnerResult({ runtime }) });
+
+      const response = await postNotification(deps);
+
+      const mentatRunner = (response.body as { mentatRunner?: Record<string, unknown> })
+        .mentatRunner;
+      expect(mentatRunner).not.toHaveProperty("runtime");
+    }
+  });
+
+  it("omits disabled-action booleans when any is not exactly false", async () => {
+    const deps = createDeps({
+      runner: runnerResult({
+        runtime: safeRunnerRuntimeFacts(),
+        disabledLiveActions: { ...safeRunnerDisabledLiveActions(), netSuiteMutation: true },
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    const mentatRunner = (response.body as { mentatRunner?: Record<string, unknown> }).mentatRunner;
+    expect(mentatRunner).toHaveProperty("runtime");
+    expect(mentatRunner).not.toHaveProperty("disabledLiveActions");
+  });
+
+  it("does not forward arbitrary or token-like runner output into the summary", async () => {
+    const deps = createDeps({
+      runner: {
+        ...runnerResult(),
+        runtime: safeRunnerRuntimeFacts(),
+        disabledLiveActions: safeRunnerDisabledLiveActions(),
+        // Arbitrary extra fields on the runner result must never reach the summary.
+        ...({ clientState: "Bearer raw-token-value", rawBody: "<html>secret</html>" } as Record<
+          string,
+          unknown
+        >),
+      } as MentatSandboxWorkflowRunResult,
+    });
+
+    const response = await postNotification(deps);
+
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("Bearer");
+    expect(rendered).not.toContain("rawBody");
+    expect(rendered).not.toContain("clientState");
+    const mentatRunner = (response.body as { mentatRunner?: Record<string, unknown> }).mentatRunner;
+    expect(Object.keys(mentatRunner ?? {}).sort()).toEqual(
+      [
+        "disabledLiveActions",
+        "handlingStage",
+        "proofScope",
+        "redacted",
+        "runtime",
+        "status",
+      ].sort(),
+    );
   });
 });

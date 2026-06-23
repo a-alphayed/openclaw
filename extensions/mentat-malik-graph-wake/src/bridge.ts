@@ -5,6 +5,17 @@ export const MALIK_SANDBOX_MAILBOX = "malik-mentat@outlook.com";
 export const MALIK_SANDBOX_OPENCLAW_AGENT_ID = "malik-mentat-sandbox";
 export const MALIK_SANDBOX_WINDOW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
+// Sandbox fixture-source proof bridge allowlist. These are hardcoded constants,
+// never "any configured value". The override only maps the scanned Mentat source
+// id so the existing role-pack fixture resolver creates the no-live
+// purchase_orders.create_po workflow; it is deployment/test-window authority, not
+// raw source authority.
+export const MALIK_SANDBOX_FIXTURE_SOURCE_ID = "source-po-new-millenium-1129895-enriched";
+export const MALIK_SANDBOX_FIXTURE_SOURCE_CLASS = "role_pack_sanitized_po_create_fixture";
+export const MALIK_SANDBOX_FIXTURE_SOURCE_LABEL = "sandbox_fixture_source_mapping";
+// Numeric runner facts are accepted into the redacted summary only within this
+// small inclusive bound (defense in depth against arbitrary runner output).
+const MAX_SAFE_RUNNER_RUNTIME_COUNT = 16;
 const MAX_BODY_BYTES = 64 * 1024;
 const SAFE_RUNNER_FAILURE_CODES = new Set([
   "invalid_input",
@@ -47,6 +58,17 @@ export type MalikSandboxSourceScope = {
   receivedBefore?: string;
 };
 
+// Carries the raw (possibly non-allowlisted) config values so the fail-closed
+// resolver can compare against the hardcoded constants and HARD BLOCK on any
+// mismatch instead of silently dropping an invalid override. The manifest schema
+// already pins sourceId/fixtureClass to consts; this in-code shape is defense in
+// depth for a bypassed/drifted schema.
+export type MalikSandboxFixtureSourceConfig = {
+  enabled: boolean;
+  sourceId: string;
+  fixtureClass: string;
+};
+
 export type MalikSandboxGraphWakeWindow = {
   id: string;
   approved: boolean;
@@ -61,8 +83,25 @@ export type MalikSandboxGraphWakeWindow = {
     enabled: boolean;
     recipients: string[];
   };
+  sandboxFixtureSource?: MalikSandboxFixtureSourceConfig;
   verifyClientState: (clientState: string) => boolean;
 };
+
+export type SandboxFixtureSourceMappingEvidence = {
+  applied: true;
+  sourceAuthority: false;
+  fixtureClass: typeof MALIK_SANDBOX_FIXTURE_SOURCE_CLASS;
+  sourceId: typeof MALIK_SANDBOX_FIXTURE_SOURCE_ID;
+  label: typeof MALIK_SANDBOX_FIXTURE_SOURCE_LABEL;
+};
+
+export type SandboxFixtureSourceResolution =
+  | {
+      applied: true;
+      sourceId: typeof MALIK_SANDBOX_FIXTURE_SOURCE_ID;
+      evidence: SandboxFixtureSourceMappingEvidence;
+    }
+  | { applied: false; reason: "absent" | "fail_closed" };
 
 export type GraphNotificationSummary = {
   subscriptionId: string;
@@ -97,6 +136,12 @@ export type ScopedMentatSourceRecord = {
       receivedAt: string;
       parentFolderId: "inbox";
       to: Array<{ name: string; address: string }>;
+    };
+    sandboxFixtureSource?: {
+      sourceAuthority: false;
+      fixtureClass: typeof MALIK_SANDBOX_FIXTURE_SOURCE_CLASS;
+      sourceId: typeof MALIK_SANDBOX_FIXTURE_SOURCE_ID;
+      label: typeof MALIK_SANDBOX_FIXTURE_SOURCE_LABEL;
     };
   };
   runtimeProfile: RuntimeProfileRef;
@@ -164,13 +209,32 @@ export type MalikAgentWakeRequest = {
     sourceRefs: string[];
     notification: GraphNotificationSummary;
     restrictedWakeTarget: RestrictedWakeTargetProof;
-    mentatRunner: {
-      status: "closed" | "open" | "blocked";
-      proofScope?: "graph_wake_to_mentat_no_live_workflow";
-      handlingStage?: string;
-      redacted: true;
-    };
+    mentatRunner: MentatRunnerSummary;
+    sandboxFixtureSourceMapping?: SandboxFixtureSourceMappingEvidence;
   };
+};
+
+export type MentatRunnerRuntimeFacts = {
+  scanRecorded: number;
+  workflowsCreated: number;
+  workersDispatched: number;
+};
+
+export type MentatRunnerDisabledLiveActions = {
+  emailSend: false;
+  vendorOrCustomerContact: false;
+  netSuiteMutation: false;
+  productionRuntimeOrAccess: false;
+  oldRuntimeFallback: false;
+};
+
+export type MentatRunnerSummary = {
+  status: "closed" | "open" | "blocked";
+  proofScope?: "graph_wake_to_mentat_no_live_workflow";
+  handlingStage?: string;
+  redacted: true;
+  runtime?: MentatRunnerRuntimeFacts;
+  disabledLiveActions?: MentatRunnerDisabledLiveActions;
 };
 
 export type AgentWakePostResult = {
@@ -202,6 +266,18 @@ export type MentatSandboxWorkflowRunResult = {
   redacted: true;
   proofScope?: "graph_wake_to_mentat_no_live_workflow";
   handlingStage?: string;
+  runtime?: {
+    scanRecorded?: number;
+    workflowsCreated?: number;
+    workersDispatched?: number;
+  };
+  disabledLiveActions?: {
+    emailSend?: boolean;
+    vendorOrCustomerContact?: boolean;
+    netSuiteMutation?: boolean;
+    productionRuntimeOrAccess?: boolean;
+    oldRuntimeFallback?: boolean;
+  };
   failure?: { code?: string };
 };
 
@@ -268,6 +344,7 @@ type BlockReason =
   | "sandbox_wake_target_unavailable"
   | "sandbox_wake_target_not_restricted"
   | ScopedSourceBlockReason
+  | "sandbox_fixture_source_rejected"
   | "mentat_runner_rejected"
   | "host_poster_rejected";
 
@@ -403,6 +480,21 @@ export async function handleMalikSandboxGraphWakeRequest(
       return blocked("source_scope_empty");
     }
 
+    // Sandbox fixture-source mapping (fail-closed). Absent -> default hashed id
+    // (unchanged). Present-and-valid -> override the scanned source id so the
+    // existing Mentat fixture resolver creates the no-live create_po workflow.
+    // Present-but-invalid -> hard block, never a silent fallback.
+    const fixtureSourceResolution = resolveSandboxFixtureSource(activeWindow);
+    if (!fixtureSourceResolution.applied && fixtureSourceResolution.reason === "fail_closed") {
+      return blocked("sandbox_fixture_source_rejected");
+    }
+    const mappedSources = fixtureSourceResolution.applied
+      ? sources.map((source) => applySandboxFixtureSourceMapping(source, fixtureSourceResolution))
+      : sources;
+    const fixtureSourceMappingEvidence = fixtureSourceResolution.applied
+      ? fixtureSourceResolution.evidence
+      : undefined;
+
     const redactedNotification = redactNotification(parsedNotification);
     let runnerResult: MentatSandboxWorkflowRunResult;
     try {
@@ -413,7 +505,7 @@ export async function handleMalikSandboxGraphWakeRequest(
           notification: redactedNotification,
           restrictedWakeTarget: targetValidation.proof,
           sessionKey,
-          sources,
+          sources: mappedSources,
           sourceRefs,
           now: deps.now?.() ?? new Date(),
         }),
@@ -435,6 +527,7 @@ export async function handleMalikSandboxGraphWakeRequest(
       sessionKey,
       sourceRefs,
       mentatRunner: runnerSummary.summary,
+      sandboxFixtureSourceMapping: fixtureSourceMappingEvidence,
     });
     const postResult = await deps.postAgentWake(wakeRequest);
     if (!postResult.accepted) {
@@ -448,6 +541,9 @@ export async function handleMalikSandboxGraphWakeRequest(
       idempotencyKey,
       restrictedWakeTarget: targetValidation.proof,
       mentatRunner: runnerSummary.summary,
+      ...(fixtureSourceMappingEvidence
+        ? { sandboxFixtureSourceMapping: fixtureSourceMappingEvidence }
+        : {}),
     });
   } finally {
     deps.state.inFlightScopes.delete(scopeKey);
@@ -575,6 +671,87 @@ function hasApprovedSourceScope(sourceScope: MalikSandboxSourceScope): boolean {
   return hasSelector;
 }
 
+// Pure, fail-closed sandbox fixture-source resolution. Returns an override only
+// when EVERY allowlist condition holds. When the optional config is absent the
+// default hashed Graph wake source id is preserved (behavior unchanged). When
+// the config is present but any condition fails, the request is blocked (the
+// caller treats `fail_closed` as a hard block, never a silent fallback). All
+// constants are re-validated here even though the manifest schema already pins
+// them, as defense in depth against a manifest/runtime drift or a bypassed
+// schema. This object is deployment/test-window authority, not source authority.
+export function resolveSandboxFixtureSource(
+  activeWindow: MalikSandboxGraphWakeWindow,
+): SandboxFixtureSourceResolution {
+  const fixtureSource = activeWindow.sandboxFixtureSource;
+  if (fixtureSource === undefined) {
+    return { applied: false, reason: "absent" };
+  }
+
+  const allowed =
+    fixtureSource.enabled === true &&
+    fixtureSource.sourceId === MALIK_SANDBOX_FIXTURE_SOURCE_ID &&
+    fixtureSource.fixtureClass === MALIK_SANDBOX_FIXTURE_SOURCE_CLASS &&
+    // Exactly one allowed action and it must be purchase_orders.create_po.
+    activeWindow.allowedActions.length === 1 &&
+    activeWindow.allowedActions[0]?.family === "purchase_orders" &&
+    activeWindow.allowedActions[0]?.action === "create_po" &&
+    // Runtime profile and NetSuite target must both be the sandbox target.
+    activeWindow.runtimeProfile.environmentClass === "sandbox" &&
+    activeWindow.runtimeProfile.environmentId === NETSUITE_SANDBOX_ENVIRONMENT_ID &&
+    activeWindow.netSuiteTarget.environmentClass === "sandbox" &&
+    activeWindow.netSuiteTarget.environmentId === NETSUITE_SANDBOX_ENVIRONMENT_ID &&
+    // Mailbox must be exactly the approved sandbox mailbox.
+    activeWindow.mailbox.toLowerCase() === MALIK_SANDBOX_MAILBOX &&
+    // Vendor notification must stay blocked: no sandbox-safe recipient plan is
+    // enabled for this proof path.
+    !hasSandboxSafeRecipientPlan(activeWindow.sandboxSafeRecipientPlan);
+
+  if (!allowed) {
+    return { applied: false, reason: "fail_closed" };
+  }
+
+  return {
+    applied: true,
+    sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+    evidence: {
+      applied: true,
+      sourceAuthority: false,
+      fixtureClass: MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
+      sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID,
+      label: MALIK_SANDBOX_FIXTURE_SOURCE_LABEL,
+    },
+  };
+}
+
+// Maps the scanned source record onto the allowlisted fixture source id so the
+// existing Mentat fixture resolver creates the no-live create_po workflow. Only
+// `id`, `summary`, and the added `metadata.sandboxFixtureSource` evidence block
+// change; redacted hashed externalId/rawRef/thread/message refs derived from the
+// real Graph message are preserved unchanged. No raw body/header/url/path/token
+// is introduced.
+function applySandboxFixtureSourceMapping(
+  source: ScopedMentatSourceRecord,
+  resolution: Extract<SandboxFixtureSourceResolution, { applied: true }>,
+): ScopedMentatSourceRecord {
+  return {
+    ...source,
+    id: resolution.sourceId,
+    summary:
+      "Approved sandbox fixture-source proof bridge. Source id mapped to a role-pack " +
+      "sanitized PO-create fixture for no-live workflow planning. This is " +
+      "deployment/test-window authority, not raw source authority.",
+    metadata: {
+      ...source.metadata,
+      sandboxFixtureSource: {
+        sourceAuthority: false,
+        fixtureClass: resolution.evidence.fixtureClass,
+        sourceId: resolution.sourceId,
+        label: resolution.evidence.label,
+      },
+    },
+  };
+}
+
 function buildMentatRunnerRequest(params: {
   activeWindow: MalikSandboxGraphWakeWindow;
   idempotencyKey: string;
@@ -699,6 +876,8 @@ function summarizeMentatRunnerResult(result: MentatSandboxWorkflowRunResult):
     return { accepted: false, hostStatus: "runner_status_invalid" };
   }
   const handlingStage = sanitizeRunnerHandlingStage(result.handlingStage);
+  const runtime = sanitizeRunnerRuntimeFacts(result.runtime);
+  const disabledLiveActions = sanitizeRunnerDisabledLiveActions(result.disabledLiveActions);
   return {
     accepted: true,
     summary: {
@@ -706,7 +885,67 @@ function summarizeMentatRunnerResult(result: MentatSandboxWorkflowRunResult):
       proofScope: result.proofScope,
       ...(handlingStage ? { handlingStage } : {}),
       redacted: true,
+      ...(runtime ? { runtime } : {}),
+      ...(disabledLiveActions ? { disabledLiveActions } : {}),
     },
+  };
+}
+
+// Whitelist only the three small non-negative integer runtime facts. The first
+// host proof must stop at no worker dispatch, so workersDispatched must be 0.
+// Any missing / non-finite / negative / out-of-bounds value omits the block.
+function sanitizeRunnerRuntimeFacts(
+  runtime: MentatSandboxWorkflowRunResult["runtime"],
+): MentatRunnerRuntimeFacts | undefined {
+  if (!runtime) {
+    return undefined;
+  }
+  const scanRecorded = runtime.scanRecorded;
+  const workflowsCreated = runtime.workflowsCreated;
+  const workersDispatched = runtime.workersDispatched;
+  if (
+    !isSafeRuntimeCount(scanRecorded) ||
+    !isSafeRuntimeCount(workflowsCreated) ||
+    !isSafeRuntimeCount(workersDispatched) ||
+    workersDispatched !== 0
+  ) {
+    return undefined;
+  }
+  return { scanRecorded, workflowsCreated, workersDispatched };
+}
+
+function isSafeRuntimeCount(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_SAFE_RUNNER_RUNTIME_COUNT
+  );
+}
+
+// Whitelist only the five disabled-action booleans and require each to be
+// exactly false. Any missing or non-false value omits the block.
+function sanitizeRunnerDisabledLiveActions(
+  disabledLiveActions: MentatSandboxWorkflowRunResult["disabledLiveActions"],
+): MentatRunnerDisabledLiveActions | undefined {
+  if (!disabledLiveActions) {
+    return undefined;
+  }
+  if (
+    disabledLiveActions.emailSend !== false ||
+    disabledLiveActions.vendorOrCustomerContact !== false ||
+    disabledLiveActions.netSuiteMutation !== false ||
+    disabledLiveActions.productionRuntimeOrAccess !== false ||
+    disabledLiveActions.oldRuntimeFallback !== false
+  ) {
+    return undefined;
+  }
+  return {
+    emailSend: false,
+    vendorOrCustomerContact: false,
+    netSuiteMutation: false,
+    productionRuntimeOrAccess: false,
+    oldRuntimeFallback: false,
   };
 }
 
@@ -735,6 +974,7 @@ function buildWakeRequest(params: {
   sessionKey: string;
   sourceRefs: string[];
   mentatRunner: MalikAgentWakeRequest["payload"]["mentatRunner"];
+  sandboxFixtureSourceMapping?: SandboxFixtureSourceMappingEvidence;
 }): MalikAgentWakeRequest {
   return {
     message: "Mentat Malik sandbox Graph webhook wake",
@@ -754,6 +994,9 @@ function buildWakeRequest(params: {
       notification: params.notification,
       restrictedWakeTarget: params.restrictedWakeTarget,
       mentatRunner: params.mentatRunner,
+      ...(params.sandboxFixtureSourceMapping
+        ? { sandboxFixtureSourceMapping: params.sandboxFixtureSourceMapping }
+        : {}),
     },
   };
 }

@@ -165,6 +165,26 @@
               }
             }
           },
+          "sandboxFixtureSource": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "enabled",
+              "sourceId",
+              "fixtureClass"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "sourceId": {
+                "const": "source-po-new-millenium-1129895-enriched"
+              },
+              "fixtureClass": {
+                "const": "role_pack_sanitized_po_create_fixture"
+              }
+            }
+          },
           "clientStateSha256": {
             "type": "string",
             "pattern": "^[a-fA-F0-9]{64}$"

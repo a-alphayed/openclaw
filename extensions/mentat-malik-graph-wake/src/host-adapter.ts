@@ -13,6 +13,7 @@ import {
   parseOutlookMessageNotificationResource,
   type AgentWakePostResult,
   type MalikAgentWakeRequest,
+  type MalikSandboxFixtureSourceConfig,
   type MalikSandboxGraphWakeDependencies,
   type MalikSandboxGraphWakeState,
   type MalikSandboxGraphWakeWindow,
@@ -223,6 +224,8 @@ function sanitizeMentatRunnerResult(
     readString(asRecord(value.failure)?.code) ?? status,
   );
   const handlingStage = sanitizeRunnerHandlingStage(readString(value.handlingStage));
+  const runtime = extractRunnerRuntimeFacts(value.runtime);
+  const disabledLiveActions = extractRunnerDisabledLiveActions(value.disabledLiveActions);
   return {
     ok,
     status:
@@ -234,7 +237,60 @@ function sanitizeMentatRunnerResult(
       ? { proofScope: value.proofScope }
       : {}),
     ...(handlingStage ? { handlingStage } : {}),
+    ...(runtime ? { runtime } : {}),
+    ...(disabledLiveActions ? { disabledLiveActions } : {}),
     ...(!ok ? { failure: { code: failureCode } } : {}),
+  };
+}
+
+// Extracts only the three small integer counts from the committed Mentat runner
+// shape (runtime.scan.recorded, runtime.loopTick.workflowsCreated/workersDispatched).
+// The bridge summarizer re-validates bounds and the workersDispatched===0 gate
+// and omits the block on any unsafe value, so this stays a pure shape-map.
+function extractRunnerRuntimeFacts(
+  value: unknown,
+): NonNullable<MentatSandboxWorkflowRunResult["runtime"]> | undefined {
+  const runtime = asRecord(value);
+  if (!runtime) {
+    return undefined;
+  }
+  const scan = asRecord(runtime.scan);
+  const loopTick = asRecord(runtime.loopTick);
+  return {
+    ...(typeof scan?.recorded === "number" ? { scanRecorded: scan.recorded } : {}),
+    ...(typeof loopTick?.workflowsCreated === "number"
+      ? { workflowsCreated: loopTick.workflowsCreated }
+      : {}),
+    ...(typeof loopTick?.workersDispatched === "number"
+      ? { workersDispatched: loopTick.workersDispatched }
+      : {}),
+  };
+}
+
+// Extracts only the five disabled-action booleans from the committed runner
+// shape. The bridge summarizer requires each to be exactly false and omits the
+// block otherwise.
+function extractRunnerDisabledLiveActions(
+  value: unknown,
+): NonNullable<MentatSandboxWorkflowRunResult["disabledLiveActions"]> | undefined {
+  const disabled = asRecord(value);
+  if (!disabled) {
+    return undefined;
+  }
+  return {
+    ...(typeof disabled.emailSend === "boolean" ? { emailSend: disabled.emailSend } : {}),
+    ...(typeof disabled.vendorOrCustomerContact === "boolean"
+      ? { vendorOrCustomerContact: disabled.vendorOrCustomerContact }
+      : {}),
+    ...(typeof disabled.netSuiteMutation === "boolean"
+      ? { netSuiteMutation: disabled.netSuiteMutation }
+      : {}),
+    ...(typeof disabled.productionRuntimeOrAccess === "boolean"
+      ? { productionRuntimeOrAccess: disabled.productionRuntimeOrAccess }
+      : {}),
+    ...(typeof disabled.oldRuntimeFallback === "boolean"
+      ? { oldRuntimeFallback: disabled.oldRuntimeFallback }
+      : {}),
   };
 }
 
@@ -335,6 +391,7 @@ function loadActiveWindow(
     allowedActions,
     sourceScope,
     sandboxSafeRecipientPlan: readSandboxSafeRecipientPlan(activeWindow.sandboxSafeRecipientPlan),
+    sandboxFixtureSource: readSandboxFixtureSource(activeWindow.sandboxFixtureSource),
     verifyClientState: (clientState) => verifySha256Digest(clientState, clientStateSha256),
   };
 }
@@ -676,6 +733,29 @@ function readSandboxSafeRecipientPlan(
       const normalized = readString(recipient);
       return normalized ? [normalized] : [];
     }),
+  };
+}
+
+// Carries the optional sandbox fixture-source config when the object is PRESENT
+// and well-shaped, preserving the raw sourceId/fixtureClass values so the bridge
+// resolver can HARD BLOCK (fail closed) on any allowlist mismatch rather than
+// silently dropping an invalid override. Returns undefined only when the object
+// is genuinely absent or malformed -> default hashed Graph wake source id
+// (behavior unchanged). The bridge resolver re-validates every condition.
+function readSandboxFixtureSource(value: unknown): MalikSandboxFixtureSourceConfig | undefined {
+  const input = asRecord(value);
+  if (!input || !("enabled" in input) || typeof input.enabled !== "boolean") {
+    return undefined;
+  }
+  const sourceId = readString(input.sourceId);
+  const fixtureClass = readString(input.fixtureClass);
+  if (sourceId === undefined || fixtureClass === undefined) {
+    return undefined;
+  }
+  return {
+    enabled: input.enabled,
+    sourceId,
+    fixtureClass,
   };
 }
 

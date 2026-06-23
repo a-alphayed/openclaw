@@ -895,3 +895,159 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(JSON.stringify(second.body)).not.toContain("wake-redacted");
   });
 });
+
+const FIXTURE_SOURCE_ID = "source-po-new-millenium-1129895-enriched";
+const FIXTURE_SOURCE_CLASS = "role_pack_sanitized_po_create_fixture";
+
+describe("Malik sandbox Graph wake host adapter fixture-source mapping", () => {
+  it("maps the scanned source id through the host adapter when the window config is valid", async () => {
+    const runMentatSandboxWorkflow = vi.fn(async () => ({
+      ok: true as const,
+      status: "open" as const,
+      redacted: true as const,
+      proofScope: "graph_wake_to_mentat_no_live_workflow" as const,
+      handlingStage: "created_waiting_on_approval",
+    }));
+    const { deps } = createHarness({
+      config: pluginConfig({
+        activeWindow: activeWindowConfig({
+          sandboxFixtureSource: {
+            enabled: true,
+            sourceId: FIXTURE_SOURCE_ID,
+            fixtureClass: FIXTURE_SOURCE_CLASS,
+          },
+        }),
+      }),
+      runMentatSandboxWorkflow,
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: true,
+      status: "wake_scheduled",
+      sandboxFixtureSourceMapping: { applied: true, sourceAuthority: false },
+    });
+    expect(runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    const runnerInput = runMentatSandboxWorkflow.mock.calls[0][0];
+    expect(runnerInput.sources[0].id).toBe(FIXTURE_SOURCE_ID);
+    expect(runnerInput.sources[0].metadata.sandboxFixtureSource).toMatchObject({
+      sourceAuthority: false,
+      fixtureClass: FIXTURE_SOURCE_CLASS,
+      sourceId: FIXTURE_SOURCE_ID,
+      label: "sandbox_fixture_source_mapping",
+    });
+    // No raw token/clientState leaks into the mapped runner input. (The
+    // notification.resource field carrying the redacted message-id segment is
+    // pre-existing committed runner input, unchanged by the fixture mapping.)
+    const rendered = JSON.stringify(runnerInput);
+    expect(rendered).not.toContain(FAKE_GRAPH_TOKEN);
+    expect(rendered).not.toContain(EXPECTED_CLIENT_STATE);
+    expect(rendered).not.toContain("MENTAT_MALIK_GRAPH_TOKEN");
+  });
+
+  it("keeps the default hashed source id when no sandboxFixtureSource is configured", async () => {
+    const runMentatSandboxWorkflow = vi.fn(async () => ({
+      ok: true as const,
+      status: "open" as const,
+      redacted: true as const,
+      proofScope: "graph_wake_to_mentat_no_live_workflow" as const,
+      handlingStage: "created_waiting_on_approval",
+    }));
+    const { deps } = createHarness({ runMentatSandboxWorkflow });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(response.body).not.toHaveProperty("sandboxFixtureSourceMapping");
+    const runnerInput = runMentatSandboxWorkflow.mock.calls[0][0];
+    expect(runnerInput.sources[0].id).toMatch(/^graph-wake-source-[a-f0-9]{32}$/);
+    expect(runnerInput.sources[0].metadata).not.toHaveProperty("sandboxFixtureSource");
+  });
+
+  it("fails closed at the bridge when the host carries an unapproved sourceId", async () => {
+    const runMentatSandboxWorkflow = vi.fn();
+    const { deps, scheduleSessionTurn } = createHarness({
+      config: pluginConfig({
+        activeWindow: activeWindowConfig({
+          sandboxFixtureSource: {
+            enabled: true,
+            sourceId: "source-not-allowed",
+            fixtureClass: FIXTURE_SOURCE_CLASS,
+          },
+        }),
+      }),
+      runMentatSandboxWorkflow,
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_fixture_source_rejected",
+    });
+    expect(runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(scheduleSessionTurn).not.toHaveBeenCalled();
+  });
+});
+
+describe("Malik sandbox Graph wake host adapter runner summary", () => {
+  it("maps nested subprocess runtime/disabled-action facts into the redacted summary", async () => {
+    const runnerOutput = {
+      ok: true,
+      status: "open",
+      redacted: true,
+      proofScope: "graph_wake_to_mentat_no_live_workflow",
+      handlingStage: "created_waiting_on_approval",
+      runtime: {
+        scan: { recorded: 1, skipped: 0 },
+        loopTick: { workflowsCreated: 1, workersDispatched: 0 },
+      },
+      disabledLiveActions: {
+        emailSend: false,
+        vendorOrCustomerContact: false,
+        netSuiteMutation: false,
+        productionRuntimeOrAccess: false,
+        oldRuntimeFallback: false,
+      },
+    };
+    const subprocessScript = [
+      "const fs = require('node:fs');",
+      "const out = process.argv[process.argv.indexOf('--output') + 1];",
+      `fs.writeFileSync(out, JSON.stringify(${JSON.stringify(runnerOutput)}));`,
+    ].join(" ");
+    const { deps } = createHarness({
+      config: pluginConfig({
+        mentatRunner: {
+          command: "node",
+          args: ["-e", subprocessScript, "--"],
+          roleBindingId: "binding-malik-sandbox-graph-wake-runner",
+          engineDataRoot: "/redacted/state",
+          rolePackPath: "/redacted/role-pack",
+          roleKbPath: "/redacted/role-kb",
+        },
+      }),
+      runMentatSandboxWorkflow: null,
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: true,
+      status: "wake_scheduled",
+      mentatRunner: {
+        status: "open",
+        redacted: true,
+        runtime: { scanRecorded: 1, workflowsCreated: 1, workersDispatched: 0 },
+        disabledLiveActions: {
+          emailSend: false,
+          vendorOrCustomerContact: false,
+          netSuiteMutation: false,
+          productionRuntimeOrAccess: false,
+          oldRuntimeFallback: false,
+        },
+      },
+    });
+  });
+});
