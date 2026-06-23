@@ -235,6 +235,14 @@ function approvedWindowFixture(): JsonRecord {
         id: "MENTAT_MALIK_GRAPH_TOKEN",
       },
     },
+    mentatRunner: {
+      command: "node",
+      args: ["scripts/run-malik-sandbox-graph-wake-workflow.ts"],
+      roleBindingId: "binding-malik-sandbox-graph-wake-runner",
+      engineDataRoot: "/redacted/mentat-state",
+      rolePackPath: "/redacted/examples/role-packs/malik",
+      roleKbPath: "/redacted/examples/role-kbs/malik",
+    },
   };
 }
 
@@ -273,6 +281,7 @@ describe("mentat malik graph wake manifest config schema", () => {
     expect(validateAgainstSchema(schema, { enabled: false })).toEqual([]);
     expect(properties.activeWindow).toBeDefined();
     expect(properties.graph).toBeDefined();
+    expect(properties.mentatRunner).toBeDefined();
     expect(schema.additionalProperties).toBe(false);
   });
 
@@ -380,6 +389,39 @@ describe("mentat malik graph wake manifest config schema", () => {
     expect(bearerTokenRefProperties).not.toHaveProperty("value");
     expect(bearerTokenRefProperties).not.toHaveProperty("token");
     expect(bearerTokenRefProperties).not.toHaveProperty("password");
+  });
+
+  it("requires a fixed Mentat runner command/config without raw secret fields", () => {
+    const runner = requireRecord(
+      propertiesOf(readManifestConfigSchema()).mentatRunner,
+      "mentatRunner",
+    );
+    const runnerProperties = propertiesOf(runner);
+
+    expect(runner.additionalProperties).toBe(false);
+    expect(requiredOf(runner)).toEqual([
+      "command",
+      "roleBindingId",
+      "engineDataRoot",
+      "rolePackPath",
+      "roleKbPath",
+    ]);
+    expect(runnerProperties.command).toBeDefined();
+    expect(runnerProperties.args).toBeDefined();
+    expect(runnerProperties.cwd).toBeDefined();
+    expect(runnerProperties).not.toHaveProperty("token");
+    expect(runnerProperties).not.toHaveProperty("clientState");
+    expect(runnerProperties).not.toHaveProperty("rawSource");
+    expect(
+      validateAgainstSchema(runner, {
+        command: "node",
+        roleBindingId: "binding",
+        engineDataRoot: "/redacted/state",
+        rolePackPath: "/redacted/role-pack",
+        roleKbPath: "/redacted/role-kb",
+        token: "not-allowed",
+      }),
+    ).toContain("$.token is not allowed");
   });
 
   it("validates the approved host-proof window fixture with only a SecretRef token reference", () => {

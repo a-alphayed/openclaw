@@ -56,7 +56,10 @@
           "runtimeProfile": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["environmentClass", "environmentId"],
+            "required": [
+              "environmentClass",
+              "environmentId"
+            ],
             "properties": {
               "environmentClass": {
                 "const": "sandbox"
@@ -69,7 +72,10 @@
           "netSuiteTarget": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["environmentClass", "environmentId"],
+            "required": [
+              "environmentClass",
+              "environmentId"
+            ],
             "properties": {
               "environmentClass": {
                 "const": "sandbox"
@@ -86,7 +92,10 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["family", "action"],
+              "required": [
+                "family",
+                "action"
+              ],
               "properties": {
                 "family": {
                   "const": "purchase_orders"
@@ -102,15 +111,24 @@
             "additionalProperties": false,
             "anyOf": [
               {
-                "required": ["selector"]
+                "required": [
+                  "selector"
+                ]
               },
               {
-                "required": ["receivedAfter", "receivedBefore"]
+                "required": [
+                  "receivedAfter",
+                  "receivedBefore"
+                ]
               }
             ],
             "dependentRequired": {
-              "receivedAfter": ["receivedBefore"],
-              "receivedBefore": ["receivedAfter"]
+              "receivedAfter": [
+                "receivedBefore"
+              ],
+              "receivedBefore": [
+                "receivedAfter"
+              ]
             },
             "properties": {
               "selector": {
@@ -130,7 +148,10 @@
           "sandboxSafeRecipientPlan": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["enabled", "recipients"],
+            "required": [
+              "enabled",
+              "recipients"
+            ],
             "properties": {
               "enabled": {
                 "type": "boolean"
@@ -153,15 +174,25 @@
       "graph": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["bearerTokenRef"],
+        "required": [
+          "bearerTokenRef"
+        ],
         "properties": {
           "bearerTokenRef": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["source", "provider", "id"],
+            "required": [
+              "source",
+              "provider",
+              "id"
+            ],
             "properties": {
               "source": {
-                "enum": ["env", "file", "exec"]
+                "enum": [
+                  "env",
+                  "file",
+                  "exec"
+                ]
               },
               "provider": {
                 "type": "string",
@@ -172,6 +203,52 @@
                 "minLength": 1
               }
             }
+          }
+        }
+      },
+      "mentatRunner": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "roleBindingId",
+          "engineDataRoot",
+          "rolePackPath",
+          "roleKbPath"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "roleBindingId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "engineDataRoot": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rolePackPath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "roleKbPath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "timeoutMs": {
+            "type": "number"
           }
         }
       }

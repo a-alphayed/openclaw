@@ -6,10 +6,34 @@ export const MALIK_SANDBOX_OPENCLAW_AGENT_ID = "malik-mentat-sandbox";
 export const MALIK_SANDBOX_WINDOW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
 const MAX_BODY_BYTES = 64 * 1024;
+const SAFE_RUNNER_FAILURE_CODES = new Set([
+  "invalid_input",
+  "host_wake_preflight_failed",
+  "runtime_profile_not_sandbox",
+  "source_binding_mismatch",
+  "workflow_family_mismatch",
+  "prohibited_effect_declared",
+  "redaction_failed",
+  "runtime_error",
+  "mentat_runner_not_configured",
+  "mentat_runner_timeout",
+  "mentat_runner_failed",
+  "mentat_runner_output_invalid",
+  "runner_result_not_redacted",
+  "runner_status_invalid",
+]);
+const SAFE_RUNNER_HANDLING_STAGES = new Set([
+  "completed_no_live_planning",
+  "created_waiting_on_approval",
+  "blocked_no_matching_workflow",
+  "failed_preflight",
+]);
 
 export type RuntimeProfileRef = {
+  runtimeProfileId?: string;
   environmentClass: "sandbox" | "production";
   environmentId: string;
+  sourceProfileId?: string;
 };
 
 export type WorkflowActionRef = {
@@ -53,6 +77,31 @@ export type ScopedSourceFetchRequest = {
   notification: GraphNotificationSummary;
 };
 
+export type ScopedMentatSourceRecord = {
+  id: string;
+  providerId: "email";
+  externalId: string;
+  sourceType: "email_thread";
+  receivedAt: string;
+  subject: string;
+  summary: string;
+  rawRef: string;
+  artifactRefs: string[];
+  handledStatus: "new";
+  metadata: {
+    email: {
+      provider: "microsoft_graph";
+      accountId: string;
+      threadId: string;
+      messageIds: string[];
+      receivedAt: string;
+      parentFolderId: "inbox";
+      to: Array<{ name: string; address: string }>;
+    };
+  };
+  runtimeProfile: RuntimeProfileRef;
+};
+
 export type ScopedSourceBlockReason =
   | "host_graph_source_unconfigured"
   | "host_graph_source_unavailable"
@@ -60,6 +109,7 @@ export type ScopedSourceBlockReason =
 
 export type ScopedSourceFetchResult = {
   sourceRefs: string[];
+  sources: ScopedMentatSourceRecord[];
   blockedReason?: ScopedSourceBlockReason;
   hostStatus?: string;
 };
@@ -114,6 +164,12 @@ export type MalikAgentWakeRequest = {
     sourceRefs: string[];
     notification: GraphNotificationSummary;
     restrictedWakeTarget: RestrictedWakeTargetProof;
+    mentatRunner: {
+      status: "closed" | "open" | "blocked";
+      proofScope?: "graph_wake_to_mentat_no_live_workflow";
+      handlingStage?: string;
+      redacted: true;
+    };
   };
 };
 
@@ -122,6 +178,36 @@ export type AgentWakePostResult = {
   wakeId?: string;
   status?: string;
 };
+
+export type MentatSandboxWorkflowRunRequest = {
+  idempotencyKey: string;
+  sandboxWindowId: string;
+  workflowFamily: "purchase_orders.create_po";
+  runtimeProfile: RuntimeProfileRef;
+  sourceBinding: {
+    sourceId: "malik-email-inbox";
+    mailbox: typeof MALIK_SANDBOX_MAILBOX;
+  };
+  hostWakeProof: Record<string, unknown>;
+  sources: ScopedMentatSourceRecord[];
+  sourceRefs: string[];
+  notification: GraphNotificationSummary;
+  restrictedWakeTarget: RestrictedWakeTargetProof;
+  now: string;
+};
+
+export type MentatSandboxWorkflowRunResult = {
+  ok: boolean;
+  status: "closed" | "open" | "blocked" | "failed";
+  redacted: true;
+  proofScope?: "graph_wake_to_mentat_no_live_workflow";
+  handlingStage?: string;
+  failure?: { code?: string };
+};
+
+export type MentatSandboxWorkflowRunner = (
+  request: MentatSandboxWorkflowRunRequest,
+) => Promise<MentatSandboxWorkflowRunResult>;
 
 export type MalikSandboxGraphWakeState = {
   inFlightScopes: Set<string>;
@@ -135,6 +221,7 @@ export type MalikSandboxGraphWakeDependencies = {
     request: RestrictedWakeTargetValidationRequest,
   ) => Promise<RestrictedWakeTargetValidationResult>;
   fetchScopedSource: (request: ScopedSourceFetchRequest) => Promise<ScopedSourceFetchResult>;
+  runMentatSandboxWorkflow: MentatSandboxWorkflowRunner;
   postAgentWake: (request: MalikAgentWakeRequest) => Promise<AgentWakePostResult>;
   now?: () => Date;
 };
@@ -181,6 +268,7 @@ type BlockReason =
   | "sandbox_wake_target_unavailable"
   | "sandbox_wake_target_not_restricted"
   | ScopedSourceBlockReason
+  | "mentat_runner_rejected"
   | "host_poster_rejected";
 
 export function isSafeSandboxWindowId(value: string): boolean {
@@ -310,17 +398,43 @@ export async function handleMalikSandboxGraphWakeRequest(
     }
 
     const sourceRefs = sourceResult.sourceRefs.filter((ref) => ref.trim().length > 0);
-    if (sourceRefs.length === 0) {
+    const sources = sourceResult.sources.filter((source) => source.id.trim().length > 0);
+    if (sourceRefs.length === 0 || sources.length === 0) {
       return blocked("source_scope_empty");
+    }
+
+    const redactedNotification = redactNotification(parsedNotification);
+    let runnerResult: MentatSandboxWorkflowRunResult;
+    try {
+      runnerResult = await deps.runMentatSandboxWorkflow(
+        buildMentatRunnerRequest({
+          activeWindow,
+          idempotencyKey,
+          notification: redactedNotification,
+          restrictedWakeTarget: targetValidation.proof,
+          sessionKey,
+          sources,
+          sourceRefs,
+          now: deps.now?.() ?? new Date(),
+        }),
+      );
+    } catch {
+      return blocked("mentat_runner_rejected", { hostStatus: "runner_threw" });
+    }
+
+    const runnerSummary = summarizeMentatRunnerResult(runnerResult);
+    if (!runnerSummary.accepted) {
+      return blocked("mentat_runner_rejected", { hostStatus: runnerSummary.hostStatus });
     }
 
     const wakeRequest = buildWakeRequest({
       activeWindow,
       idempotencyKey,
-      notification: redactNotification(parsedNotification),
+      notification: redactedNotification,
       restrictedWakeTarget: targetValidation.proof,
       sessionKey,
       sourceRefs,
+      mentatRunner: runnerSummary.summary,
     });
     const postResult = await deps.postAgentWake(wakeRequest);
     if (!postResult.accepted) {
@@ -333,6 +447,7 @@ export async function handleMalikSandboxGraphWakeRequest(
       wakeId: postResult.wakeId,
       idempotencyKey,
       restrictedWakeTarget: targetValidation.proof,
+      mentatRunner: runnerSummary.summary,
     });
   } finally {
     deps.state.inFlightScopes.delete(scopeKey);
@@ -460,6 +575,158 @@ function hasApprovedSourceScope(sourceScope: MalikSandboxSourceScope): boolean {
   return hasSelector;
 }
 
+function buildMentatRunnerRequest(params: {
+  activeWindow: MalikSandboxGraphWakeWindow;
+  idempotencyKey: string;
+  notification: GraphNotificationSummary;
+  restrictedWakeTarget: RestrictedWakeTargetProof;
+  sessionKey: string;
+  sourceRefs: string[];
+  sources: ScopedMentatSourceRecord[];
+  now: Date;
+}): MentatSandboxWorkflowRunRequest {
+  const runtimeProfile = mentatSandboxRuntimeProfile(params.activeWindow.runtimeProfile);
+  return {
+    idempotencyKey: params.idempotencyKey,
+    sandboxWindowId: params.activeWindow.id,
+    workflowFamily: "purchase_orders.create_po",
+    runtimeProfile,
+    sourceBinding: {
+      sourceId: "malik-email-inbox",
+      mailbox: MALIK_SANDBOX_MAILBOX,
+    },
+    hostWakeProof: buildRedactedHostWakeProof({
+      activeWindow: params.activeWindow,
+      restrictedWakeTarget: params.restrictedWakeTarget,
+      sessionKey: params.sessionKey,
+    }),
+    sources: params.sources.map((source) => ({ ...source, runtimeProfile })),
+    sourceRefs: [...params.sourceRefs],
+    notification: params.notification,
+    restrictedWakeTarget: params.restrictedWakeTarget,
+    now: params.now.toISOString(),
+  };
+}
+
+function buildRedactedHostWakeProof(params: {
+  activeWindow: MalikSandboxGraphWakeWindow;
+  restrictedWakeTarget: RestrictedWakeTargetProof;
+  sessionKey: string;
+}): Record<string, unknown> {
+  return {
+    proofMode: "host_redacted_sandbox_graph_wake",
+    workflowFamily: "purchase_orders.create_po",
+    proofScope: "wake_scheduled_only",
+    sandboxGraphWakeProofStatus: "open",
+    evidenceSource: {
+      sourceClass: "host_deployment_submitted_redacted",
+      hostOwned: true,
+      localFixture: false,
+      templateOnly: false,
+    },
+    hostBindings: {
+      sourceBinding: {
+        sourceId: "malik-email-inbox",
+        mailbox: MALIK_SANDBOX_MAILBOX,
+        observedMailbox: MALIK_SANDBOX_MAILBOX,
+        mailboxIdentityHostAttested: true,
+        redacted: true,
+      },
+      runtimeProfile: {
+        runtimeProfileRequirement: "sandbox_only",
+        targetClass: "sandbox",
+        mutationAttempted: false,
+        productionAccess: false,
+        redacted: true,
+      },
+      wakeRouteBinding: {
+        sessionTarget: params.sessionKey,
+        targetClass: "restricted_subagent_lane",
+        wakeScheduledStatus: "wake_scheduled",
+        sandboxLaneClass: "mentat_sandbox",
+        safeWindowId: params.activeWindow.id,
+        singleFlight: true,
+        redacted: true,
+      },
+    },
+    proofPacket: {
+      redacted: true,
+      containsSourceAuthority: false,
+      containsEmailSend: false,
+      containsVendorOrCustomerContact: false,
+      containsExternalMutation: false,
+      containsProductionRuntime: false,
+      containsOldRuntimeFallback: false,
+      containsLiveNetSuiteMutation: false,
+      containsProductionNetSuiteAccess: false,
+      containsRawIds: false,
+      containsMessageBodiesOrHeaders: false,
+      containsUrls: false,
+      containsLocalPaths: false,
+      containsTokensOrSecrets: false,
+      containsLogs: false,
+      containsNetSuiteAccountOrRoleValues: false,
+      containsOldWorkspaceFields: false,
+    },
+    confirmations: {
+      noWorkflowExecutionProof: true,
+      noEmailSendProof: true,
+      noNetSuiteMutationProof: true,
+      noProductionReadinessClaim: true,
+      exactDedicatedAgentHostAttestedOnly: true,
+      primaryAgentDerivedFromRolePackIdPolicy: true,
+    },
+    redactedDiagnostics: true,
+  };
+}
+
+function summarizeMentatRunnerResult(result: MentatSandboxWorkflowRunResult):
+  | {
+      accepted: true;
+      summary: MalikAgentWakeRequest["payload"]["mentatRunner"];
+    }
+  | { accepted: false; hostStatus: string } {
+  if (result.redacted !== true) {
+    return { accepted: false, hostStatus: "runner_result_not_redacted" };
+  }
+  if (result.ok !== true) {
+    return {
+      accepted: false,
+      hostStatus: sanitizeRunnerFailureCode(result.failure?.code ?? result.status),
+    };
+  }
+  if (result.status !== "open" && result.status !== "blocked" && result.status !== "closed") {
+    return { accepted: false, hostStatus: "runner_status_invalid" };
+  }
+  const handlingStage = sanitizeRunnerHandlingStage(result.handlingStage);
+  return {
+    accepted: true,
+    summary: {
+      status: result.status,
+      proofScope: result.proofScope,
+      ...(handlingStage ? { handlingStage } : {}),
+      redacted: true,
+    },
+  };
+}
+
+function sanitizeRunnerFailureCode(value: string | undefined): string {
+  return value && SAFE_RUNNER_FAILURE_CODES.has(value) ? value : "mentat_runner_failed";
+}
+
+function sanitizeRunnerHandlingStage(value: string | undefined): string | undefined {
+  return value && SAFE_RUNNER_HANDLING_STAGES.has(value) ? value : undefined;
+}
+
+function mentatSandboxRuntimeProfile(runtimeProfile: RuntimeProfileRef): RuntimeProfileRef {
+  return {
+    runtimeProfileId: "malik-sandbox-graph-wake",
+    environmentClass: runtimeProfile.environmentClass,
+    environmentId: runtimeProfile.environmentId,
+    sourceProfileId: "malik-mentat-outlook-inbox",
+  };
+}
+
 function buildWakeRequest(params: {
   activeWindow: MalikSandboxGraphWakeWindow;
   idempotencyKey: string;
@@ -467,6 +734,7 @@ function buildWakeRequest(params: {
   restrictedWakeTarget: RestrictedWakeTargetProof;
   sessionKey: string;
   sourceRefs: string[];
+  mentatRunner: MalikAgentWakeRequest["payload"]["mentatRunner"];
 }): MalikAgentWakeRequest {
   return {
     message: "Mentat Malik sandbox Graph webhook wake",
@@ -485,6 +753,7 @@ function buildWakeRequest(params: {
       sourceRefs: [...params.sourceRefs],
       notification: params.notification,
       restrictedWakeTarget: params.restrictedWakeTarget,
+      mentatRunner: params.mentatRunner,
     },
   };
 }

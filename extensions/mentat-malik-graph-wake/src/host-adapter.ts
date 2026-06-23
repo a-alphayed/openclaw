@@ -1,4 +1,8 @@
+import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isSecretRef } from "openclaw/plugin-sdk/secret-input";
 import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/secret-input-runtime";
 import type { OpenClawPluginApi } from "../api.js";
@@ -13,10 +17,14 @@ import {
   type MalikSandboxGraphWakeState,
   type MalikSandboxGraphWakeWindow,
   type MalikSandboxSourceScope,
+  type MentatSandboxWorkflowRunner,
+  type MentatSandboxWorkflowRunRequest,
+  type MentatSandboxWorkflowRunResult,
   type RestrictedWakeTargetProof,
   type RestrictedWakeTargetValidationRequest,
   type RestrictedWakeTargetValidationResult,
   type RuntimeProfileRef,
+  type ScopedMentatSourceRecord,
   type ScopedSourceFetchRequest,
   type ScopedSourceFetchResult,
   type WorkflowActionRef,
@@ -36,6 +44,28 @@ const SANDBOX_WAKE_EXTRA_SYSTEM_PROMPT = [
 const GRAPH_TOKEN_CONFIG_PATH =
   "plugins.entries.mentat-malik-graph-wake.config.graph.bearerTokenRef";
 const LEGACY_MALIK_OPENCLAW_AGENT_ID = "malik";
+const SAFE_RUNNER_FAILURE_CODES = new Set([
+  "invalid_input",
+  "host_wake_preflight_failed",
+  "runtime_profile_not_sandbox",
+  "source_binding_mismatch",
+  "workflow_family_mismatch",
+  "prohibited_effect_declared",
+  "redaction_failed",
+  "runtime_error",
+  "mentat_runner_not_configured",
+  "mentat_runner_timeout",
+  "mentat_runner_failed",
+  "mentat_runner_output_invalid",
+  "runner_result_not_redacted",
+  "runner_status_invalid",
+]);
+const SAFE_RUNNER_HANDLING_STAGES = new Set([
+  "completed_no_live_planning",
+  "created_waiting_on_approval",
+  "blocked_no_matching_workflow",
+  "failed_preflight",
+]);
 
 const RISKY_TOOL_DENY_COVERAGE: Record<string, { group: string; concrete: string[] }> = {
   outboundSend: { group: "group:messaging", concrete: ["message", "send", "poll"] },
@@ -65,7 +95,19 @@ export type MalikSandboxGraphWakeHostAdapterOptions = {
   state: MalikSandboxGraphWakeState;
   env?: NodeJS.ProcessEnv;
   fetchGraph?: MalikSandboxGraphFetch;
+  runMentatSandboxWorkflow?: MentatSandboxWorkflowRunner;
   now?: () => Date;
+};
+
+type MentatRunnerConfig = {
+  command: string;
+  args: string[];
+  cwd?: string;
+  roleBindingId: string;
+  engineDataRoot: string;
+  rolePackPath: string;
+  roleKbPath: string;
+  timeoutMs: number;
 };
 
 type GraphConfig = {
@@ -77,6 +119,8 @@ export function createMalikSandboxGraphWakeHostDependencies(
 ): MalikSandboxGraphWakeDependencies {
   const env = options.env ?? process.env;
   const fetchGraph = options.fetchGraph ?? defaultGraphFetch;
+  const runMentatSandboxWorkflow =
+    options.runMentatSandboxWorkflow ?? createConfiguredMentatRunner(options.api.pluginConfig);
   return {
     state: options.state,
     now: options.now,
@@ -93,12 +137,155 @@ export function createMalikSandboxGraphWakeHostDependencies(
         env,
         fetchGraph,
       }),
+    runMentatSandboxWorkflow,
     postAgentWake: async (request) => await scheduleHostWake(options.api, request),
   };
 }
 
 async function defaultGraphFetch(url: string, init: FetchInit): Promise<GraphFetchResponse> {
   return await globalThis.fetch(url, init);
+}
+
+function createConfiguredMentatRunner(
+  pluginConfig: OpenClawPluginApi["pluginConfig"],
+): MentatSandboxWorkflowRunner {
+  const config = readMentatRunnerConfig(pluginConfig);
+  return async (request) => {
+    if (!config) {
+      return redactedRunnerFailure("mentat_runner_not_configured");
+    }
+    return await runMentatRunnerSubprocess(config, request);
+  };
+}
+
+async function runMentatRunnerSubprocess(
+  config: MentatRunnerConfig,
+  request: MentatSandboxWorkflowRunRequest,
+): Promise<MentatSandboxWorkflowRunResult> {
+  const tempDir = await mkdtemp(join(tmpdir(), "openclaw-mentat-malik-runner-"));
+  const inputFile = join(tempDir, "input.json");
+  const outputFile = join(tempDir, "output.json");
+  try {
+    await writeFile(inputFile, JSON.stringify(buildMentatRunnerInput(config, request)), "utf8");
+    const child = spawn(
+      config.command,
+      [...config.args, "--input", inputFile, "--output", outputFile],
+      {
+        cwd: config.cwd,
+        shell: false,
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    const exit = await waitForRunner(child, config.timeoutMs);
+    if (exit.code !== 0) {
+      return redactedRunnerFailure(
+        exit.timedOut ? "mentat_runner_timeout" : "mentat_runner_failed",
+      );
+    }
+    const parsed = asRecord(JSON.parse(await readFile(outputFile, "utf8")));
+    if (!parsed) {
+      return redactedRunnerFailure("mentat_runner_output_invalid");
+    }
+    return sanitizeMentatRunnerResult(parsed);
+  } catch {
+    return redactedRunnerFailure("mentat_runner_failed");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function buildMentatRunnerInput(
+  config: MentatRunnerConfig,
+  request: MentatSandboxWorkflowRunRequest,
+): Record<string, unknown> {
+  return {
+    roleBindingId: config.roleBindingId,
+    engineDataRoot: config.engineDataRoot,
+    rolePackPath: config.rolePackPath,
+    roleKbPath: config.roleKbPath,
+    scopeId: "malik-sandbox-graph-wake",
+    workflowFamily: request.workflowFamily,
+    runtimeProfile: request.runtimeProfile,
+    sourceBinding: request.sourceBinding,
+    hostWakeProof: request.hostWakeProof,
+    sources: request.sources,
+    idempotencyKeyPrefix: request.idempotencyKey,
+    now: request.now,
+  };
+}
+
+function sanitizeMentatRunnerResult(
+  value: Record<string, unknown>,
+): MentatSandboxWorkflowRunResult {
+  const status = readString(value.status);
+  const ok = value.ok === true;
+  const failureCode = sanitizeRunnerFailureCode(
+    readString(asRecord(value.failure)?.code) ?? status,
+  );
+  const handlingStage = sanitizeRunnerHandlingStage(readString(value.handlingStage));
+  return {
+    ok,
+    status:
+      status === "closed" || status === "open" || status === "blocked" || status === "failed"
+        ? status
+        : "failed",
+    redacted: true,
+    ...(value.proofScope === "graph_wake_to_mentat_no_live_workflow"
+      ? { proofScope: value.proofScope }
+      : {}),
+    ...(handlingStage ? { handlingStage } : {}),
+    ...(!ok ? { failure: { code: failureCode } } : {}),
+  };
+}
+
+function sanitizeRunnerFailureCode(value: string | undefined): string {
+  return value && SAFE_RUNNER_FAILURE_CODES.has(value) ? value : "mentat_runner_failed";
+}
+
+function sanitizeRunnerHandlingStage(value: string | undefined): string | undefined {
+  return value && SAFE_RUNNER_HANDLING_STAGES.has(value) ? value : undefined;
+}
+
+function redactedRunnerFailure(code: string): MentatSandboxWorkflowRunResult {
+  return {
+    ok: false,
+    status: "failed",
+    redacted: true,
+    failure: { code },
+  };
+}
+
+function waitForRunner(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<{ code: number | null; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill("SIGTERM");
+      resolve({ code: null, timedOut: true });
+    }, timeoutMs);
+    child.once("error", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ code: null, timedOut: false });
+    });
+    child.once("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ code, timedOut: false });
+    });
+  });
 }
 
 function loadActiveWindow(
@@ -159,19 +346,19 @@ async function fetchScopedGraphSource(params: {
   fetchGraph: MalikSandboxGraphFetch;
 }): Promise<ScopedSourceFetchResult> {
   if (params.request.mailbox !== MALIK_SANDBOX_MAILBOX) {
-    return { sourceRefs: [], blockedReason: "source_outside_approved_scope" };
+    return { sourceRefs: [], sources: [], blockedReason: "source_outside_approved_scope" };
   }
 
   const graphConfig = readGraphConfig(params.api.pluginConfig);
   if (!graphConfig || !isSecretRef(graphConfig.bearerTokenRef)) {
-    return { sourceRefs: [], blockedReason: "host_graph_source_unconfigured" };
+    return { sourceRefs: [], sources: [], blockedReason: "host_graph_source_unconfigured" };
   }
 
   const parsedResource = parseOutlookMessageNotificationResource(
     params.request.notification.resource,
   );
   if (!parsedResource) {
-    return { sourceRefs: [], blockedReason: "source_outside_approved_scope" };
+    return { sourceRefs: [], sources: [], blockedReason: "source_outside_approved_scope" };
   }
 
   const resolvedToken = await resolveConfiguredSecretInputString({
@@ -182,7 +369,7 @@ async function fetchScopedGraphSource(params: {
     unresolvedReasonStyle: "generic",
   });
   if (!resolvedToken.value) {
-    return { sourceRefs: [], blockedReason: "host_graph_source_unconfigured" };
+    return { sourceRefs: [], sources: [], blockedReason: "host_graph_source_unconfigured" };
   }
 
   const response = await params.fetchGraph(buildGraphMessageUrl(parsedResource.messageId), {
@@ -195,6 +382,7 @@ async function fetchScopedGraphSource(params: {
   if (!response.ok) {
     return {
       sourceRefs: [],
+      sources: [],
       blockedReason: "host_graph_source_unavailable",
       hostStatus: "graph_fetch_failed",
     };
@@ -202,12 +390,21 @@ async function fetchScopedGraphSource(params: {
 
   const message = asRecord(await response.json());
   if (!message || !messageMatchesSourceScope(message, params.request.sourceScope)) {
-    return { sourceRefs: [], blockedReason: "source_outside_approved_scope" };
+    return { sourceRefs: [], sources: [], blockedReason: "source_outside_approved_scope" };
   }
 
   const messageId = readString(message.id) ?? parsedResource.messageId;
+  const sourceRef = buildRedactedSourceRef({ mailbox: params.request.mailbox, messageId });
   return {
-    sourceRefs: [buildRedactedSourceRef({ mailbox: params.request.mailbox, messageId })],
+    sourceRefs: [sourceRef],
+    sources: [
+      buildScopedMentatSourceRecord({
+        message,
+        messageId,
+        mailbox: params.request.mailbox,
+        sourceRef,
+      }),
+    ],
   };
 }
 
@@ -354,6 +551,8 @@ function buildWakeMessage(request: MalikAgentWakeRequest): string {
     sandboxHandoff: {
       workflowAction: "purchase_orders.create_po",
       graphNotificationAuthority: "wake_only",
+      deterministicMentatRunner: request.payload.mentatRunner,
+      scheduledTurnRole: "operator_visible_marker_only",
       expectedSideEffects: {
         emailSend: false,
         netSuiteMutation: false,
@@ -361,7 +560,8 @@ function buildWakeMessage(request: MalikAgentWakeRequest): string {
       vendorNotification: "blocked_without_approved_sandbox_safe_recipient_plan",
       runtimeBoundary: "sandbox_only",
       instructions: [
-        "Process only through Mentat sandbox runtime/profile/provider seams.",
+        "The deterministic Mentat runner has already handled this attempt through Mentat public runtime seams.",
+        "This scheduled turn is a non-load-bearing marker; do not run Mentat or replay the workflow from this subagent.",
         "Do not use old Malik email, Fleet, NetSuite, or workflow paths.",
         "Do not access production systems, browser/auth/session recovery, or secret/config/env/session/token/cache/log material.",
       ],
@@ -375,6 +575,36 @@ function summarizeSourceScope(sourceScope: MalikSandboxSourceScope): Record<stri
     receivedWindowBounded: Boolean(
       sourceScope.receivedAfter?.trim() && sourceScope.receivedBefore?.trim(),
     ),
+  };
+}
+
+function readMentatRunnerConfig(
+  pluginConfig: OpenClawPluginApi["pluginConfig"],
+): MentatRunnerConfig | null {
+  const runner = asRecord(asRecord(pluginConfig)?.mentatRunner);
+  if (!runner) {
+    return null;
+  }
+  const command = readString(runner.command);
+  const roleBindingId = readString(runner.roleBindingId);
+  const engineDataRoot = readString(runner.engineDataRoot);
+  const rolePackPath = readString(runner.rolePackPath);
+  const roleKbPath = readString(runner.roleKbPath);
+  if (!command || !roleBindingId || !engineDataRoot || !rolePackPath || !roleKbPath) {
+    return null;
+  }
+  const args = readStringArray(runner.args);
+  const timeoutMs =
+    typeof runner.timeoutMs === "number" && runner.timeoutMs > 0 ? runner.timeoutMs : 30_000;
+  return {
+    command,
+    args,
+    cwd: readString(runner.cwd),
+    roleBindingId,
+    engineDataRoot,
+    rolePackPath,
+    roleKbPath,
+    timeoutMs,
   };
 }
 
@@ -500,6 +730,51 @@ function messageMatchesSelector(message: Record<string, unknown>, selector: stri
   const expectedSubject = selector.slice(subjectPrefix.length).trim().toLowerCase();
   const subject = readString(message.subject)?.toLowerCase();
   return Boolean(expectedSubject && subject?.includes(expectedSubject));
+}
+
+function buildScopedMentatSourceRecord(params: {
+  message: Record<string, unknown>;
+  messageId: string;
+  mailbox: string;
+  sourceRef: string;
+}): ScopedMentatSourceRecord {
+  const sourceHash = sha256Hex(`${params.mailbox}|${params.messageId}`).slice(0, 32);
+  const receivedAt = readString(params.message.receivedDateTime) ?? new Date(0).toISOString();
+  return {
+    id: `graph-wake-source-${sourceHash}`,
+    providerId: "email",
+    externalId: params.sourceRef,
+    sourceType: "email_thread",
+    receivedAt,
+    subject: readString(params.message.subject) ?? "Redacted sandbox Graph wake source",
+    summary:
+      "Scoped Microsoft Graph message matched the approved Malik sandbox Graph wake source scope.",
+    rawRef: params.sourceRef,
+    artifactRefs: [],
+    handledStatus: "new",
+    metadata: {
+      email: {
+        provider: "microsoft_graph",
+        accountId: params.mailbox,
+        threadId: `thread-${sourceHash}`,
+        messageIds: [`message-${sourceHash}`],
+        receivedAt,
+        parentFolderId: "inbox",
+        to: [
+          {
+            name: "Malik sandbox mailbox",
+            address: params.mailbox,
+          },
+        ],
+      },
+    },
+    runtimeProfile: {
+      runtimeProfileId: "malik-sandbox-graph-wake",
+      environmentClass: "sandbox",
+      environmentId: NETSUITE_SANDBOX_ENVIRONMENT_ID,
+      sourceProfileId: "malik-mentat-outlook-inbox",
+    },
+  };
 }
 
 function buildRedactedSourceRef(params: { mailbox: string; messageId: string }): string {

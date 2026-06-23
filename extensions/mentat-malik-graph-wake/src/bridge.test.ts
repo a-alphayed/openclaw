@@ -8,6 +8,8 @@ import {
   type MalikSandboxGraphWakeDependencies,
   type MalikSandboxGraphWakeWindow,
   type RestrictedWakeTargetProof,
+  type ScopedMentatSourceRecord,
+  type MentatSandboxWorkflowRunResult,
 } from "./bridge.js";
 
 function windowFixture(
@@ -54,6 +56,51 @@ function graphNotification(
   };
 }
 
+function sourceRecord(id = "graph-wake-source-redacted"): ScopedMentatSourceRecord {
+  return {
+    id,
+    providerId: "email",
+    externalId: "graph-message:redacted",
+    sourceType: "email_thread",
+    receivedAt: "2026-06-20T17:30:00.000Z",
+    subject: "Malik sandbox E2E PO create",
+    summary: "Scoped redacted source content.",
+    rawRef: "graph-message:redacted",
+    artifactRefs: [],
+    handledStatus: "new",
+    metadata: {
+      email: {
+        provider: "microsoft_graph",
+        accountId: MALIK_SANDBOX_MAILBOX,
+        threadId: "thread-redacted",
+        messageIds: ["message-redacted"],
+        receivedAt: "2026-06-20T17:30:00.000Z",
+        parentFolderId: "inbox",
+        to: [{ name: "Malik sandbox mailbox", address: MALIK_SANDBOX_MAILBOX }],
+      },
+    },
+    runtimeProfile: {
+      runtimeProfileId: "malik-sandbox-graph-wake",
+      environmentClass: "sandbox",
+      environmentId: "netsuite-sandbox",
+      sourceProfileId: "malik-mentat-outlook-inbox",
+    },
+  };
+}
+
+function runnerResult(
+  overrides?: Partial<MentatSandboxWorkflowRunResult>,
+): MentatSandboxWorkflowRunResult {
+  return {
+    ok: true,
+    status: "open",
+    redacted: true,
+    proofScope: "graph_wake_to_mentat_no_live_workflow",
+    handlingStage: "created_waiting_on_approval",
+    ...overrides,
+  };
+}
+
 function restrictedWakeTargetProof(
   overrides?: Partial<RestrictedWakeTargetProof>,
 ): RestrictedWakeTargetProof {
@@ -79,7 +126,9 @@ function restrictedWakeTargetProof(
 function createDeps(params?: {
   window?: MalikSandboxGraphWakeWindow | null;
   sourceRefs?: string[];
+  sources?: ScopedMentatSourceRecord[];
   fetchDelay?: Promise<void>;
+  runner?: MentatSandboxWorkflowRunResult;
   targetProof?: RestrictedWakeTargetProof;
   targetValidationOk?: boolean;
 }): MalikSandboxGraphWakeDependencies {
@@ -105,8 +154,12 @@ function createDeps(params?: {
       if (params?.fetchDelay) {
         await params.fetchDelay;
       }
-      return { sourceRefs: params?.sourceRefs ?? ["source-ref-redacted"] };
+      return {
+        sourceRefs: params?.sourceRefs ?? ["source-ref-redacted"],
+        sources: params?.sources ?? [sourceRecord()],
+      };
     }),
+    runMentatSandboxWorkflow: vi.fn(async () => params?.runner ?? runnerResult()),
     postAgentWake: vi.fn(async () => ({ accepted: true, wakeId: "wake-redacted" })),
   };
 }
@@ -141,6 +194,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(response.headers["content-type"]).toBe("text/plain");
     expect(response.body).toBe("hello sandbox");
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -158,6 +212,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(response.statusCode).toBe(202);
     expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
@@ -173,6 +228,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "sandbox_window_unavailable",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -192,6 +248,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(isSafeSandboxWindowId("sandbox-window-2026-06-20")).toBe(true);
     expect(isSafeSandboxWindowId("sandbox-window:unsafe")).toBe(false);
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -207,6 +264,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "client_state_mismatch",
     });
     expect(JSON.stringify(response.body)).not.toContain("wrong-client-state");
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -245,6 +303,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "vendor_notification_recipient_plan_required",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -267,6 +326,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "vendor_notification_recipient_plan_required",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -293,6 +353,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       sessionKey: "agent:malik-mentat-sandbox:subagent:mentat-sandbox-sandbox-window-2026-06-20",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -313,6 +374,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "source_scope_unavailable",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -330,6 +392,7 @@ describe("Malik sandbox Graph wake bridge", () => {
 
     expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
@@ -347,6 +410,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "notification_resource_not_approved",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -369,6 +433,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "source_scope_unavailable",
     });
     expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -397,6 +462,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       },
       sandboxWindowId: "sandbox-window-2026-06-20",
     });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
     const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
     expect(wakeRequest.idempotencyKey).toMatch(/^malik-sandbox-graph-wake:/);
@@ -416,9 +482,29 @@ describe("Malik sandbox Graph wake bridge", () => {
       workflowActions: [{ family: "purchase_orders", action: "create_po" }],
       sourceRefs: ["source-ref-redacted"],
       restrictedWakeTarget: restrictedWakeTargetProof(),
+      mentatRunner: {
+        status: "open",
+        proofScope: "graph_wake_to_mentat_no_live_workflow",
+        handlingStage: "created_waiting_on_approval",
+        redacted: true,
+      },
     });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowFamily: "purchase_orders.create_po",
+        sourceBinding: { sourceId: "malik-email-inbox", mailbox: MALIK_SANDBOX_MAILBOX },
+        sourceRefs: ["source-ref-redacted"],
+        sources: [expect.objectContaining({ id: "graph-wake-source-redacted" })],
+        hostWakeProof: expect.objectContaining({
+          proofMode: "host_redacted_sandbox_graph_wake",
+          proofScope: "wake_scheduled_only",
+        }),
+      }),
+    );
     expect(response.body).toMatchObject({
       restrictedWakeTarget: restrictedWakeTargetProof(),
+      mentatRunner: { status: "open", redacted: true },
     });
   });
 
@@ -449,6 +535,71 @@ describe("Malik sandbox Graph wake bridge", () => {
     }
   });
 
+  it("blocks when the deterministic Mentat runner rejects before scheduling", async () => {
+    const deps = createDeps({
+      runner: {
+        ok: false,
+        status: "failed",
+        redacted: true,
+        failure: { code: "host_wake_preflight_failed" },
+      },
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "mentat_runner_rejected",
+      hostStatus: "host_wake_preflight_failed",
+    });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("redacts untrusted runner failure codes before response fields", async () => {
+    const deps = createDeps({
+      runner: {
+        ok: false,
+        status: "failed",
+        redacted: true,
+        failure: { code: "Bearer raw /Users/example clientState detail" },
+      },
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "mentat_runner_rejected",
+      hostStatus: "mentat_runner_failed",
+    });
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("Bearer");
+    expect(rendered).not.toContain("/Users/example");
+    expect(rendered).not.toContain("clientState");
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("omits untrusted runner handling stages from response and wake payload", async () => {
+    const deps = createDeps({
+      runner: runnerResult({ handlingStage: "Bearer raw /tmp/clientState detail" }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("Bearer");
+    expect(rendered).not.toContain("/tmp/clientState");
+    const mentatRunner = (response.body as { mentatRunner?: Record<string, unknown> }).mentatRunner;
+    expect(mentatRunner).toMatchObject({ status: "open", redacted: true });
+    expect(mentatRunner).not.toHaveProperty("handlingStage");
+    const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
+    expect(wakeRequest.payload.mentatRunner).not.toHaveProperty("handlingStage");
+  });
+
   it("blocks when the approved scoped source is empty", async () => {
     const deps = createDeps({ sourceRefs: [] });
 
@@ -461,6 +612,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       reason: "source_scope_empty",
     });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
     expect(deps.postAgentWake).not.toHaveBeenCalled();
   });
 
@@ -475,6 +627,7 @@ describe("Malik sandbox Graph wake bridge", () => {
       status: "duplicate",
       wakeId: "wake-redacted",
     });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 
@@ -492,6 +645,7 @@ describe("Malik sandbox Graph wake bridge", () => {
 
     expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(second.body).toMatchObject({ ok: true, status: "duplicate" });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
     expect((second.body as Record<string, unknown>).idempotencyKey).toBe(
       (first.body as Record<string, unknown>).idempotencyKey,
@@ -513,6 +667,7 @@ describe("Malik sandbox Graph wake bridge", () => {
     expect(second.body).toMatchObject({ ok: true, status: "coalesced" });
     expect(firstResponse.body).toMatchObject({ ok: true, status: "wake_scheduled" });
     expect(deps.fetchScopedSource).toHaveBeenCalledTimes(1);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
     expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
   });
 });

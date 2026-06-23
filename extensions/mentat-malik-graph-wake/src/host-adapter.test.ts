@@ -9,6 +9,7 @@ import {
   handleMalikSandboxGraphWakeRequest,
   type MalikSandboxGraphWakeDependencies,
   type MalikAgentWakeRequest,
+  type MentatSandboxWorkflowRunResult,
 } from "./bridge.js";
 import {
   createMalikSandboxGraphWakeHostDependencies,
@@ -138,15 +139,32 @@ function createHarness(params?: {
   graphOk?: boolean;
   openClawConfig?: Record<string, unknown>;
   scheduleSessionTurn?: ReturnType<typeof vi.fn>;
+  runnerResult?: MentatSandboxWorkflowRunResult;
+  runMentatSandboxWorkflow?: ReturnType<typeof vi.fn> | null;
 }): {
   deps: MalikSandboxGraphWakeDependencies;
   fetchGraph: ReturnType<typeof vi.fn>;
   scheduleSessionTurn: ReturnType<typeof vi.fn>;
   subagentRun: ReturnType<typeof vi.fn>;
+  runMentatSandboxWorkflow: ReturnType<typeof vi.fn>;
 } {
   const scheduleSessionTurn =
     params?.scheduleSessionTurn ?? vi.fn(async () => ({ id: "wake-redacted" }));
   const subagentRun = vi.fn(async () => ({ runId: "run-redacted" }));
+  const defaultRunner = vi.fn(
+    async () =>
+      params?.runnerResult ?? {
+        ok: true,
+        status: "open",
+        redacted: true,
+        proofScope: "graph_wake_to_mentat_no_live_workflow",
+        handlingStage: "created_waiting_on_approval",
+      },
+  );
+  const runMentatSandboxWorkflow =
+    params && "runMentatSandboxWorkflow" in params
+      ? params.runMentatSandboxWorkflow
+      : defaultRunner;
   const fetchGraph = vi.fn(async () => ({
     ok: params?.graphOk ?? true,
     status: params?.graphOk === false ? 404 : 200,
@@ -166,10 +184,17 @@ function createHarness(params?: {
     api,
     env: params?.env ?? { MENTAT_MALIK_GRAPH_TOKEN: FAKE_GRAPH_TOKEN },
     fetchGraph,
+    ...(runMentatSandboxWorkflow ? { runMentatSandboxWorkflow } : {}),
     now: () => new Date("2026-06-20T17:30:00.000Z"),
     state: createMalikSandboxGraphWakeState(),
   });
-  return { deps, fetchGraph, scheduleSessionTurn, subagentRun };
+  return {
+    deps,
+    fetchGraph,
+    scheduleSessionTurn,
+    subagentRun,
+    runMentatSandboxWorkflow: runMentatSandboxWorkflow ?? defaultRunner,
+  };
 }
 
 async function postNotification(
@@ -597,6 +622,64 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(subagentRun).not.toHaveBeenCalled();
   });
 
+  it("blocks when the deterministic Mentat runner rejects before host scheduling", async () => {
+    const { deps, scheduleSessionTurn, runMentatSandboxWorkflow } = createHarness({
+      runnerResult: {
+        ok: false,
+        status: "failed",
+        redacted: true,
+        failure: { code: "host_wake_preflight_failed" },
+      },
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "mentat_runner_rejected",
+      hostStatus: "host_wake_preflight_failed",
+    });
+    expect(runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    expect(scheduleSessionTurn).not.toHaveBeenCalled();
+  });
+
+  it("redacts raw subprocess runner failure output before response fields", async () => {
+    const rawCode = "Bearer raw /Users/example clientState detail";
+    const subprocessScript = [
+      "const fs = require('node:fs');",
+      "const out = process.argv[process.argv.indexOf('--output') + 1];",
+      `fs.writeFileSync(out, JSON.stringify({ ok: false, status: 'failed', redacted: true, failure: { code: ${JSON.stringify(rawCode)} } }));`,
+    ].join(" ");
+    const { deps, scheduleSessionTurn } = createHarness({
+      config: pluginConfig({
+        mentatRunner: {
+          command: "node",
+          args: ["-e", subprocessScript, "--"],
+          roleBindingId: "binding-malik-sandbox-graph-wake-runner",
+          engineDataRoot: "/redacted/state",
+          rolePackPath: "/redacted/role-pack",
+          roleKbPath: "/redacted/role-kb",
+        },
+      }),
+      runMentatSandboxWorkflow: null,
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "mentat_runner_rejected",
+      hostStatus: "mentat_runner_failed",
+    });
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("Bearer");
+    expect(rendered).not.toContain("/Users/example");
+    expect(rendered).not.toContain("clientState");
+    expect(scheduleSessionTurn).not.toHaveBeenCalled();
+  });
+
   it("blocks when the host scheduler rejects the wake", async () => {
     const scheduleSessionTurn = vi.fn(async () => {
       throw new Error("scheduler rejected with raw detail");
@@ -678,6 +761,12 @@ describe("Malik sandbox Graph wake host adapter", () => {
           riskyCapabilitiesDenied: true,
           rawValuesRedacted: true,
         },
+        mentatRunner: {
+          status: "open",
+          proofScope: "graph_wake_to_mentat_no_live_workflow",
+          handlingStage: "created_waiting_on_approval",
+          redacted: true,
+        },
       },
     } satisfies MalikAgentWakeRequest);
 
@@ -686,7 +775,7 @@ describe("Malik sandbox Graph wake host adapter", () => {
   });
 
   it("schedules the wake through host scheduler with no delivery and a bounded wake id", async () => {
-    const { deps, scheduleSessionTurn, subagentRun } = createHarness();
+    const { deps, scheduleSessionTurn, subagentRun, runMentatSandboxWorkflow } = createHarness();
 
     const response = await postNotification(deps);
 
@@ -700,6 +789,28 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(wakeIdString).toMatch(/^[a-f0-9]{32}$/);
     expect(wakeIdString).not.toBe("wake-redacted");
     expect(JSON.stringify(response.body)).not.toContain("wake-redacted");
+
+    expect(runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    const runnerInput = runMentatSandboxWorkflow.mock.calls[0][0];
+    expect(runnerInput).toMatchObject({
+      workflowFamily: "purchase_orders.create_po",
+      sourceBinding: { sourceId: "malik-email-inbox", mailbox: MALIK_SANDBOX_MAILBOX },
+      hostWakeProof: {
+        proofMode: "host_redacted_sandbox_graph_wake",
+        proofScope: "wake_scheduled_only",
+      },
+      sources: [
+        expect.objectContaining({
+          providerId: "email",
+          sourceType: "email_thread",
+          subject: "Malik sandbox E2E PO create",
+        }),
+      ],
+    });
+    const renderedRunnerInput = JSON.stringify(runnerInput);
+    expect(renderedRunnerInput).not.toContain(FAKE_GRAPH_TOKEN);
+    expect(renderedRunnerInput).not.toContain(EXPECTED_CLIENT_STATE);
+    expect(renderedRunnerInput).not.toContain("MENTAT_MALIK_GRAPH_TOKEN");
 
     expect(scheduleSessionTurn).toHaveBeenCalledTimes(1);
     expect(subagentRun).not.toHaveBeenCalled();
@@ -717,8 +828,12 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(scheduleParams.name).not.toContain(":");
     expect(scheduleParams.tag).not.toContain(":");
     expect(scheduleParams.message).toContain("Mentat Malik sandbox Graph webhook wake");
+    expect(scheduleParams.message).toContain("operator_visible_marker_only");
+    expect(scheduleParams.message).toContain("deterministic Mentat runner has already handled");
+    expect(scheduleParams.message).toContain("non-load-bearing marker");
     expect(scheduleParams.message).toContain("purchase_orders.create_po");
     expect(scheduleParams.message).toContain('"graphNotificationAuthority":"wake_only"');
+    expect(scheduleParams.message).toContain('"deterministicMentatRunner":{"status":"open"');
     expect(scheduleParams.message).toContain('"emailSend":false');
     expect(scheduleParams.message).toContain('"netSuiteMutation":false');
     expect(scheduleParams.message).toContain(
@@ -736,6 +851,31 @@ describe("Malik sandbox Graph wake host adapter", () => {
     expect(scheduleParams.message).not.toContain("Malik sandbox E2E");
     expect(scheduleParams.message).not.toContain("malik-mentat-sandbox-workspace");
     expect(scheduleParams.message).not.toContain("malik-mentat-sandbox-agent");
+  });
+
+  it("omits raw runner handling stages from scheduled marker messages", async () => {
+    const rawStage = "Bearer raw /tmp/clientState detail";
+    const { deps, scheduleSessionTurn } = createHarness({
+      runnerResult: {
+        ok: true,
+        status: "open",
+        redacted: true,
+        proofScope: "graph_wake_to_mentat_no_live_workflow",
+        handlingStage: rawStage,
+      },
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    const renderedResponse = JSON.stringify(response.body);
+    expect(renderedResponse).not.toContain("Bearer");
+    expect(renderedResponse).not.toContain("/tmp/clientState");
+    const [scheduleParams] = scheduleSessionTurn.mock.calls[0];
+    expect(scheduleParams.message).toContain("deterministicMentatRunner");
+    expect(scheduleParams.message).not.toContain("Bearer");
+    expect(scheduleParams.message).not.toContain("/tmp/clientState");
+    expect(scheduleParams.message).not.toContain(rawStage);
   });
 
   it("does not schedule a second turn for duplicate notifications", async () => {
