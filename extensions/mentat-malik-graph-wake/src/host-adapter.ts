@@ -354,6 +354,8 @@ function loadActiveWindow(
   }
 
   const id = readString(activeWindow.id);
+  const issuedAt = readIssuedAt(activeWindow.issuedAt);
+  const windowSeq = readWindowSeq(activeWindow.windowSeq);
   const expiresAt = readString(activeWindow.expiresAt);
   const mailbox = readString(activeWindow.mailbox);
   const graphResourcePrefix = normalizeGraphResourcePrefix(
@@ -368,6 +370,8 @@ function loadActiveWindow(
     !id ||
     !isSafeSandboxWindowId(id) ||
     activeWindow.approved !== true ||
+    issuedAt === undefined ||
+    windowSeq === undefined ||
     !expiresAt ||
     !mailbox ||
     !graphResourcePrefix ||
@@ -383,6 +387,8 @@ function loadActiveWindow(
   return {
     id,
     approved: true,
+    issuedAt,
+    windowSeq,
     expiresAt,
     mailbox,
     graphResourcePrefix,
@@ -890,6 +896,20 @@ function normalizeGraphResourcePrefix(value: string | undefined): string | undef
 function readSha256(value: unknown): string | undefined {
   const normalized = readString(value)?.toLowerCase();
   return normalized && /^[a-f0-9]{64}$/.test(normalized) ? normalized : undefined;
+}
+
+// Gate 1: issuedAt must be a present, parseable ISO timestamp. Absent or
+// unparseable -> undefined, which fails the whole window to null (mirroring how
+// clientStateSha256 invalidation drops the window).
+function readIssuedAt(value: unknown): string | undefined {
+  const normalized = readString(value);
+  return normalized && Number.isFinite(Date.parse(normalized)) ? normalized : undefined;
+}
+
+// Gate 1: windowSeq must be a present, finite, non-negative integer. Absent or
+// any other value -> undefined, which fails the whole window to null.
+function readWindowSeq(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

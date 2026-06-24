@@ -16,6 +16,10 @@ export const MALIK_SANDBOX_FIXTURE_SOURCE_LABEL = "sandbox_fixture_source_mappin
 // Numeric runner facts are accepted into the redacted summary only within this
 // small inclusive bound (defense in depth against arbitrary runner output).
 const MAX_SAFE_RUNNER_RUNTIME_COUNT = 16;
+// Gate 1 (current-window authority): the bounded validity span. Even an approved
+// window with a far-future expiresAt is rejected if expiresAt - issuedAt exceeds
+// this, defeating a stale window re-armed with a distant expiry.
+const MAX_WINDOW_LIFETIME_MS = 4 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 64 * 1024;
 const SAFE_RUNNER_FAILURE_CODES = new Set([
   "invalid_input",
@@ -72,6 +76,8 @@ export type MalikSandboxFixtureSourceConfig = {
 export type MalikSandboxGraphWakeWindow = {
   id: string;
   approved: boolean;
+  issuedAt: string;
+  windowSeq: number;
   expiresAt: string;
   mailbox: string;
   graphResourcePrefix: string;
@@ -288,6 +294,11 @@ export type MentatSandboxWorkflowRunner = (
 export type MalikSandboxGraphWakeState = {
   inFlightScopes: Set<string>;
   completedByIdempotencyKey: Map<string, { wakeId?: string }>;
+  // Gate 1 monotonic floor. Initialized to -1 so the first valid window (seq 0+)
+  // passes; never decreases. A window whose seq is below this floor is a rollback
+  // to a superseded window and is rejected. An EQUAL seq is accepted so one
+  // approved window can drive multiple Graph notifications.
+  highestWindowSeq: number;
 };
 
 export type MalikSandboxGraphWakeDependencies = {
@@ -332,10 +343,12 @@ type BlockReason =
   | "sandbox_window_unavailable"
   | "sandbox_window_id_invalid"
   | "sandbox_window_expired"
+  | "sandbox_window_not_current"
   | "mailbox_not_approved"
   | "runtime_profile_not_sandbox"
   | "netsuite_target_not_sandbox"
   | "workflow_action_not_approved"
+  | "workflow_action_not_in_window"
   | "vendor_notification_recipient_plan_required"
   | "client_state_mismatch"
   | "notification_resource_not_approved"
@@ -356,6 +369,7 @@ export function createMalikSandboxGraphWakeState(): MalikSandboxGraphWakeState {
   return {
     inFlightScopes: new Set(),
     completedByIdempotencyKey: new Map(),
+    highestWindowSeq: -1,
   };
 }
 
@@ -424,6 +438,7 @@ export async function handleMalikSandboxGraphWakeRequest(
     activeWindow,
     notification.value,
     deps.now?.() ?? new Date(),
+    deps.state,
   );
   if (!windowCheck.ok) {
     return blocked(windowCheck.reason);
@@ -589,6 +604,7 @@ function validateActiveWindow(
   activeWindow: MalikSandboxGraphWakeWindow | null,
   notification: RawGraphNotification,
   now: Date,
+  state: MalikSandboxGraphWakeState,
 ): { ok: true; notification: ParsedGraphNotification } | { ok: false; reason: BlockReason } {
   if (!activeWindow || !activeWindow.approved) {
     return { ok: false, reason: "sandbox_window_unavailable" };
@@ -599,6 +615,13 @@ function validateActiveWindow(
   const expiresAt = Date.parse(activeWindow.expiresAt);
   if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
     return { ok: false, reason: "sandbox_window_expired" };
+  }
+  // Gate 1: current-window authority. Reject a future-dated, over-long, or
+  // superseded (rolled-back) window even when approved + not yet expired. An
+  // equal seq is accepted (multi-notification); only a LOWER seq is a rollback.
+  const currency = checkWindowCurrency(activeWindow, now, state.highestWindowSeq);
+  if (!currency.ok) {
+    return { ok: false, reason: currency.reason };
   }
   if (activeWindow.mailbox.toLowerCase() !== MALIK_SANDBOX_MAILBOX) {
     return { ok: false, reason: "mailbox_not_approved" };
@@ -615,16 +638,10 @@ function validateActiveWindow(
   ) {
     return { ok: false, reason: "netsuite_target_not_sandbox" };
   }
-  if (activeWindow.allowedActions.length === 0) {
-    return { ok: false, reason: "workflow_action_not_approved" };
-  }
-  if (
-    activeWindow.allowedActions.some(
-      (action) => action.family === "purchase_orders" && action.action === "vendor_notification",
-    ) &&
-    !hasSandboxSafeRecipientPlan(activeWindow.sandboxSafeRecipientPlan)
-  ) {
-    return { ok: false, reason: "vendor_notification_recipient_plan_required" };
+  // Gate 2: first-class family/action classification against the allowlist.
+  const actionClassification = classifyWindowWorkflowActions(activeWindow);
+  if (!actionClassification.ok) {
+    return { ok: false, reason: actionClassification.reason };
   }
   if (!activeWindow.verifyClientState(notification.clientState)) {
     return { ok: false, reason: "client_state_mismatch" };
@@ -642,7 +659,98 @@ function validateActiveWindow(
   if (!hasApprovedSourceScope(activeWindow.sourceScope)) {
     return { ok: false, reason: "source_scope_unavailable" };
   }
+  // Advance the monotonic floor only after the ENTIRE window validation
+  // succeeds, so a window rejected by a later check cannot raise the floor and
+  // lock out a subsequent legitimate (equal/lower) seq. The currency comparison
+  // above still reads the unmutated floor; only the recording happens here.
+  state.highestWindowSeq = Math.max(state.highestWindowSeq, activeWindow.windowSeq);
   return { ok: true, notification: { ...notification, messageId: parsedResource.messageId } };
+}
+
+// Gate 1 (current-window authority) currency check. Pure: compares the window's
+// issuedAt/windowSeq/expiresAt against `now` and the monotonic floor without
+// mutating state. The caller records the seq on a pass. Fails closed unless ALL
+// hold: issuedAt parses and is not future-dated; expiresAt - issuedAt is within
+// the bounded lifetime; windowSeq is >= the highest seq already seen (equal seq
+// accepted; a lower seq is a rollback to a superseded window and is rejected).
+export function checkWindowCurrency(
+  activeWindow: Pick<MalikSandboxGraphWakeWindow, "issuedAt" | "expiresAt" | "windowSeq">,
+  now: Date,
+  highestWindowSeq: number,
+): { ok: true } | { ok: false; reason: "sandbox_window_not_current" } {
+  const issuedAt = Date.parse(activeWindow.issuedAt);
+  const expiresAt = Date.parse(activeWindow.expiresAt);
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)) {
+    return { ok: false, reason: "sandbox_window_not_current" };
+  }
+  // issuedAt must not be in the future.
+  if (issuedAt > now.getTime()) {
+    return { ok: false, reason: "sandbox_window_not_current" };
+  }
+  // Bounded validity span defeats a far-future expiresAt re-armed onto a stale
+  // window.
+  if (expiresAt - issuedAt > MAX_WINDOW_LIFETIME_MS) {
+    return { ok: false, reason: "sandbox_window_not_current" };
+  }
+  // Monotonic rule: reject a rollback to a superseded (lower seq) window; an
+  // equal seq is accepted so one window can drive multiple notifications.
+  if (
+    !Number.isInteger(activeWindow.windowSeq) ||
+    activeWindow.windowSeq < 0 ||
+    activeWindow.windowSeq < highestWindowSeq
+  ) {
+    return { ok: false, reason: "sandbox_window_not_current" };
+  }
+  return { ok: true };
+}
+
+export type WorkflowActionClassification = "allowed" | "vendor_needs_plan" | "unlisted";
+
+// Gate 2 (pre-scan family/action classification). Pure: classifies a single
+// requested action against the allowlist. `create_po` in the purchase_orders
+// family is first-class allowed; `vendor_notification` is listed but needs an
+// approved sandbox-safe recipient plan; anything else is unlisted (off-scope).
+// This is defense-in-depth: the manifest pins allowedActions to create_po, so
+// the non-allowed branches are schema-unreachable in the full flow but stay
+// unit-testable and ready for future workflow families.
+export function classifyWorkflowAction(action: WorkflowActionRef): WorkflowActionClassification {
+  if (action.family === "purchase_orders" && action.action === "create_po") {
+    return "allowed";
+  }
+  if (action.family === "purchase_orders" && action.action === "vendor_notification") {
+    return "vendor_needs_plan";
+  }
+  return "unlisted";
+}
+
+// Classifies the whole window's requested action set, emitting the first
+// off-scope outcome as a distinct block reason. Empty action sets stay reported
+// as `workflow_action_not_approved` (unchanged). Any unlisted action blocks with
+// the new `workflow_action_not_in_window`; a vendor_notification action without
+// a sandbox-safe recipient plan reuses `vendor_notification_recipient_plan_required`.
+function classifyWindowWorkflowActions(activeWindow: MalikSandboxGraphWakeWindow):
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | "workflow_action_not_approved"
+        | "workflow_action_not_in_window"
+        | "vendor_notification_recipient_plan_required";
+    } {
+  if (activeWindow.allowedActions.length === 0) {
+    return { ok: false, reason: "workflow_action_not_approved" };
+  }
+  const classifications = activeWindow.allowedActions.map(classifyWorkflowAction);
+  if (classifications.includes("unlisted")) {
+    return { ok: false, reason: "workflow_action_not_in_window" };
+  }
+  if (
+    classifications.includes("vendor_needs_plan") &&
+    !hasSandboxSafeRecipientPlan(activeWindow.sandboxSafeRecipientPlan)
+  ) {
+    return { ok: false, reason: "vendor_notification_recipient_plan_required" };
+  }
+  return { ok: true };
 }
 
 function hasSandboxSafeRecipientPlan(

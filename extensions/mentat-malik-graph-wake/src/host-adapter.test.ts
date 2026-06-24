@@ -24,11 +24,19 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function activeWindowConfigWithout(field: string): Record<string, unknown> {
+  const config = activeWindowConfig();
+  delete config[field];
+  return config;
+}
+
 function activeWindowConfig(overrides?: Record<string, unknown>): Record<string, unknown> {
   return {
     id: "sandbox-window-2026-06-20",
     approved: true,
-    expiresAt: "2099-01-01T00:00:00.000Z",
+    issuedAt: "2026-06-20T17:00:00.000Z",
+    windowSeq: 0,
+    expiresAt: "2026-06-20T18:00:00.000Z",
     mailbox: MALIK_SANDBOX_MAILBOX,
     graphResourcePrefix: "users/malik-mentat@outlook.com/mailFolders/inbox/messages",
     runtimeProfile: {
@@ -495,6 +503,69 @@ describe("Malik sandbox Graph wake host adapter", () => {
       expect(fetchGraph).not.toHaveBeenCalled();
       expect(subagentRun).not.toHaveBeenCalled();
     }
+  });
+
+  it("fails the window to null on a missing or malformed issuedAt / windowSeq (Gate 1)", async () => {
+    const cases: Array<{ label: string; activeWindow: Record<string, unknown> }> = [
+      {
+        label: "missing issuedAt",
+        activeWindow: activeWindowConfigWithout("issuedAt"),
+      },
+      {
+        label: "unparseable issuedAt",
+        activeWindow: activeWindowConfig({ issuedAt: "not-a-timestamp" }),
+      },
+      {
+        label: "missing windowSeq",
+        activeWindow: activeWindowConfigWithout("windowSeq"),
+      },
+      {
+        label: "negative windowSeq",
+        activeWindow: activeWindowConfig({ windowSeq: -1 }),
+      },
+      {
+        label: "non-integer windowSeq",
+        activeWindow: activeWindowConfig({ windowSeq: 1.5 }),
+      },
+      {
+        label: "string windowSeq",
+        activeWindow: activeWindowConfig({ windowSeq: "0" }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { deps, fetchGraph, subagentRun } = createHarness({
+        config: pluginConfig({ activeWindow: testCase.activeWindow }),
+      });
+
+      const response = await postNotification(deps);
+
+      expect(response.body, testCase.label).toMatchObject({
+        ok: false,
+        status: "blocked",
+        reason: "sandbox_window_unavailable",
+      });
+      expect(fetchGraph, testCase.label).not.toHaveBeenCalled();
+      expect(subagentRun, testCase.label).not.toHaveBeenCalled();
+    }
+  });
+
+  it("loads a window with a present issuedAt and non-negative integer windowSeq (Gate 1)", async () => {
+    const { deps, fetchGraph } = createHarness({
+      config: pluginConfig({
+        activeWindow: activeWindowConfig({ issuedAt: "2026-06-20T17:15:00.000Z", windowSeq: 4 }),
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(fetchGraph).toHaveBeenCalledTimes(1);
+    // Raw issuedAt/windowSeq never surface in the response.
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("2026-06-20T17:15:00.000Z");
+    expect(rendered).not.toContain("issuedAt");
+    expect(rendered).not.toContain("windowSeq");
   });
 
   it("still accepts the old no-live fixture path and fetches through the approved mailbox", async () => {

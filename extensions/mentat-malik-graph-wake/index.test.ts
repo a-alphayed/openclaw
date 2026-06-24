@@ -10,6 +10,8 @@ const NETSUITE_SANDBOX_ENVIRONMENT_ID = "netsuite-sandbox";
 const ADAPTER_REQUIRED_ACTIVE_WINDOW_FIELDS = [
   "id",
   "approved",
+  "issuedAt",
+  "windowSeq",
   "expiresAt",
   "mailbox",
   "graphResourcePrefix",
@@ -95,6 +97,9 @@ function validateAgainstSchema(schema: JsonRecord, value: unknown, path = "$"): 
   }
   if (type === "string") {
     validateStringSchema(schema, value, path, errors);
+  }
+  if (type === "integer" || type === "number") {
+    validateNumberSchema(schema, value, path, errors);
   }
 
   const anyOf = Array.isArray(schema.anyOf) ? schema.anyOf : undefined;
@@ -193,12 +198,29 @@ function validateStringSchema(
   }
 }
 
+function validateNumberSchema(
+  schema: JsonRecord,
+  value: unknown,
+  path: string,
+  errors: string[],
+): void {
+  if (typeof value !== "number") {
+    return;
+  }
+  if (typeof schema.minimum === "number" && value < schema.minimum) {
+    errors.push(`${path} must be >= ${schema.minimum}`);
+  }
+}
+
 function matchesJsonType(value: unknown, type: string): boolean {
   if (type === "object") {
     return isRecord(value);
   }
   if (type === "array") {
     return Array.isArray(value);
+  }
+  if (type === "integer") {
+    return typeof value === "number" && Number.isInteger(value);
   }
   return typeof value === type;
 }
@@ -209,6 +231,8 @@ function approvedWindowFixture(): JsonRecord {
     activeWindow: {
       id: "malik-sandbox-host-proof-2026-06-21-0930",
       approved: true,
+      issuedAt: "2026-06-21T09:30:00-07:00",
+      windowSeq: 0,
       expiresAt: "2026-06-21T10:30:00-07:00",
       mailbox: MALIK_SANDBOX_MAILBOX,
       graphResourcePrefix: MALIK_GRAPH_RESOURCE_PREFIX,
@@ -369,6 +393,44 @@ describe("mentat malik graph wake manifest config schema", () => {
     expect(validateAgainstSchema(clientStateSha256, "not-a-digest")).toContain(
       "$ must match pattern",
     );
+  });
+
+  it("requires issuedAt and a non-negative integer windowSeq for current-window authority", () => {
+    const schema = readManifestConfigSchema();
+    const activeWindowProperties = propertiesOf(
+      requireRecord(propertiesOf(schema).activeWindow, "activeWindow"),
+    );
+    const issuedAt = requireRecord(activeWindowProperties.issuedAt, "issuedAt");
+    const windowSeq = requireRecord(activeWindowProperties.windowSeq, "windowSeq");
+
+    expect(issuedAt.type).toBe("string");
+    expect(issuedAt.minLength).toBe(1);
+    expect(windowSeq.type).toBe("integer");
+    expect(windowSeq.minimum).toBe(0);
+
+    // Accepts the approved fixture (issuedAt + windowSeq present).
+    expect(validateAgainstSchema(schema, approvedWindowFixture())).toEqual([]);
+
+    // Rejects a missing issuedAt.
+    const missingIssuedAt = approvedWindowFixture();
+    delete (missingIssuedAt.activeWindow as JsonRecord).issuedAt;
+    expect(validateAgainstSchema(schema, missingIssuedAt)).toContain(
+      "$.activeWindow.issuedAt is required",
+    );
+
+    // Rejects a missing windowSeq.
+    const missingWindowSeq = approvedWindowFixture();
+    delete (missingWindowSeq.activeWindow as JsonRecord).windowSeq;
+    expect(validateAgainstSchema(schema, missingWindowSeq)).toContain(
+      "$.activeWindow.windowSeq is required",
+    );
+
+    // Rejects a negative windowSeq.
+    expect(validateAgainstSchema(windowSeq, -1)).toContain("$ must be >= 0");
+    // Rejects a non-integer windowSeq.
+    expect(validateAgainstSchema(windowSeq, 1.5)).toContain("$ must be integer");
+    // Accepts seq 0.
+    expect(validateAgainstSchema(windowSeq, 0)).toEqual([]);
   });
 
   it("requires graph bearerTokenRef to be a SecretRef without raw token fields", () => {

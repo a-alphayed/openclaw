@@ -4,6 +4,7 @@ import {
   MALIK_SANDBOX_MAILBOX,
   MALIK_SANDBOX_FIXTURE_SOURCE_ID,
   MALIK_SANDBOX_FIXTURE_SOURCE_CLASS,
+  classifyWorkflowAction,
   createMalikSandboxGraphWakeState,
   handleMalikSandboxGraphWakeRequest,
   isSafeSandboxWindowId,
@@ -30,7 +31,9 @@ function windowFixture(
   return {
     id: "sandbox-window-2026-06-20",
     approved: true,
-    expiresAt: "2099-01-01T00:00:00.000Z",
+    issuedAt: "2026-06-20T17:00:00.000Z",
+    windowSeq: 0,
+    expiresAt: "2026-06-20T18:00:00.000Z",
     mailbox: MALIK_SANDBOX_MAILBOX,
     graphResourcePrefix: "users/malik-mentat@outlook.com/mailFolders/inbox/messages",
     runtimeProfile: {
@@ -700,6 +703,261 @@ describe("Malik sandbox Graph wake bridge", () => {
   });
 });
 
+describe("Gate 1: current-window authority (freshness + monotonic seq)", () => {
+  it("schedules a wake for a fresh, in-bounds, seq-0 window", async () => {
+    const deps = createDeps();
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a future-dated issuedAt before fetching source", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        issuedAt: "2026-06-20T18:00:00.000Z", // after now (17:30Z)
+        expiresAt: "2026-06-20T19:00:00.000Z",
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_window_not_current",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("blocks an over-long validity span (expiresAt - issuedAt > 4h)", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        issuedAt: "2026-06-20T17:00:00.000Z",
+        // 4h + 1ms after issuedAt; far-future expiry must not rescue a stale window.
+        expiresAt: "2026-06-20T21:00:00.001Z",
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_window_not_current",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("accepts a span of exactly the bounded lifetime (4h)", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        issuedAt: "2026-06-20T17:00:00.000Z",
+        expiresAt: "2026-06-20T21:00:00.000Z", // exactly 4h
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+  });
+
+  it("rejects a rollback to a superseded (lower seq) window", async () => {
+    const deps = createDeps({ window: windowFixture({ windowSeq: 3 }) });
+
+    // First notification at seq 3 records the floor.
+    const first = await postNotification(deps);
+    expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(deps.state.highestWindowSeq).toBe(3);
+
+    // Rebind the loader to a rolled-back seq-1 window (same fixture, lower seq).
+    vi.mocked(deps.loadActiveWindow).mockResolvedValue(windowFixture({ windowSeq: 1 }));
+    const rolledBack = await postNotification(
+      deps,
+      graphNotification(
+        "expected-client-state",
+        "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-rollback",
+      ),
+    );
+
+    expect(rolledBack.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "sandbox_window_not_current",
+    });
+    // Floor unchanged; runner only ran for the first (seq-3) notification.
+    expect(deps.state.highestWindowSeq).toBe(3);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts an EQUAL seq for a second notification with a different message id", async () => {
+    const deps = createDeps({ window: windowFixture({ windowSeq: 2 }) });
+
+    const first = await postNotification(
+      deps,
+      graphNotification(
+        "expected-client-state",
+        "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-first",
+      ),
+    );
+    const second = await postNotification(
+      deps,
+      graphNotification(
+        "expected-client-state",
+        "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-second",
+      ),
+    );
+
+    // Same approved window (seq 2) legitimately drives both notifications.
+    expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(second.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(deps.state.highestWindowSeq).toBe(2);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(2);
+    expect(deps.postAgentWake).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts and records a higher seq", async () => {
+    const deps = createDeps({ window: windowFixture({ windowSeq: 5 }) });
+
+    const first = await postNotification(deps);
+    expect(first.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(deps.state.highestWindowSeq).toBe(5);
+
+    vi.mocked(deps.loadActiveWindow).mockResolvedValue(windowFixture({ windowSeq: 9 }));
+    const higher = await postNotification(
+      deps,
+      graphNotification(
+        "expected-client-state",
+        "users/malik-mentat@outlook.com/mailFolders/inbox/messages/AAMk-higher",
+      ),
+    );
+
+    expect(higher.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    expect(deps.state.highestWindowSeq).toBe(9);
+  });
+
+  it("does not advance the windowSeq floor when a later check rejects", async () => {
+    // Window passes Gate-1 currency (fresh issuedAt, valid span, seq 5) but
+    // fails a LATER check (unlisted action). The monotonic floor must not move,
+    // so a subsequent legitimate equal/lower-seq window is not locked out.
+    const deps = createDeps({
+      window: windowFixture({
+        windowSeq: 5,
+        allowedActions: [{ family: "purchase_orders", action: "receive_po" }],
+      }),
+    });
+    expect(deps.state.highestWindowSeq).toBe(-1);
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "workflow_action_not_in_window",
+    });
+    // Floor unchanged: the seq is recorded only on full-window-validation success.
+    expect(deps.state.highestWindowSeq).toBe(-1);
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("advances the windowSeq floor only on full validation success", async () => {
+    const deps = createDeps({ window: windowFixture({ windowSeq: 4 }) });
+    expect(deps.state.highestWindowSeq).toBe(-1);
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    // Every window check passed, so the floor advances to the window seq.
+    expect(deps.state.highestWindowSeq).toBe(4);
+    expect(deps.runMentatSandboxWorkflow).toHaveBeenCalledTimes(1);
+    expect(deps.postAgentWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not echo raw issuedAt or windowSeq in the response", async () => {
+    const deps = createDeps({
+      window: windowFixture({ issuedAt: "2026-06-20T17:11:22.333Z", windowSeq: 7 }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({ ok: true, status: "wake_scheduled" });
+    const rendered = JSON.stringify(response.body);
+    expect(rendered).not.toContain("2026-06-20T17:11:22.333Z");
+    expect(rendered).not.toContain("issuedAt");
+    expect(rendered).not.toContain("windowSeq");
+    const wakeRequest = vi.mocked(deps.postAgentWake).mock.calls[0][0];
+    const renderedWake = JSON.stringify(wakeRequest);
+    expect(renderedWake).not.toContain("issuedAt");
+    expect(renderedWake).not.toContain("windowSeq");
+  });
+});
+
+describe("Gate 2: pre-scan family/action classification", () => {
+  it("classifies create_po as allowed", () => {
+    expect(classifyWorkflowAction({ family: "purchase_orders", action: "create_po" })).toBe(
+      "allowed",
+    );
+  });
+
+  it("classifies vendor_notification as needing a recipient plan", () => {
+    expect(
+      classifyWorkflowAction({ family: "purchase_orders", action: "vendor_notification" }),
+    ).toBe("vendor_needs_plan");
+  });
+
+  it("classifies any other family/action as unlisted", () => {
+    expect(classifyWorkflowAction({ family: "purchase_orders", action: "receive_po" })).toBe(
+      "unlisted",
+    );
+    expect(classifyWorkflowAction({ family: "invoices", action: "create_po" })).toBe("unlisted");
+    expect(classifyWorkflowAction({ family: "anything", action: "else" })).toBe("unlisted");
+  });
+
+  it("blocks an unlisted window action before scan with workflow_action_not_in_window", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        allowedActions: [{ family: "purchase_orders", action: "receive_po" }],
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "workflow_action_not_in_window",
+    });
+    expect(deps.fetchScopedSource).not.toHaveBeenCalled();
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+
+  it("reuses the vendor-plan block reason for a vendor_notification window without a plan", async () => {
+    const deps = createDeps({
+      window: windowFixture({
+        allowedActions: [{ family: "purchase_orders", action: "vendor_notification" }],
+      }),
+    });
+
+    const response = await postNotification(deps);
+
+    expect(response.body).toMatchObject({
+      ok: false,
+      status: "blocked",
+      reason: "vendor_notification_recipient_plan_required",
+    });
+    expect(deps.runMentatSandboxWorkflow).not.toHaveBeenCalled();
+    expect(deps.postAgentWake).not.toHaveBeenCalled();
+  });
+});
+
 describe("Malik sandbox fixture-source mapping", () => {
   function runnerInputSourceId(deps: MalikSandboxGraphWakeDependencies): string {
     const runnerInput = vi.mocked(deps.runMentatSandboxWorkflow).mock.calls[0][0];
@@ -761,7 +1019,13 @@ describe("Malik sandbox fixture-source mapping", () => {
   });
 
   it("fails closed for each invalid sandboxFixtureSource condition without overriding", async () => {
-    const cases: Array<{ label: string; window: Partial<MalikSandboxGraphWakeWindow> }> = [
+    const cases: Array<{
+      label: string;
+      window: Partial<MalikSandboxGraphWakeWindow>;
+      // Default fixture-resolver fail-closed reason, unless an earlier gate (Gate 2
+      // family/action classification) intercepts the off-scope window first.
+      reason?: string;
+    }> = [
       {
         label: "unapproved sourceId",
         window: {
@@ -784,11 +1048,17 @@ describe("Malik sandbox fixture-source mapping", () => {
         },
       },
       {
-        label: "non-create_po action",
+        // An off-scope action is now intercepted first by the Gate 2 pre-scan
+        // family/action classification, before the fixture resolver runs. Either
+        // way the window is blocked and never overrides or wakes. The resolver's
+        // own non-create_po fail-closed branch stays covered by the pure-helper
+        // unit test below.
+        label: "non-create_po action (intercepted by Gate 2 pre-scan classification)",
         window: {
           allowedActions: [{ family: "purchase_orders", action: "receive_po" }],
           sandboxFixtureSource: validFixtureSourceConfig(),
         },
+        reason: "workflow_action_not_in_window",
       },
       {
         label: "vendor safe-recipient plan enabled",
@@ -808,7 +1078,7 @@ describe("Malik sandbox fixture-source mapping", () => {
       expect(response.body, testCase.label).toMatchObject({
         ok: false,
         status: "blocked",
-        reason: "sandbox_fixture_source_rejected",
+        reason: testCase.reason ?? "sandbox_fixture_source_rejected",
       });
       expect(deps.runMentatSandboxWorkflow, testCase.label).not.toHaveBeenCalled();
       expect(deps.postAgentWake, testCase.label).not.toHaveBeenCalled();
@@ -832,6 +1102,20 @@ describe("Malik sandbox fixture-source mapping", () => {
     );
 
     expect(resolution).toMatchObject({ applied: true, sourceId: MALIK_SANDBOX_FIXTURE_SOURCE_ID });
+  });
+
+  it("resolves fail-closed via the pure helper for a non-create_po action", () => {
+    // Defense in depth: even though Gate 2 now intercepts an off-scope action in
+    // the full flow, the resolver's own non-create_po fail-closed branch remains
+    // directly reachable and covered.
+    const resolution = resolveSandboxFixtureSource(
+      windowFixture({
+        allowedActions: [{ family: "purchase_orders", action: "receive_po" }],
+        sandboxFixtureSource: validFixtureSourceConfig(),
+      }),
+    );
+
+    expect(resolution).toEqual({ applied: false, reason: "fail_closed" });
   });
 
   it("resolves absent (no override) when sandboxFixtureSource is missing", () => {

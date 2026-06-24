@@ -25,6 +25,8 @@
         "required": [
           "id",
           "approved",
+          "issuedAt",
+          "windowSeq",
           "expiresAt",
           "mailbox",
           "graphResourcePrefix",
@@ -42,6 +44,14 @@
           },
           "approved": {
             "const": true
+          },
+          "issuedAt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "windowSeq": {
+            "type": "integer",
+            "minimum": 0
           },
           "expiresAt": {
             "type": "string",
