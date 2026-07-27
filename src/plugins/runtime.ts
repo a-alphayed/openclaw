@@ -82,6 +82,14 @@ function isRegistryLive(registry: PluginRegistry): boolean {
   return state.activeRegistry === registry || isRegistryPinned(registry);
 }
 
+// Liveness guard for plugin APIs captured across registry swaps: a registry
+// stays live while it is the singular active registry or pinned on a current
+// HTTP-route/channel/session-extension surface. Narrow delegate so captured
+// API guards share this policy instead of re-deriving surface state.
+export function isLivePluginRegistry(registry: PluginRegistry): boolean {
+  return isRegistryLive(registry);
+}
+
 async function cleanupPreviousPluginHostRegistry(params: {
   previousRegistry: PluginRegistry;
 }): Promise<void> {

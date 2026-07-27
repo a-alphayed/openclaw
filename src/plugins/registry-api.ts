@@ -25,7 +25,7 @@ import {
   type PluginSideEffectGuard,
 } from "./registry-state.js";
 import type { PluginRecord } from "./registry-types.js";
-import { getActivePluginRegistry } from "./runtime.js";
+import { isLivePluginRegistry } from "./runtime.js";
 import type { OpenClawPluginApi, PluginLogger, PluginRegistrationMode } from "./types.js";
 
 function normalizeLogger(logger: PluginLogger): PluginLogger {
@@ -147,8 +147,11 @@ export function createPluginApiFactory(
     const sideEffectGuard = createPluginSideEffectGuard(record.id);
     const isLoadedRecordInRegistry = () =>
       registry.plugins.some((plugin) => plugin.id === record.id && plugin.status === "loaded");
-    const isLoadedRecordInActiveRegistry = () =>
-      getActivePluginRegistry() === registry && isLoadedRecordInRegistry();
+    // Captured APIs stay callable while the owning registry is live: singular
+    // active OR pinned on a current HTTP-route/channel/session-extension
+    // surface. A released (stale, unpinned) registry rejects the call.
+    const isLoadedRecordInLiveRegistry = () =>
+      isLivePluginRegistry(registry) && isLoadedRecordInRegistry();
     const isActivatingLoadedRecord = () =>
       registryParams.activateGlobalSideEffects !== false &&
       record.enabled &&
@@ -307,7 +310,7 @@ export function createPluginApiFactory(
                   return { ok: false, error: "global side effects disabled" };
                 }
                 try {
-                  if (!isLoadedRecordInActiveRegistry()) {
+                  if (!isLoadedRecordInLiveRegistry()) {
                     return { ok: false, error: "plugin is not loaded" };
                   }
                   const runtimeConfig =
@@ -336,7 +339,7 @@ export function createPluginApiFactory(
                   origin: record.origin,
                   schedule,
                   cron: getHostCronService(),
-                  shouldCommit: isLoadedRecordInActiveRegistry,
+                  shouldCommit: isLoadedRecordInLiveRegistry,
                   ownerRegistry: registry,
                 });
               },
@@ -345,7 +348,7 @@ export function createPluginApiFactory(
                   return { removed: 0, failed: 0 };
                 }
                 await Promise.resolve();
-                if (!isLoadedRecordInActiveRegistry()) {
+                if (!isLoadedRecordInLiveRegistry()) {
                   return { removed: 0, failed: 0 };
                 }
                 return unschedulePluginSessionTurnsByTag({

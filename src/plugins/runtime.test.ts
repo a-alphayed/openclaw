@@ -9,6 +9,7 @@ import {
   getActivePluginRegistryVersion,
   getActivePluginRegistry,
   getActivePluginSessionExtensionRegistry,
+  isLivePluginRegistry,
   listImportedRuntimePluginIds,
   pinActivePluginChannelRegistry,
   pinActivePluginHttpRouteRegistry,
@@ -448,4 +449,59 @@ describe("setActivePluginRegistry", () => {
 
     expect(listImportedRuntimePluginIds()).toEqual(["broken-plugin"]);
   });
+});
+
+describe("isLivePluginRegistry", () => {
+  afterEach(() => {
+    releasePinnedPluginChannelRegistry();
+    releasePinnedPluginHttpRouteRegistry();
+    releasePinnedPluginSessionExtensionRegistry();
+    resetPluginRuntimeStateForTest();
+  });
+
+  it("treats the singular active registry as live and a stale unpinned registry as not live", () => {
+    const { startupRegistry, laterRegistry } = createRuntimeRegistryPair();
+
+    setActivePluginRegistry(startupRegistry);
+    expect(isLivePluginRegistry(startupRegistry)).toBe(true);
+
+    setActivePluginRegistry(laterRegistry);
+    expect(isLivePluginRegistry(laterRegistry)).toBe(true);
+    expect(isLivePluginRegistry(startupRegistry)).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "HTTP-route",
+      pin: pinActivePluginHttpRouteRegistry,
+      release: releasePinnedPluginHttpRouteRegistry,
+    },
+    {
+      name: "channel",
+      pin: pinActivePluginChannelRegistry,
+      release: releasePinnedPluginChannelRegistry,
+    },
+    {
+      name: "session-extension",
+      pin: pinActivePluginSessionExtensionRegistry,
+      release: releasePinnedPluginSessionExtensionRegistry,
+    },
+  ] as const)(
+    "keeps a $name-pinned registry live across active churn until release",
+    ({ pin, release }) => {
+      const { startupRegistry, laterRegistry } = createRuntimeRegistryPair();
+
+      setActivePluginRegistry(startupRegistry);
+      pin(startupRegistry);
+      setActivePluginRegistry(laterRegistry);
+
+      expect(isLivePluginRegistry(startupRegistry)).toBe(true);
+      expect(isLivePluginRegistry(laterRegistry)).toBe(true);
+
+      release(startupRegistry);
+
+      expect(isLivePluginRegistry(startupRegistry)).toBe(false);
+      expect(isLivePluginRegistry(laterRegistry)).toBe(true);
+    },
+  );
 });

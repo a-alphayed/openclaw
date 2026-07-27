@@ -16,7 +16,11 @@ import { sendPluginSessionAttachment } from "../host-hook-attachments.js";
 import { clearPluginLoaderCache } from "../loader.test-fixtures.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
 import { createPluginRegistry } from "../registry.js";
-import { setActivePluginRegistry } from "../runtime.js";
+import {
+  pinActivePluginHttpRouteRegistry,
+  releasePinnedPluginHttpRouteRegistry,
+  setActivePluginRegistry,
+} from "../runtime.js";
 import type { PluginRuntime } from "../runtime/types.js";
 import { createPluginRecord } from "../status.test-helpers.js";
 import type { OpenClawPluginApi } from "../types.js";
@@ -495,6 +499,53 @@ describe("plugin session attachments", () => {
           files: [{ path: filePath }],
         }),
       ).resolves.toEqual({ ok: false, error: "plugin is not loaded" });
+    });
+  });
+
+  it("keeps a pinned HTTP-route registry's captured attachment API live across active churn", async () => {
+    await withSessionStore(async ({ storePath, filePath }) => {
+      await writeSessionEntry(storePath);
+      mockSuccessfulAttachmentDelivery();
+
+      const pinnedFixture = createPluginRegistryFixture({ session: { store: storePath } });
+      let capturedApi: OpenClawPluginApi | undefined;
+      registerTestPlugin({
+        registry: pinnedFixture.registry,
+        config: pinnedFixture.config,
+        record: createPluginRecord({
+          id: "pinned-attachment-plugin",
+          name: "Pinned Attachment Plugin",
+          origin: "bundled",
+        }),
+        register(api) {
+          capturedApi = api;
+        },
+      });
+      // Registry A owns the loaded plugin and stays pinned as the HTTP-route
+      // surface; registry B then becomes the singular active registry.
+      setActivePluginRegistry(pinnedFixture.registry.registry);
+      pinActivePluginHttpRouteRegistry(pinnedFixture.registry.registry);
+      setActivePluginRegistry(createEmptyPluginRegistry());
+
+      try {
+        const pinnedResult = await capturedApi?.sendSessionAttachment({
+          sessionKey: MAIN_SESSION_KEY,
+          files: [{ path: filePath }],
+        });
+        expectTelegramAttachmentResult(pinnedResult, 1);
+        expect(workflowMocks.sendMessage).toHaveBeenCalledTimes(1);
+      } finally {
+        releasePinnedPluginHttpRouteRegistry(pinnedFixture.registry.registry);
+      }
+
+      // Released A is stale and unpinned: reject before any delivery attempt.
+      await expect(
+        capturedApi?.sendSessionAttachment({
+          sessionKey: MAIN_SESSION_KEY,
+          files: [{ path: filePath }],
+        }),
+      ).resolves.toEqual({ ok: false, error: "plugin is not loaded" });
+      expect(workflowMocks.sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 

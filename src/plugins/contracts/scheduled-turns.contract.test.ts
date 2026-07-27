@@ -25,7 +25,11 @@ import {
 import { loadOpenClawPlugins } from "../loader.js";
 import { clearPluginLoaderCache, makeTempDir, writePlugin } from "../loader.test-fixtures.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
-import { setActivePluginRegistry } from "../runtime.js";
+import {
+  pinActivePluginHttpRouteRegistry,
+  releasePinnedPluginHttpRouteRegistry,
+  setActivePluginRegistry,
+} from "../runtime.js";
 import { createPluginRecord } from "../status.test-helpers.js";
 import type { OpenClawPluginApi } from "../types.js";
 
@@ -1089,6 +1093,114 @@ describe("plugin scheduled turns", () => {
         tag: "nudge",
       }),
     ).resolves.toEqual({ removed: 0, failed: 0 });
+  });
+
+  it("keeps a pinned HTTP-route registry's captured schedule API live across active churn", async () => {
+    workflowMocks.cronAdd.mockResolvedValue(makeCronJob({ id: "job-pinned-route" }));
+    const pinnedFixture = createPluginRegistryFixture({}, { hostServices: { cron } });
+    let capturedApi: OpenClawPluginApi | undefined;
+    registerTestPlugin({
+      registry: pinnedFixture.registry,
+      config: pinnedFixture.config,
+      record: createPluginRecord({
+        id: "pinned-route-scheduler",
+        name: "Pinned Route Scheduler",
+        origin: "bundled",
+      }),
+      register(api) {
+        capturedApi = api;
+      },
+    });
+    // Registry A owns the loaded plugin and stays pinned as the HTTP-route
+    // surface; registry B then becomes the singular active registry.
+    setActivePluginRegistry(pinnedFixture.registry.registry);
+    pinActivePluginHttpRouteRegistry(pinnedFixture.registry.registry);
+    const activeFixture = createPluginRegistryFixture();
+    setActivePluginRegistry(activeFixture.registry.registry);
+
+    try {
+      const pinnedHandle = await capturedApi?.session.workflow.scheduleSessionTurn({
+        sessionKey: MAIN_SESSION_KEY,
+        message: "wake",
+        delayMs: 10,
+      });
+      expectSessionTurnHandle(pinnedHandle, "job-pinned-route", "pinned-route-scheduler");
+      expect(workflowMocks.cronAdd).toHaveBeenCalledTimes(1);
+    } finally {
+      releasePinnedPluginHttpRouteRegistry(pinnedFixture.registry.registry);
+    }
+
+    // Released A is stale and unpinned: the same captured API rejects before cron.add.
+    await expect(
+      capturedApi?.session.workflow.scheduleSessionTurn({
+        sessionKey: MAIN_SESSION_KEY,
+        message: "wake",
+        delayMs: 10,
+      }),
+    ).resolves.toBeUndefined();
+    expect(workflowMocks.cronAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a pinned HTTP-route registry's captured unschedule API live across active churn", async () => {
+    const pinnedFixture = createPluginRegistryFixture({}, { hostServices: { cron } });
+    let capturedApi: OpenClawPluginApi | undefined;
+    registerTestPlugin({
+      registry: pinnedFixture.registry,
+      config: pinnedFixture.config,
+      record: createPluginRecord({
+        id: "pinned-route-scheduler",
+        name: "Pinned Route Scheduler",
+        origin: "bundled",
+      }),
+      register(api) {
+        capturedApi = api;
+      },
+    });
+    setActivePluginRegistry(pinnedFixture.registry.registry);
+    pinActivePluginHttpRouteRegistry(pinnedFixture.registry.registry);
+    const activeFixture = createPluginRegistryFixture();
+    setActivePluginRegistry(activeFixture.registry.registry);
+    workflowMocks.cronListPage.mockResolvedValue({
+      jobs: [
+        makeCronJob({
+          id: "pinned-route-job",
+          name: "plugin:pinned-route-scheduler:tag:nudge:agent:main:main:1",
+          sessionTarget: "session:agent:main:main",
+        }),
+      ],
+      snapshotRevision: "fixture",
+      total: 1,
+      offset: 0,
+      limit: 200,
+      hasMore: false,
+      nextOffset: null,
+    });
+
+    try {
+      // While A is pinned after B became active, tagged list/remove still runs.
+      await expect(
+        capturedApi?.session.workflow.unscheduleSessionTurnsByTag({
+          sessionKey: MAIN_SESSION_KEY,
+          tag: "nudge",
+        }),
+      ).resolves.toEqual({ removed: 1, failed: 0 });
+      expect(workflowMocks.cronListPage).toHaveBeenCalledTimes(1);
+      expect(workflowMocks.cronRemove).toHaveBeenCalledWith("pinned-route-job");
+    } finally {
+      releasePinnedPluginHttpRouteRegistry(pinnedFixture.registry.registry);
+    }
+
+    // Released A is stale: reject before any cron list/remove.
+    workflowMocks.cronListPage.mockClear();
+    workflowMocks.cronRemove.mockClear();
+    await expect(
+      capturedApi?.session.workflow.unscheduleSessionTurnsByTag({
+        sessionKey: MAIN_SESSION_KEY,
+        tag: "nudge",
+      }),
+    ).resolves.toEqual({ removed: 0, failed: 0 });
+    expect(workflowMocks.cronListPage).not.toHaveBeenCalled();
+    expect(workflowMocks.cronRemove).not.toHaveBeenCalled();
   });
 
   it("resolves live cron service for captured plugin scheduled-turn APIs", async () => {
