@@ -1,16 +1,71 @@
+// Runs the repository check lanes selected by CLI arguments.
 import { performance } from "node:perf_hooks";
+import { booleanFlag, parseFlagArgs } from "./lib/arg-utils.mjs";
 import { printTimingSummary } from "./lib/check-timing-summary.mjs";
 import { runManagedCommand } from "./lib/managed-child-process.mjs";
 
+/**
+ * Returns command usage text for the aggregate check runner.
+ */
+export function usage() {
+  return [
+    "Usage: node scripts/check.mjs [--timed] [--include-architecture] [--include-test-types]",
+    "",
+    "Runs the local check graph: guard preflights, typecheck, lint, and policy guards.",
+    "",
+    "Options:",
+    "  --timed                 Print timing summary even when checks pass.",
+    "  --include-architecture  Run architecture import-cycle checks instead of runtime cycles.",
+    "  --include-test-types    Typecheck production and test sources.",
+    "  -h, --help              Show this help.",
+  ].join("\n");
+}
+
+/**
+ * Parses aggregate check runner arguments.
+ */
+function parseCheckArgs(argv) {
+  return parseFlagArgs(
+    argv,
+    { help: false, includeArchitecture: false, includeTestTypes: false, timed: false },
+    [
+      booleanFlag("--timed", "timed", true, { repeatable: true }),
+      booleanFlag("--include-architecture", "includeArchitecture", true, { repeatable: true }),
+      booleanFlag("--include-test-types", "includeTestTypes", true, { repeatable: true }),
+      booleanFlag("--help", "help", true, { repeatable: true }),
+      booleanFlag("-h", "help", true, { repeatable: true }),
+    ],
+    {
+      ignoreDoubleDash: false,
+      onUnhandledArg(arg) {
+        throw new Error(`unknown argument: ${arg}\n\n${usage()}`);
+      },
+    },
+  );
+}
+
+/**
+ * Runs selected repository check lanes.
+ */
 export async function main(argv = process.argv.slice(2)) {
-  const timed = argv.includes("--timed");
-  const includeArchitecture = argv.includes("--include-architecture");
-  const includeTestTypes = argv.includes("--include-test-types");
+  let args;
+  try {
+    args = parseCheckArgs(argv);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+    return;
+  }
+  if (args.help) {
+    console.log(usage());
+    process.exitCode = 0;
+    return;
+  }
 
   const tailChecks = [
     { name: "webhook body guard", args: ["lint:webhook:no-low-level-body-read"] },
     { name: "runtime action config guard", args: ["check:no-runtime-action-load-config"] },
-    !includeArchitecture
+    !args.includeArchitecture
       ? {
           name: "deprecated API usage guard",
           args: ["check:deprecated-api-usage"],
@@ -19,7 +74,7 @@ export async function main(argv = process.argv.slice(2)) {
     { name: "temp path guard", args: ["check:temp-path-guardrails"] },
     { name: "pairing store guard", args: ["lint:auth:no-pairing-store-group"] },
     { name: "pairing account guard", args: ["lint:auth:pairing-account-scope"] },
-    includeArchitecture
+    args.includeArchitecture
       ? { name: "architecture import cycles", args: ["check:architecture"] }
       : { name: "runtime import cycles", args: ["check:import-cycles"] },
   ].filter(Boolean);
@@ -30,7 +85,10 @@ export async function main(argv = process.argv.slice(2)) {
       parallel: true,
       commands: [
         { name: "conflict markers", args: ["check:no-conflict-markers"] },
+        { name: "environment variable count ratchet", args: ["check:env-var-count"] },
+        { name: "max-lines suppression ratchet", args: ["check:max-lines-ratchet"] },
         { name: "changelog attributions", args: ["check:changelog-attributions"] },
+        { name: "database-first legacy-store guard", args: ["check:database-first-legacy-stores"] },
         {
           name: "guarded extension wildcard re-exports",
           args: ["lint:extensions:no-guarded-wildcard-reexports"],
@@ -49,24 +107,29 @@ export async function main(argv = process.argv.slice(2)) {
         { name: "host env policy", args: ["check:host-env-policy:swift"] },
         { name: "opengrep rule metadata", args: ["check:opengrep-rule-metadata"] },
         { name: "duplicate scan target coverage", args: ["dup:check:coverage"] },
-        { name: "npm shrinkwrap guard", args: ["deps:shrinkwrap:check"] },
+        { name: "npm package-lock guard", args: ["deps:npm-lock:check"] },
         { name: "package patch guard", args: ["deps:patches:check"] },
+        { name: "script declaration contracts", args: ["check:script-declarations"] },
       ],
     },
     {
       name: "typecheck",
       parallel: false,
-      commands: [
-        {
-          name: includeTestTypes ? "typecheck all" : "typecheck prod",
-          args: [includeTestTypes ? "tsgo:all" : "tsgo:prod"],
-        },
-      ],
+      commands: args.includeTestTypes
+        ? [{ name: "typecheck all", args: ["tsgo:all"] }]
+        : [
+            { name: "typecheck prod", args: ["tsgo:prod"] },
+            { name: "typecheck scripts", args: ["tsgo:scripts"] },
+            { name: "typecheck test root", args: ["tsgo:test:root"] },
+          ],
     },
     {
       name: "lint",
       parallel: false,
-      commands: [{ name: "lint", args: ["lint"] }],
+      commands: [
+        { name: "lint", args: ["lint"] },
+        { name: "format", args: ["format:check"] },
+      ],
     },
     {
       name: "policy guards",
@@ -92,7 +155,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
 
-  if (timed || exitCode !== 0) {
+  if (args.timed || exitCode !== 0) {
     printSummary(timings);
   }
 
@@ -111,6 +174,9 @@ async function runSerial(commands) {
   return results;
 }
 
+/**
+ * Runs one managed check command and returns timing/status details.
+ */
 export async function runCommand(command, runManagedCommandImpl = runManagedCommand) {
   const startedAt = performance.now();
   let status = 1;

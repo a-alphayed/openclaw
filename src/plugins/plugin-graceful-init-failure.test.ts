@@ -1,3 +1,4 @@
+// Verifies graceful plugin init failure handling and reporting.
 import fs from "node:fs";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -6,7 +7,7 @@ import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fi
 const fixtureTempDirs: string[] = [];
 const fixtureRoot = makeTrackedTempDir("openclaw-plugin-graceful", fixtureTempDirs);
 let tempDirIndex = 0;
-const { loadOpenClawPlugins, clearPluginLoaderCache } = await import("./loader.js");
+const { loadOpenClawPlugins, clearPluginLoaderCache } = await import("./loader.test-fixtures.js");
 
 afterAll(() => {
   cleanupTrackedTempDirs(fixtureTempDirs);
@@ -136,6 +137,40 @@ describe("graceful plugin initialization failure", () => {
     expect(failed.failedAt?.getTime()).toBeLessThanOrEqual(after.getTime());
   });
 
+  it("rolls back partial metadata without breaking an earlier class-backed service", async () => {
+    const stable = writePlugin({
+      id: "a-stable-service-plugin",
+      body: `class StableService {
+        constructor() { this.id = "stable-service"; }
+        start() {}
+        ping() { return "still-alive"; }
+      }
+      module.exports = { id: "a-stable-service-plugin", register(api) {
+        api.registerService(new StableService());
+      } };`,
+    });
+    const failing = writePlugin({
+      id: "z-partial-register-failure",
+      body: `module.exports = { id: "z-partial-register-failure", register(api) {
+        api.registerService({ id: "failed-service", start() {} });
+        api.registerHttpRoute({ path: "/failed", auth: "plugin", handler: async () => true });
+        throw new Error("fail after partial registration");
+      } };`,
+    });
+
+    const registry = await loadPlugins([stable.file, failing.file]);
+    const failed = requirePluginEntry(registry, "z-partial-register-failure");
+    const stableService = registry.services.find((entry) => entry.service.id === "stable-service")
+      ?.service as { ping?: () => string } | undefined;
+
+    expect(failed.status).toBe("error");
+    expect(failed.services).toEqual([]);
+    expect(failed.httpRoutes).toBe(0);
+    expect(registry.services.map((entry) => entry.service.id)).toEqual(["stable-service"]);
+    expect(registry.httpRoutes).toEqual([]);
+    expect(stableService?.ping?.()).toBe("still-alive");
+  });
+
   it("records validation failures before register", async () => {
     const plugin = writePlugin({
       id: "missing-register",
@@ -166,6 +201,7 @@ describe("graceful plugin initialization failure", () => {
     const summary = requireWarning(warnings, "failed to initialize");
     expect(summary).toContain("register: warn-register");
     expect(summary).toContain("validation: warn-validation");
+    expect(summary).toContain("openclaw plugins inspect <id> --runtime --json");
     expect(summary).toContain("openclaw plugins list");
   });
 });

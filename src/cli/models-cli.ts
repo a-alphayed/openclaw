@@ -1,13 +1,40 @@
+// Commander registration for model catalog, status, auth, alias, and fallback commands.
 import type { Command } from "commander";
-import { formatDocsLink } from "../terminal/links.js";
-import { theme } from "../terminal/theme.js";
+import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
+import { isModelsStatusJsonOutput } from "./models-output-mode.js";
+import { setCommandJsonMode } from "./program/json-mode.js";
 
 type ModelsCliRuntime = typeof import("./models-cli.runtime.js");
+
+function createModuleLoader<T>(load: () => Promise<T>): () => Promise<T> {
+  // Model subcommands are heavy; load each implementation once on first use.
+  let promise: Promise<T> | undefined;
+  return () => (promise ??= load());
+}
+
+const loadModelsRuntime = createModuleLoader<ModelsCliRuntime>(
+  () => import("./models-cli.runtime.js"),
+);
+const loadModelsStatusCommands = createModuleLoader(
+  () => import("../commands/models/list.status-command.js"),
+);
+const loadModelsAliasesCommands = createModuleLoader(() => import("../commands/models/aliases.js"));
+const loadModelsFallbacksCommands = createModuleLoader(
+  () => import("../commands/models/fallbacks.js"),
+);
+const loadModelsImageFallbacksCommands = createModuleLoader(
+  () => import("../commands/models/image-fallbacks.js"),
+);
+const loadModelsAuthCommands = createModuleLoader(() => import("../commands/models/auth.js"));
+const loadModelsAuthOrderCommands = createModuleLoader(
+  () => import("../commands/models/auth-order.js"),
+);
 
 async function withModelsRuntime(
   action: (runtime: ModelsCliRuntime) => Promise<void>,
 ): Promise<void> {
-  const runtime = await import("./models-cli.runtime.js");
+  const runtime = await loadModelsRuntime();
   return runtime.runModelsCommand(() => action(runtime));
 }
 
@@ -15,6 +42,7 @@ export function registerModelsCli(program: Command) {
   const models = program
     .command("models")
     .description("Model discovery, scanning, and configuration")
+    .option("--json", "Output JSON (alias for `models status --json`)", false)
     .option("--status-json", "Output JSON (alias for `models status --json`)", false)
     .option("--status-plain", "Plain output (alias for `models status --plain`)", false)
     .option("--agent <id>", "Agent id to inspect (overrides OPENCLAW_AGENT_DIR)")
@@ -23,6 +51,9 @@ export function registerModelsCli(program: Command) {
       () =>
         `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/models", "docs.openclaw.ai/cli/models")}\n`,
     );
+  const hasJsonOutput = (opts?: { json?: boolean }): boolean =>
+    Boolean(opts?.json || models.opts<{ json?: boolean }>().json);
+  setCommandJsonMode(models, "output", ({ argv }) => isModelsStatusJsonOutput(argv));
 
   models
     .command("list")
@@ -35,7 +66,7 @@ export function registerModelsCli(program: Command) {
     .action(async (opts) => {
       await withModelsRuntime(async ({ defaultRuntime }) => {
         const { modelsListCommand } = await import("../commands/models/list.list-command.js");
-        await modelsListCommand(opts, defaultRuntime);
+        await modelsListCommand({ ...opts, json: hasJsonOutput(opts) }, defaultRuntime);
       });
     });
 
@@ -67,10 +98,10 @@ export function registerModelsCli(program: Command) {
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command, opts);
-        const { modelsStatusCommand } = await import("../commands/models/list.status-command.js");
+        const { modelsStatusCommand } = await loadModelsStatusCommands();
         await modelsStatusCommand(
           {
-            json: Boolean(opts.json),
+            json: hasJsonOutput(opts),
             plain: Boolean(opts.plain),
             check: Boolean(opts.check),
             probe: Boolean(opts.probe),
@@ -87,11 +118,22 @@ export function registerModelsCli(program: Command) {
     });
 
   models
+    .command("refresh")
+    .description("Refresh the hosted model catalog")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await withModelsRuntime(async ({ defaultRuntime }) => {
+        const { modelsRefreshCommand } = await import("../commands/models/refresh.js");
+        await modelsRefreshCommand({ json: hasJsonOutput(opts) }, defaultRuntime);
+      });
+    });
+
+  models
     .command("set")
     .description("Set the default model")
     .argument("<model>", "Model id or alias")
     .action(async (model: string, _opts: unknown, command: Command) => {
-      const runtime = await import("./models-cli.runtime.js");
+      const runtime = await loadModelsRuntime();
       runtime.rejectAgentScopedModelWrite(command, "set");
       await runtime.runModelsCommand(async () => {
         const { modelsSetCommand } = await import("../commands/models/set.js");
@@ -104,7 +146,7 @@ export function registerModelsCli(program: Command) {
     .description("Set the image model")
     .argument("<model>", "Model id or alias")
     .action(async (model: string, _opts: unknown, command: Command) => {
-      const runtime = await import("./models-cli.runtime.js");
+      const runtime = await loadModelsRuntime();
       runtime.rejectAgentScopedModelWrite(command, "set-image");
       await runtime.runModelsCommand(async () => {
         const { modelsSetImageCommand } = await import("../commands/models/set-image.js");
@@ -121,8 +163,8 @@ export function registerModelsCli(program: Command) {
     .option("--plain", "Plain output", false)
     .action(async (opts) => {
       await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsAliasesListCommand } = await import("../commands/models/aliases.js");
-        await modelsAliasesListCommand(opts, defaultRuntime);
+        const { modelsAliasesListCommand } = await loadModelsAliasesCommands();
+        await modelsAliasesListCommand({ ...opts, json: hasJsonOutput(opts) }, defaultRuntime);
       });
     });
 
@@ -133,7 +175,7 @@ export function registerModelsCli(program: Command) {
     .argument("<model>", "Model id or alias")
     .action(async (alias: string, model: string) => {
       await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsAliasesAddCommand } = await import("../commands/models/aliases.js");
+        const { modelsAliasesAddCommand } = await loadModelsAliasesCommands();
         await modelsAliasesAddCommand(alias, model, defaultRuntime);
       });
     });
@@ -144,108 +186,82 @@ export function registerModelsCli(program: Command) {
     .argument("<alias>", "Alias name")
     .action(async (alias: string) => {
       await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsAliasesRemoveCommand } = await import("../commands/models/aliases.js");
+        const { modelsAliasesRemoveCommand } = await loadModelsAliasesCommands();
         await modelsAliasesRemoveCommand(alias, defaultRuntime);
       });
     });
 
-  const fallbacks = models.command("fallbacks").description("Manage model fallback list");
+  const fallbackGroups = [
+    {
+      name: "fallbacks",
+      modelType: "model",
+      noun: "fallback",
+      article: "a",
+      load: async () => {
+        const commands = await loadModelsFallbacksCommands();
+        return {
+          list: commands.modelsFallbacksListCommand,
+          add: commands.modelsFallbacksAddCommand,
+          remove: commands.modelsFallbacksRemoveCommand,
+          clear: commands.modelsFallbacksClearCommand,
+        };
+      },
+    },
+    {
+      name: "image-fallbacks",
+      modelType: "image model",
+      noun: "image fallback",
+      article: "an",
+      load: async () => {
+        const commands = await loadModelsImageFallbacksCommands();
+        return {
+          list: commands.modelsImageFallbacksListCommand,
+          add: commands.modelsImageFallbacksAddCommand,
+          remove: commands.modelsImageFallbacksRemoveCommand,
+          clear: commands.modelsImageFallbacksClearCommand,
+        };
+      },
+    },
+  ] as const;
 
-  fallbacks
-    .command("list")
-    .description("List fallback models")
-    .option("--json", "Output JSON", false)
-    .option("--plain", "Plain output", false)
-    .action(async (opts) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsFallbacksListCommand } = await import("../commands/models/fallbacks.js");
-        await modelsFallbacksListCommand(opts, defaultRuntime);
+  for (const { name, modelType, noun, article, load } of fallbackGroups) {
+    const group = models.command(name).description(`Manage ${modelType} fallback list`);
+
+    group
+      .command("list")
+      .description(`List ${noun} models`)
+      .option("--json", "Output JSON", false)
+      .option("--plain", "Plain output", false)
+      .action(async (opts) => {
+        await withModelsRuntime(async ({ defaultRuntime }) => {
+          const commands = await load();
+          await commands.list({ ...opts, json: hasJsonOutput(opts) }, defaultRuntime);
+        });
       });
-    });
 
-  fallbacks
-    .command("add")
-    .description("Add a fallback model")
-    .argument("<model>", "Model id or alias")
-    .action(async (model: string) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsFallbacksAddCommand } = await import("../commands/models/fallbacks.js");
-        await modelsFallbacksAddCommand(model, defaultRuntime);
+    for (const action of ["add", "remove"] as const) {
+      group
+        .command(action)
+        .description(`${action === "add" ? "Add" : "Remove"} ${article} ${noun} model`)
+        .argument("<model>", "Model id or alias")
+        .action(async (model: string) => {
+          await withModelsRuntime(async ({ defaultRuntime }) => {
+            const commands = await load();
+            await commands[action](model, defaultRuntime);
+          });
+        });
+    }
+
+    group
+      .command("clear")
+      .description(`Clear all ${noun} models`)
+      .action(async () => {
+        await withModelsRuntime(async ({ defaultRuntime }) => {
+          const commands = await load();
+          await commands.clear(defaultRuntime);
+        });
       });
-    });
-
-  fallbacks
-    .command("remove")
-    .description("Remove a fallback model")
-    .argument("<model>", "Model id or alias")
-    .action(async (model: string) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsFallbacksRemoveCommand } = await import("../commands/models/fallbacks.js");
-        await modelsFallbacksRemoveCommand(model, defaultRuntime);
-      });
-    });
-
-  fallbacks
-    .command("clear")
-    .description("Clear all fallback models")
-    .action(async () => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsFallbacksClearCommand } = await import("../commands/models/fallbacks.js");
-        await modelsFallbacksClearCommand(defaultRuntime);
-      });
-    });
-
-  const imageFallbacks = models
-    .command("image-fallbacks")
-    .description("Manage image model fallback list");
-
-  imageFallbacks
-    .command("list")
-    .description("List image fallback models")
-    .option("--json", "Output JSON", false)
-    .option("--plain", "Plain output", false)
-    .action(async (opts) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsImageFallbacksListCommand } =
-          await import("../commands/models/image-fallbacks.js");
-        await modelsImageFallbacksListCommand(opts, defaultRuntime);
-      });
-    });
-
-  imageFallbacks
-    .command("add")
-    .description("Add an image fallback model")
-    .argument("<model>", "Model id or alias")
-    .action(async (model: string) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsImageFallbacksAddCommand } =
-          await import("../commands/models/image-fallbacks.js");
-        await modelsImageFallbacksAddCommand(model, defaultRuntime);
-      });
-    });
-
-  imageFallbacks
-    .command("remove")
-    .description("Remove an image fallback model")
-    .argument("<model>", "Model id or alias")
-    .action(async (model: string) => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsImageFallbacksRemoveCommand } =
-          await import("../commands/models/image-fallbacks.js");
-        await modelsImageFallbacksRemoveCommand(model, defaultRuntime);
-      });
-    });
-
-  imageFallbacks
-    .command("clear")
-    .description("Clear all image fallback models")
-    .action(async () => {
-      await withModelsRuntime(async ({ defaultRuntime }) => {
-        const { modelsImageFallbacksClearCommand } =
-          await import("../commands/models/image-fallbacks.js");
-        await modelsImageFallbacksClearCommand(defaultRuntime);
-      });
-    });
+  }
 
   models
     .command("scan")
@@ -265,16 +281,16 @@ export function registerModelsCli(program: Command) {
     .action(async (opts) => {
       await withModelsRuntime(async ({ defaultRuntime }) => {
         const { modelsScanCommand } = await import("../commands/models/scan.js");
-        await modelsScanCommand(opts, defaultRuntime);
+        await modelsScanCommand({ ...opts, json: hasJsonOutput(opts) }, defaultRuntime);
       });
     });
 
   models.action(async (opts) => {
     await withModelsRuntime(async ({ defaultRuntime }) => {
-      const { modelsStatusCommand } = await import("../commands/models/list.status-command.js");
+      const { modelsStatusCommand } = await loadModelsStatusCommands();
       await modelsStatusCommand(
         {
-          json: Boolean(opts?.statusJson),
+          json: Boolean(opts?.json || opts?.statusJson),
           plain: Boolean(opts?.statusPlain),
           agent: opts?.agent as string | undefined,
         },
@@ -303,7 +319,7 @@ export function registerModelsCli(program: Command) {
           {
             provider: opts.provider as string | undefined,
             agent,
-            json: Boolean(opts.json),
+            json: hasJsonOutput(opts),
           },
           defaultRuntime,
         );
@@ -316,8 +332,29 @@ export function registerModelsCli(program: Command) {
     .action(async (command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command) ?? resolveModelAgentOption(auth);
-        const { modelsAuthAddCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthAddCommand } = await loadModelsAuthCommands();
         await modelsAuthAddCommand({ agent }, defaultRuntime);
+      });
+    });
+
+  auth
+    .command("logout")
+    .description("Remove a saved auth profile (see `models auth list` for ids)")
+    .argument("<profileId>", "Auth profile id (e.g. openai:manual)")
+    .option("--agent <id>", "Agent id (default: configured default agent)")
+    .option("--yes", "Skip the confirmation prompt", false)
+    .action(async (profileId: string, opts, command) => {
+      await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
+        const agent = resolveModelAgentOption(command, opts);
+        const { modelsAuthLogoutCommand } = await import("../commands/models/auth-logout.js");
+        await modelsAuthLogoutCommand(
+          {
+            profileId,
+            agent,
+            yes: Boolean(opts.yes),
+          },
+          defaultRuntime,
+        );
       });
     });
 
@@ -329,6 +366,11 @@ export function registerModelsCli(program: Command) {
     .option("--device-code", "Use the provider device-code auth method", false)
     .option("--profile-id <id>", "Auth profile id override for single-profile login methods")
     .option("--set-default", "Apply the provider's default model recommendation", false)
+    .option(
+      "--force",
+      "Remove existing profiles for the provider before logging in (use when a cached OAuth profile is stuck or you want to switch accounts)",
+      false,
+    )
     .action(async (opts, command) => {
       if (opts.deviceCode && typeof opts.method === "string" && opts.method !== "device-code") {
         throw new Error(
@@ -337,13 +379,14 @@ export function registerModelsCli(program: Command) {
       }
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command);
-        const { modelsAuthLoginCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthLoginCommand } = await loadModelsAuthCommands();
         await modelsAuthLoginCommand(
           {
             provider: opts.provider as string | undefined,
             method: opts.deviceCode ? "device-code" : (opts.method as string | undefined),
             profileId: opts.profileId as string | undefined,
             setDefault: Boolean(opts.setDefault),
+            force: Boolean(opts.force),
             agent,
           },
           defaultRuntime,
@@ -359,7 +402,7 @@ export function registerModelsCli(program: Command) {
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command);
-        const { modelsAuthSetupTokenCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthSetupTokenCommand } = await loadModelsAuthCommands();
         await modelsAuthSetupTokenCommand(
           {
             provider: opts.provider as string | undefined,
@@ -383,7 +426,7 @@ export function registerModelsCli(program: Command) {
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command);
-        const { modelsAuthPasteTokenCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthPasteTokenCommand } = await loadModelsAuthCommands();
         await modelsAuthPasteTokenCommand(
           {
             provider: opts.provider as string | undefined,
@@ -399,12 +442,12 @@ export function registerModelsCli(program: Command) {
   auth
     .command("paste-api-key")
     .description("Paste an API key into auth-profiles.json and update config")
-    .requiredOption("--provider <name>", "Provider id (e.g. openai-codex)")
+    .requiredOption("--provider <name>", "Provider id (e.g. openai)")
     .option("--profile-id <id>", "Auth profile id (default: <provider>:manual)")
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command);
-        const { modelsAuthPasteApiKeyCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthPasteApiKeyCommand } = await loadModelsAuthCommands();
         await modelsAuthPasteApiKeyCommand(
           {
             provider: opts.provider as string | undefined,
@@ -423,7 +466,7 @@ export function registerModelsCli(program: Command) {
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command);
-        const { modelsAuthLoginCommand } = await import("../commands/models/auth.js");
+        const { modelsAuthLoginCommand } = await loadModelsAuthCommands();
         await modelsAuthLoginCommand(
           {
             provider: "github-copilot",
@@ -440,19 +483,19 @@ export function registerModelsCli(program: Command) {
 
   order
     .command("get")
-    .description("Show per-agent auth order override (from auth-state.json)")
+    .description("Show per-agent auth profile order override")
     .requiredOption("--provider <name>", "Provider id (e.g. anthropic)")
     .option("--agent <id>", "Agent id (default: configured default agent)")
     .option("--json", "Output JSON", false)
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command, opts);
-        const { modelsAuthOrderGetCommand } = await import("../commands/models/auth-order.js");
+        const { modelsAuthOrderGetCommand } = await loadModelsAuthOrderCommands();
         await modelsAuthOrderGetCommand(
           {
             provider: opts.provider as string,
             agent,
-            json: Boolean(opts.json),
+            json: hasJsonOutput(opts),
           },
           defaultRuntime,
         );
@@ -461,14 +504,14 @@ export function registerModelsCli(program: Command) {
 
   order
     .command("set")
-    .description("Set per-agent auth order override (writes auth-state.json)")
+    .description("Set per-agent auth profile order override")
     .requiredOption("--provider <name>", "Provider id (e.g. anthropic)")
     .option("--agent <id>", "Agent id (default: configured default agent)")
     .argument("<profileIds...>", "Auth profile ids (e.g. anthropic:default)")
     .action(async (profileIds: string[], opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command, opts);
-        const { modelsAuthOrderSetCommand } = await import("../commands/models/auth-order.js");
+        const { modelsAuthOrderSetCommand } = await loadModelsAuthOrderCommands();
         await modelsAuthOrderSetCommand(
           {
             provider: opts.provider as string,
@@ -482,13 +525,13 @@ export function registerModelsCli(program: Command) {
 
   order
     .command("clear")
-    .description("Clear per-agent auth order override (fall back to config/round-robin)")
+    .description("Clear per-agent auth profile order override")
     .requiredOption("--provider <name>", "Provider id (e.g. anthropic)")
     .option("--agent <id>", "Agent id (default: configured default agent)")
     .action(async (opts, command) => {
       await withModelsRuntime(async ({ defaultRuntime, resolveModelAgentOption }) => {
         const agent = resolveModelAgentOption(command, opts);
-        const { modelsAuthOrderClearCommand } = await import("../commands/models/auth-order.js");
+        const { modelsAuthOrderClearCommand } = await loadModelsAuthOrderCommands();
         await modelsAuthOrderClearCommand(
           {
             provider: opts.provider as string,

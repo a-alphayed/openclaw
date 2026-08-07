@@ -1,8 +1,16 @@
+// Gateway Protocol tests cover channels.schema behavior.
 import { Compile } from "typebox/compile";
 import { describe, expect, it } from "vitest";
 import { ChannelsStatusResultSchema, WebLoginWaitParamsSchema } from "./schema/channels.js";
 
+/**
+ * Channel schema regressions for browser login and status diagnostics.
+ * These payloads are consumed by dashboard/operator UI, so QR payload bounds
+ * and event-loop diagnostic shape are part of the public gateway contract.
+ */
+
 describe("WebLoginWaitParamsSchema", () => {
+  /** Compiled validator reused across QR bounds cases. */
   const validate = Compile(WebLoginWaitParamsSchema);
 
   it("bounds caller-provided QR data URLs", () => {
@@ -26,6 +34,7 @@ describe("WebLoginWaitParamsSchema", () => {
 });
 
 describe("ChannelsStatusResultSchema", () => {
+  /** Compiled status validator for channel docking diagnostics. */
   const validate = Compile(ChannelsStatusResultSchema);
 
   it("accepts gateway event-loop diagnostics emitted by channels.status", () => {
@@ -44,6 +53,16 @@ describe("ChannelsStatusResultSchema", () => {
               running: true,
               connected: false,
               healthState: "stale-socket",
+              lastError: null,
+              lastStartAt: null,
+              lastStopAt: null,
+              lastInboundAt: null,
+              lastOutboundAt: null,
+              credentialSource: "service-account",
+              audienceType: "app-url",
+              audience: "https://chat.example.test",
+              webhookPath: "/googlechat",
+              webhookUrl: null,
             },
           ],
         },
@@ -52,6 +71,7 @@ describe("ChannelsStatusResultSchema", () => {
         warnings: ["discord:default probe timed out after 1000ms"],
         eventLoop: {
           degraded: true,
+          degradedSinceMs: 61_000,
           reasons: ["event_loop_delay", "cpu"],
           intervalMs: 62_000,
           delayP99Ms: 1_250.5,

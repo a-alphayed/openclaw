@@ -397,7 +397,7 @@ fs.writeFileSync(
     {
       id: "brave",
       activation: { onStartup: false },
-      providerAuthEnvVars: { brave: ["BRAVE_API_KEY"] },
+      setup: { providers: [{ id: "brave", envVars: ["BRAVE_API_KEY"] }] },
       contracts: { webSearchProviders: ["brave"] },
       configSchema: {
         type: "object",
@@ -425,7 +425,8 @@ fs.writeFileSync(
 );
 NODE
   tar -czf "$tarball" -C "$fixture_root" package
-  node scripts/e2e/lib/plugins/npm-registry-server.mjs \
+  OPENCLAW_NPM_REGISTRY_UPSTREAM=https://registry.npmjs.org \
+    node scripts/e2e/lib/plugins/npm-registry-server.mjs \
     "$port_file" \
     "@openclaw/brave-plugin" \
     "2026.5.2" \
@@ -440,13 +441,13 @@ NODE
       return 0
     fi
     if ! kill -0 "$plugin_registry_pid" 2>/dev/null; then
-      cat "$log_file" >&2 || true
+      openclaw_e2e_print_log "$log_file" >&2
       return 1
     fi
     sleep 0.1
   done
 
-  cat "$log_file" >&2 || true
+  openclaw_e2e_print_log "$log_file" >&2
   echo "Timed out waiting for configured plugin install npm fixture registry." >&2
   return 1
 }
@@ -659,7 +660,7 @@ install_baseline() {
   echo "Installing baseline package: $baseline_spec"
   if ! openclaw_e2e_maybe_timeout "${OPENCLAW_E2E_NPM_INSTALL_TIMEOUT:-600s}" npm install -g --prefix "$npm_config_prefix" "$baseline_spec" --no-fund --no-audit >"$BASELINE_INSTALL_LOG" 2>&1; then
     echo "baseline npm install failed" >&2
-    cat "$BASELINE_INSTALL_LOG" >&2 || true
+    openclaw_e2e_print_log "$BASELINE_INSTALL_LOG" >&2
     return 1
   fi
   if ! command -v openclaw >/dev/null; then
@@ -689,6 +690,7 @@ install_baseline() {
 }
 
 seed_state() {
+  local account_home=""
   openclaw_e2e_eval_test_state_from_b64 "${OPENCLAW_TEST_STATE_FUNCTION_B64:?missing OPENCLAW_TEST_STATE_FUNCTION_B64}"
   if [ "$ROOT_MANAGED_VPS" = "1" ]; then
     if [ "$(id -u)" -ne 0 ]; then
@@ -699,6 +701,18 @@ seed_state() {
     openclaw_test_state_create /root minimal
   else
     openclaw_test_state_create "$STATE_HOME_ROOT" minimal
+  fi
+  if [ "$UPDATE_RESTART_MODE" = "auto-auth" ]; then
+    account_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+    if [ -z "$account_home" ]; then
+      echo "Could not resolve the current account home" >&2
+      return 1
+    fi
+    export HOME="$account_home"
+    export USERPROFILE="$account_home"
+    unset OPENCLAW_HOME
+    export OPENCLAW_STATE_DIR="$account_home/.openclaw"
+    export OPENCLAW_CONFIG_PATH="$OPENCLAW_STATE_DIR/openclaw.json"
   fi
   export OPENCLAW_UPGRADE_SURVIVOR_BASELINE_VERSION="$baseline_version"
   node scripts/e2e/lib/upgrade-survivor/assertions.mjs seed
@@ -713,7 +727,7 @@ apply_baseline_config_recipe() {
 validate_baseline_config() {
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" openclaw config validate >"$BASELINE_CONFIG_VALIDATE_LOG" 2>&1; then
     echo "generated baseline config failed baseline validation" >&2
-    cat "$BASELINE_CONFIG_VALIDATE_LOG" >&2 || true
+    openclaw_e2e_print_log "$BASELINE_CONFIG_VALIDATE_LOG" >&2
     return 1
   fi
 }
@@ -731,13 +745,22 @@ daemon_log="${OPENCLAW_UPGRADE_SURVIVOR_SYSTEMCTL_SHIM_DAEMON_LOG:-/tmp/openclaw
 printf '%s\n' "$*" >>"$log_file"
 
 filtered=()
+system_scope=1
+property=""
 for ((i = 1; i <= $#; i++)); do
   arg="${!i}"
   case "$arg" in
-    --user | --quiet | --no-page | --now)
+    --user)
+      system_scope=0
+      ;;
+    --quiet | --no-page | --now | --value)
       ;;
     --property)
       i=$((i + 1))
+      property="${!i}"
+      ;;
+    --property=*)
+      property="${arg#--property=}"
       ;;
     *)
       filtered+=("$arg")
@@ -840,6 +863,21 @@ case "$command" in
     exit 3
     ;;
   show)
+    if [ "$system_scope" = "1" ]; then
+      case "$property" in
+        LoadState)
+          printf 'not-found\n'
+          ;;
+        UnitPath)
+          printf '/etc/systemd/system /usr/lib/systemd/system\n'
+          ;;
+        *)
+          echo "systemctl shim unsupported system-scope show: $*" >&2
+          exit 1
+          ;;
+      esac
+      exit 0
+    fi
     if is_running; then
       printf 'ActiveState=active\nSubState=running\nMainPID=%s\nExecMainStatus=0\nExecMainCode=0\n' "$(cat "$pid_file")"
     else
@@ -863,8 +901,8 @@ SHIM
 install_update_restart_service_unit() {
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" env -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD openclaw gateway install --force --json >"$BASELINE_SERVICE_INSTALL_JSON" 2>"$BASELINE_SERVICE_INSTALL_ERR"; then
     echo "baseline gateway service install failed" >&2
-    cat "$BASELINE_SERVICE_INSTALL_ERR" >&2 || true
-    cat "$BASELINE_SERVICE_INSTALL_JSON" >&2 || true
+    openclaw_e2e_print_log "$BASELINE_SERVICE_INSTALL_ERR" >&2
+    openclaw_e2e_print_log "$BASELINE_SERVICE_INSTALL_JSON" >&2
     return 1
   fi
 }
@@ -969,21 +1007,6 @@ write_update_restart_service_secretref_env() {
   mv "$tmp_path" "$dotenv_path"
 }
 
-write_update_restart_service_auth_env() {
-  mkdir -p "$OPENCLAW_STATE_DIR"
-  local dotenv_path="$OPENCLAW_STATE_DIR/.env"
-  local tmp_path="$dotenv_path.tmp.$$"
-  if [ -f "$dotenv_path" ]; then
-    grep -v '^GATEWAY_AUTH_TOKEN_REF=' "$dotenv_path" >"$tmp_path" || true
-  else
-    : >"$tmp_path"
-  fi
-  printf 'GATEWAY_AUTH_TOKEN_REF=%s\n' "$GATEWAY_AUTH_TOKEN_REF" >>"$tmp_path"
-  mv "$tmp_path" "$dotenv_path"
-  local systemd_env_path="$OPENCLAW_STATE_DIR/gateway.systemd.env"
-  printf 'GATEWAY_AUTH_TOKEN_REF=%s\n' "$GATEWAY_AUTH_TOKEN_REF" >"$systemd_env_path"
-}
-
 prepare_update_restart_probe() {
   if [ "$UPDATE_RESTART_MODE" != "auto-auth" ]; then
     return 0
@@ -991,20 +1014,8 @@ prepare_update_restart_probe() {
   echo "Preparing configured-auth gateway for automatic update restart."
   install_update_restart_systemctl_shim
   seed_update_restart_probe_device_auth
-  start_gateway
+  start_gateway legacy-ready-log-ok
   write_update_restart_service_secretref_env
-  install_update_restart_service_unit
-}
-
-prepare_update_restart_probe_current_install() {
-  if [ "$UPDATE_RESTART_MODE" != "auto-auth" ]; then
-    return 0
-  fi
-  echo "Preparing candidate-auth gateway for automatic update restart."
-  install_update_restart_systemctl_shim
-  seed_update_restart_probe_device_auth
-  start_gateway
-  write_update_restart_service_auth_env
   install_update_restart_service_unit
 }
 
@@ -1111,8 +1122,8 @@ update_candidate() {
   fi
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" "${update_env[@]}" openclaw "${update_args[@]}" >"$UPDATE_JSON" 2>"$UPDATE_ERR"; then
     echo "openclaw update failed" >&2
-    cat "$UPDATE_ERR" >&2 || true
-    cat "$UPDATE_JSON" >&2 || true
+    openclaw_e2e_print_log "$UPDATE_ERR" >&2
+    openclaw_e2e_print_log "$UPDATE_JSON" >&2
     return 1
   fi
   if [ "$UPDATE_RESTART_MODE" = "auto-auth" ]; then
@@ -1140,7 +1151,7 @@ assert_root_managed_vps_cli_usable() {
 run_doctor() {
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" openclaw doctor --fix --non-interactive >"$DOCTOR_LOG" 2>&1; then
     echo "openclaw doctor failed" >&2
-    cat "$DOCTOR_LOG" >&2 || true
+    openclaw_e2e_print_log "$DOCTOR_LOG" >&2
     return 1
   fi
 }
@@ -1148,7 +1159,7 @@ run_doctor() {
 validate_post_doctor_config() {
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" openclaw config validate >>"$DOCTOR_LOG" 2>&1; then
     echo "post-doctor config validation failed" >&2
-    cat "$DOCTOR_LOG" >&2 || true
+    openclaw_e2e_print_log "$DOCTOR_LOG" >&2
     return 1
   fi
 }
@@ -1177,6 +1188,9 @@ probe_gateway_endpoint() {
   if [ -n "${OPENCLAW_UPGRADE_SURVIVOR_READYZ_ALLOW_FAILING:-}" ]; then
     args+=(--allow-failing "$OPENCLAW_UPGRADE_SURVIVOR_READYZ_ALLOW_FAILING")
   fi
+  if [ "${OPENCLAW_UPGRADE_SURVIVOR_READYZ_ALLOW_DEGRADED:-}" = "1" ]; then
+    args+=(--allow-degraded-ready)
+  fi
   args+=(--out "$out_file")
   start_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
   node scripts/e2e/lib/upgrade-survivor/probe-gateway.mjs "${args[@]}"
@@ -1186,7 +1200,8 @@ probe_gateway_endpoint() {
 
 start_gateway() {
   local port=18789
-  local budget="${OPENCLAW_UPGRADE_SURVIVOR_START_BUDGET_SECONDS:-90}"
+  local budget
+  budget="$(openclaw_e2e_read_positive_int_env OPENCLAW_UPGRADE_SURVIVOR_START_BUDGET_SECONDS 90)"
   local start_epoch
   local ready_epoch
   start_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
@@ -1195,12 +1210,12 @@ start_gateway() {
   if [ "$UPDATE_RESTART_MODE" = "auto-auth" ]; then
     printf '%s\n' "$gateway_pid" >"$SYSTEMCTL_SHIM_PID_FILE"
   fi
-  openclaw_e2e_wait_gateway_ready "$gateway_pid" "$GATEWAY_LOG" 360
+  openclaw_e2e_wait_gateway_ready "$gateway_pid" "$GATEWAY_LOG" 360 "$port" "${1:-strict}"
   ready_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
   start_seconds=$(((ready_epoch - start_epoch + 999) / 1000))
   if [ "$start_seconds" -gt "$budget" ]; then
     echo "gateway startup exceeded survivor budget: ${start_seconds}s > ${budget}s" >&2
-    cat "$GATEWAY_LOG" >&2 || true
+    openclaw_e2e_print_log "$GATEWAY_LOG" >&2
     return 1
   fi
 }
@@ -1214,28 +1229,27 @@ ensure_gateway_started() {
 
 check_gateway_probes() {
   healthz_seconds="$(probe_gateway_endpoint /healthz live "$HEALTHZ_JSON")"
-  export OPENCLAW_UPGRADE_SURVIVOR_READYZ_ALLOW_FAILING="discord,telegram,whatsapp,feishu,matrix"
   readyz_seconds="$(probe_gateway_endpoint /readyz ready "$READYZ_JSON")"
-  unset OPENCLAW_UPGRADE_SURVIVOR_READYZ_ALLOW_FAILING
 }
 
 check_gateway_status() {
   local port=18789
-  local budget="${OPENCLAW_UPGRADE_SURVIVOR_STATUS_BUDGET_SECONDS:-30}"
+  local budget
+  budget="$(openclaw_e2e_read_positive_int_env OPENCLAW_UPGRADE_SURVIVOR_STATUS_BUDGET_SECONDS 30)"
   local status_start
   local status_end
   status_start="$(node -e "process.stdout.write(String(Date.now()))")"
   if ! openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" openclaw gateway status --url "ws://127.0.0.1:$port" --token "$GATEWAY_AUTH_TOKEN_REF" --require-rpc --timeout 30000 --json >"$STATUS_JSON" 2>"$STATUS_ERR"; then
     echo "gateway status failed" >&2
-    cat "$STATUS_ERR" >&2 || true
-    cat "$GATEWAY_LOG" >&2 || true
+    openclaw_e2e_print_log "$STATUS_ERR" >&2
+    openclaw_e2e_print_log "$GATEWAY_LOG" >&2
     return 1
   fi
   status_end="$(node -e "process.stdout.write(String(Date.now()))")"
   status_seconds=$(((status_end - status_start + 999) / 1000))
   if [ "$status_seconds" -gt "$budget" ]; then
     echo "gateway status exceeded survivor budget: ${status_seconds}s > ${budget}s" >&2
-    cat "$STATUS_JSON" >&2 || true
+    openclaw_e2e_print_log "$STATUS_JSON" >&2
     return 1
   fi
   node scripts/e2e/lib/upgrade-survivor/assertions.mjs assert-status-json "$STATUS_JSON"

@@ -1,25 +1,28 @@
+/**
+ * Module-level session-utils mocks for deleted-agent guard tests.
+ */
 import { vi } from "vitest";
 
 const deletedAgentSessionMocks = vi.hoisted(() => ({
   loadSessionEntry: vi.fn(),
+  loadSessionEntryReadOnly: vi.fn(),
   resolveDeletedAgentIdFromSessionKey: vi.fn(),
 }));
 
-vi.mock("../session-utils.js", async () => {
-  const actual = await vi.importActual<typeof import("../session-utils.js")>("../session-utils.js");
-  return {
-    ...actual,
-    loadSessionEntry: deletedAgentSessionMocks.loadSessionEntry,
-    resolveDeletedAgentIdFromSessionKey:
-      deletedAgentSessionMocks.resolveDeletedAgentIdFromSessionKey,
-  };
-});
+vi.mock("../session-utils.js", () => ({
+  loadSessionEntry: deletedAgentSessionMocks.loadSessionEntry,
+  loadSessionEntryReadOnly: deletedAgentSessionMocks.loadSessionEntryReadOnly,
+  resolveDeletedAgentIdFromSessionKey: deletedAgentSessionMocks.resolveDeletedAgentIdFromSessionKey,
+}));
 
+/** Resets mocked deleted-agent session lookups between tests. */
 export function resetDeletedAgentSessionMocks(): void {
   deletedAgentSessionMocks.loadSessionEntry.mockReset();
+  deletedAgentSessionMocks.loadSessionEntryReadOnly.mockReset();
   deletedAgentSessionMocks.resolveDeletedAgentIdFromSessionKey.mockReset();
 }
 
+/** Stubs a session that resolves to an agent id no longer present in config. */
 export function mockDeletedAgentSession(orphanKey = "agent:deleted-agent:main"): string {
   deletedAgentSessionMocks.loadSessionEntry.mockReturnValue({
     cfg: {},

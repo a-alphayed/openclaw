@@ -1,3 +1,4 @@
+// Imessage plugin module implements shared behavior.
 import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
 import {
   adaptScopedAccountAccessor,
@@ -57,7 +58,7 @@ export const imessageSecurityAdapter =
 
 export function createIMessagePluginBase(params: {
   setupWizard?: NonNullable<ChannelPlugin<ResolvedIMessageAccount>["setupWizard"]>;
-  setup: NonNullable<ChannelPlugin<ResolvedIMessageAccount>["setup"]>;
+  setupContract: NonNullable<ChannelPlugin<ResolvedIMessageAccount>["setupContract"]>;
 }): Pick<
   ChannelPlugin<ResolvedIMessageAccount>,
   | "id"
@@ -68,7 +69,7 @@ export function createIMessagePluginBase(params: {
   | "configSchema"
   | "config"
   | "security"
-  | "setup"
+  | "setupContract"
   | "messaging"
 > {
   const base = createChannelPluginBase({
@@ -76,12 +77,19 @@ export function createIMessagePluginBase(params: {
     meta: {
       ...getChatChannelMeta(IMESSAGE_CHANNEL),
       aliases: ["imsg"],
-      showConfigured: false,
+      exposure: { configured: false },
     },
     setupWizard: params.setupWizard,
     capabilities: {
       chatTypes: ["direct", "group"],
       media: true,
+      tts: {
+        voice: {
+          synthesisTarget: "audio-file",
+          audioFileFormats: ["mp3", "caf", "audio/mpeg", "audio/x-caf"],
+          preferAudioFileFormat: "caf",
+        },
+      },
       reactions: true,
       edit: true,
       unsend: true,
@@ -101,15 +109,18 @@ export function createIMessagePluginBase(params: {
         }),
     },
     security: imessageSecurityAdapter,
-    setup: params.setup,
+    setupContract: params.setupContract,
   });
   return {
     ...base,
     messaging: {
-      resolveInboundAttachmentRoots: (params) =>
-        resolveIMessageAttachmentRoots({ accountId: params.accountId, cfg: params.cfg }),
-      resolveRemoteInboundAttachmentRoots: (params) =>
-        resolveIMessageRemoteAttachmentRoots({ accountId: params.accountId, cfg: params.cfg }),
+      resolveInboundAttachmentRoots: (paramsValue) =>
+        resolveIMessageAttachmentRoots({ accountId: paramsValue.accountId, cfg: paramsValue.cfg }),
+      resolveRemoteInboundAttachmentRoots: (paramsLocal) =>
+        resolveIMessageRemoteAttachmentRoots({
+          accountId: paramsLocal.accountId,
+          cfg: paramsLocal.cfg,
+        }),
     },
   } as Pick<
     ChannelPlugin<ResolvedIMessageAccount>,
@@ -121,7 +132,7 @@ export function createIMessagePluginBase(params: {
     | "configSchema"
     | "config"
     | "security"
-    | "setup"
+    | "setupContract"
     | "messaging"
   >;
 }

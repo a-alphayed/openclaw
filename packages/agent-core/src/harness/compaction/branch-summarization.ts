@@ -1,24 +1,23 @@
-import type { Model, StreamFn } from "../../llm.js";
+// Agent Core module implements branch summarization behavior.
+import type { Model, StreamFn } from "@openclaw/llm-core";
 import {
   type AgentCoreCompletionRuntimeDeps,
   resolveAgentCoreCompleteFn,
 } from "../../runtime-deps.js";
 import type { AgentMessage } from "../../types.js";
-import {
-  convertToLlm,
-  createBranchSummaryMessage,
-  createCompactionSummaryMessage,
-  createCustomMessage,
-} from "../messages.js";
-import type { BranchSummaryResult, Session, SessionTreeEntry } from "../types.js";
+import { convertToLlm } from "../messages.js";
+import { projectSessionEntryMessage } from "../session/session.js";
+import type { BranchSummaryResult, SessionTreeEntry } from "../types.js";
 import { BranchSummaryError, err, ok, type Result } from "../types.js";
 import { estimateTokens, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.js";
 import {
   computeFileLists,
   createFileOps,
   extractFileOpsFromMessage,
+  extractSummaryText,
   type FileOperations,
   formatFileOperations,
+  mergeSummaryFileOperations,
   serializeConversation,
 } from "./utils.js";
 
@@ -30,8 +29,6 @@ export interface BranchSummaryDetails {
   modifiedFiles: string[];
 }
 
-export type { FileOperations } from "./utils.js";
-
 /** Prepared branch content for summarization. */
 export interface BranchPreparation {
   /** Messages selected for the branch summary. */
@@ -42,19 +39,15 @@ export interface BranchPreparation {
   totalTokens: number;
 }
 
-/** Entries selected for branch summarization. */
-export interface CollectEntriesResult {
-  /** Entries to summarize in chronological order. */
-  entries: SessionTreeEntry[];
-  /** Deepest common ancestor between the previous leaf and target entry. */
-  commonAncestorId: string | null;
-}
-
+/** Minimal tree entry shape needed to compare two session branches. */
 export interface BranchPathEntry {
+  /** Stable entry id. */
   id: string;
+  /** Parent entry id, or null for the session root. */
   parentId: string | null;
 }
 
+/** Branch entries selected after comparing old and target paths. */
 export interface CollectBranchPathEntriesResult<TEntry extends BranchPathEntry> {
   /** Entries to summarize in chronological order. */
   entries: TEntry[];
@@ -63,7 +56,7 @@ export interface CollectBranchPathEntriesResult<TEntry extends BranchPathEntry> 
 }
 
 /** Options for generating a branch summary. */
-export interface GenerateBranchSummaryOptions {
+interface GenerateBranchSummaryOptions {
   /** Model used for summarization. */
   model: Model;
   /** API key forwarded to the provider. */
@@ -91,9 +84,9 @@ export function collectEntriesForBranchSummaryFromBranches<TEntry extends Branch
 ): CollectBranchPathEntriesResult<TEntry> {
   const oldPath = new Set(oldBranch.map((entry) => entry.id));
   let commonAncestorId: string | null = null;
-  for (let i = targetBranch.length - 1; i >= 0; i--) {
-    if (oldPath.has(targetBranch[i].id)) {
-      commonAncestorId = targetBranch[i].id;
+  for (const targetEntry of targetBranch.toReversed()) {
+    if (oldPath.has(targetEntry.id)) {
+      commonAncestorId = targetEntry.id;
       break;
     }
   }
@@ -105,78 +98,21 @@ export function collectEntriesForBranchSummaryFromBranches<TEntry extends Branch
   return { entries: oldBranch.slice(firstSummarizedIndex), commonAncestorId };
 }
 
-/** Collect entries that should be summarized before navigating to a different session tree entry. */
-export async function collectEntriesForBranchSummary(
-  session: Session,
-  oldLeafId: string | null,
-  targetId: string,
-): Promise<CollectEntriesResult> {
-  if (!oldLeafId) {
-    return { entries: [], commonAncestorId: null };
-  }
-  const oldBranch = await session.getBranch(oldLeafId);
-  const targetPath = await session.getBranch(targetId);
-  return collectEntriesForBranchSummaryFromBranches(oldBranch, targetPath);
-}
-function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined {
-  switch (entry.type) {
-    case "message":
-      if (entry.message.role === "toolResult") {
-        return undefined;
-      }
-      return entry.message;
-
-    case "custom_message":
-      return createCustomMessage(
-        entry.customType,
-        entry.content,
-        entry.display,
-        entry.details,
-        entry.timestamp,
-      );
-
-    case "branch_summary":
-      return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-
-    case "compaction":
-      return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-    case "thinking_level_change":
-    case "model_change":
-    case "custom":
-    case "label":
-    case "session_info":
-    case "leaf":
-      return undefined;
-  }
-  return undefined;
-}
-
 /** Prepare branch entries for summarization within an optional token budget. */
 export function prepareBranchEntries(
   entries: SessionTreeEntry[],
-  tokenBudget: number = 0,
+  tokenBudget = 0,
 ): BranchPreparation {
   const messages: AgentMessage[] = [];
   const fileOps = createFileOps();
   let totalTokens = 0;
   for (const entry of entries) {
     if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
-      const details = entry.details as BranchSummaryDetails;
-      if (Array.isArray(details.readFiles)) {
-        for (const f of details.readFiles) {
-          fileOps.read.add(f);
-        }
-      }
-      if (Array.isArray(details.modifiedFiles)) {
-        for (const f of details.modifiedFiles) {
-          fileOps.edited.add(f);
-        }
-      }
+      mergeSummaryFileOperations(fileOps, entry.details as BranchSummaryDetails);
     }
   }
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    const message = getMessageFromEntry(entry);
+  for (const entry of entries.toReversed()) {
+    const message = projectSessionEntryMessage(entry);
     if (!message) {
       continue;
     }
@@ -184,6 +120,8 @@ export function prepareBranchEntries(
 
     const tokens = estimateTokens(message);
     if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
+      // Prefer already-compressed summaries when the budget is almost filled; they
+      // preserve older branch context better than dropping the whole prefix.
       if (entry.type === "compaction" || entry.type === "branch_summary") {
         if (totalTokens < tokenBudget * 0.9) {
           messages.unshift(message);
@@ -249,7 +187,17 @@ export async function generateBranchSummary(
     reserveTokens = 16384,
   } = options;
   const contextWindow = model.contextWindow || 128000;
-  const tokenBudget = contextWindow - reserveTokens;
+  const maxSummaryOutputTokens = Math.min(
+    2048,
+    Math.max(1, Math.floor(contextWindow / 4)),
+    model.maxTokens > 0 ? model.maxTokens : 2048,
+  );
+  // Preserve usable caller reservations; only an impossible reservation may
+  // fall back before its nonpositive budget disables history bounds entirely.
+  const usableReserveTokens =
+    reserveTokens < contextWindow ? reserveTokens : Math.floor(contextWindow / 2);
+  const effectiveReserveTokens = Math.max(maxSummaryOutputTokens, usableReserveTokens);
+  const tokenBudget = Math.max(1, contextWindow - effectiveReserveTokens);
 
   const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
@@ -276,7 +224,7 @@ export async function generateBranchSummary(
     },
   ];
   const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-  const streamOptions = { apiKey, headers, signal, maxTokens: 2048 };
+  const streamOptions = { apiKey, headers, signal, maxTokens: maxSummaryOutputTokens };
   const response = options.streamFn
     ? await (await options.streamFn(model, context, streamOptions)).result()
     : await resolveAgentCoreCompleteFn(options.runtime)(model, context, streamOptions);
@@ -294,16 +242,22 @@ export async function generateBranchSummary(
     );
   }
 
-  let summary = response.content
-    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-    .map((c) => c.text)
-    .join("\n");
-  summary = BRANCH_SUMMARY_PREAMBLE + summary;
+  const summaryText = extractSummaryText(response);
+  if (summaryText === undefined) {
+    return err(
+      new BranchSummaryError(
+        "summarization_failed",
+        "Branch summary failed: model returned no summary text",
+      ),
+    );
+  }
+
+  let summary = BRANCH_SUMMARY_PREAMBLE + summaryText;
   const { readFiles, modifiedFiles } = computeFileLists(fileOps);
   summary += formatFileOperations(readFiles, modifiedFiles);
 
   return ok({
-    summary: summary || "No summary generated",
+    summary,
     readFiles,
     modifiedFiles,
   });

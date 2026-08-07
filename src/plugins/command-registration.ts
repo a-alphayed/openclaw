@@ -1,18 +1,19 @@
-import { isOperatorScope } from "../gateway/operator-scopes.js";
-import { logVerbose } from "../globals.js";
+/** Validates and registers plugin command definitions into the global command registry. */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import { isOperatorScope } from "../gateway/operator-scopes.js";
+import { logVerbose } from "../globals.js";
 import { isRecord } from "../utils.js";
 import { normalizeAgentPromptSurfaceKind } from "./agent-prompt-surface-kind.js";
+import { clearPluginCommands } from "./command-registry-state.js";
+import type { PluginRegistry } from "./registry-types.js";
 import {
-  clearPluginCommands,
-  clearPluginCommandsForPlugin,
-  isPluginCommandRegistryLocked,
-  pluginCommands,
-  type RegisteredPluginCommand,
-} from "./command-registry-state.js";
+  getActivePluginGatewayCommandRegistry,
+  getPluginRegistrationContext,
+  requireActivePluginRegistry,
+} from "./runtime.js";
 import {
   AGENT_PROMPT_SURFACE_KINDS,
   type AgentPromptGuidance,
@@ -52,6 +53,8 @@ function getReservedCommands(): Set<string> {
     "allowlist",
     "activation",
     "skill",
+    "learn",
+    "loop",
     "subagents",
     "kill",
     "steer",
@@ -76,17 +79,20 @@ function getAgentPromptSurfaces(): Set<string> {
   return agentPromptSurfaces;
 }
 
-export type CommandRegistrationResult = {
+/** Result returned when a plugin command registration succeeds or fails validation. */
+type CommandRegistrationResult = {
   ok: boolean;
   error?: string;
 };
 
+/** Returns true when a command name is owned by built-in OpenClaw command handling. */
 export function isReservedCommandName(name: string): boolean {
   const trimmed = normalizeOptionalLowercaseString(name) ?? "";
   return Boolean(trimmed && getReservedCommands().has(trimmed));
 }
 
-export function validateCommandName(
+/** Validates user-visible command names before plugin registration accepts them. */
+function validateCommandName(
   name: string,
   opts?: { allowReservedCommandNames?: boolean },
 ): string | null {
@@ -114,7 +120,7 @@ export function validateCommandName(
  * Returns an error message if invalid, or null if valid.
  * Shared by both the global registration path and snapshot (non-activating) loads.
  */
-export function validatePluginCommandDefinition(
+function validatePluginCommandDefinition(
   command: OpenClawPluginCommandDefinition,
   opts?: { allowReservedCommandNames?: boolean },
 ): string | null {
@@ -321,8 +327,23 @@ export function registerPluginCommand(
     allowOwnerStatusExposure?: boolean;
   },
 ): CommandRegistrationResult {
+  const context = getPluginRegistrationContext();
+  return registerPluginCommandInRegistry(
+    context?.registry ?? getActivePluginGatewayCommandRegistry() ?? requireActivePluginRegistry(),
+    context?.pluginId ?? pluginId,
+    command,
+    opts,
+  );
+}
+
+export function registerPluginCommandInRegistry(
+  registry: PluginRegistry,
+  pluginId: string,
+  command: OpenClawPluginCommandDefinition,
+  opts?: Parameters<typeof registerPluginCommand>[2],
+): CommandRegistrationResult {
   // Prevent registration while commands are being processed
-  if (isPluginCommandRegistryLocked()) {
+  if (registry.commandRegistryLocked) {
     return { ok: false, error: "Cannot register commands while processing is in progress" };
   }
   if (command.ownership === "reserved") {
@@ -356,11 +377,9 @@ export function registerPluginCommand(
 
   // Check for duplicate registration
   for (const invocationKey of invocationKeys) {
-    const existing =
-      pluginCommands.get(invocationKey) ??
-      Array.from(pluginCommands.values()).find((candidate) =>
-        listPluginInvocationKeys(candidate).includes(invocationKey),
-      );
+    const existing = registry.commands.find((entry) =>
+      listPluginInvocationKeys(entry.command).includes(invocationKey),
+    );
     if (existing) {
       return {
         ok: false,
@@ -369,11 +388,12 @@ export function registerPluginCommand(
     }
   }
 
-  pluginCommands.set(key, {
-    ...normalizedCommand,
+  registry.commands.push({
     pluginId,
     pluginName: opts?.pluginName,
-    pluginRoot: opts?.pluginRoot,
+    rootDir: opts?.pluginRoot,
+    source: opts?.pluginRoot ?? "runtime",
+    command: normalizedCommand,
     ...(opts?.allowOwnerStatusExposure === true && normalizedCommand.exposeSenderIsOwner === true
       ? { trustedOwnerStatusExposure: true as const }
       : {}),
@@ -382,5 +402,4 @@ export function registerPluginCommand(
   return { ok: true };
 }
 
-export { clearPluginCommands, clearPluginCommandsForPlugin };
-export type { RegisteredPluginCommand };
+export { clearPluginCommands };

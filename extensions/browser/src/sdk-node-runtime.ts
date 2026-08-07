@@ -1,3 +1,10 @@
+/**
+ * Browser-local SDK bridge for gateway, plugin runtime, CLI runtime, and timeout
+ * helpers.
+ */
+import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
+import { clampTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+
 export {
   addGatewayClientOptions,
   callGatewayFromCli,
@@ -23,7 +30,6 @@ export {
   type LazyPluginServiceHandle,
 } from "openclaw/plugin-sdk/plugin-runtime";
 export { defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
-import { clampTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
   return clampTimerTimeoutMs(timeoutMs);
@@ -45,11 +51,14 @@ function waitForAbort(
   cleanup: () => void;
 } {
   if (signal.aborted) {
-    return { promise: Promise.reject(signal.reason ?? fallback), cleanup: () => undefined };
+    return {
+      promise: Promise.reject(toErrorObject(signal.reason ?? fallback, "Non-Error rejection")),
+      cleanup: () => undefined,
+    };
   }
   let listener: (() => void) | undefined;
   const promise = new Promise<never>((_, reject) => {
-    listener = () => reject(signal.reason ?? fallback);
+    listener = () => reject(toErrorObject(signal.reason ?? fallback, "Non-Error rejection"));
     signal.addEventListener("abort", listener, { once: true });
   });
   return {
@@ -62,6 +71,7 @@ function waitForAbort(
   };
 }
 
+/** Runs async work with an optional aborting timeout signal. */
 export async function withTimeout<T>(
   work: (signal: AbortSignal | undefined) => Promise<T>,
   timeoutMs?: number,

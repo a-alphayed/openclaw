@@ -1,5 +1,7 @@
+// Covers installed plugin manifest registry behavior.
 import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   readPersistedInstalledPluginIndex,
@@ -65,7 +67,6 @@ function createIndex(rootDir: string): InstalledPluginIndex {
         startup: {
           sidecar: false,
           memory: false,
-          deferConfiguredChannelFullLoadUntilAfterListen: false,
           agentHarnesses: [],
         },
         compat: [],
@@ -150,6 +151,24 @@ function createIndexWithPackageJson(rootDir: string): InstalledPluginIndex {
   };
 }
 
+function createIndexWithUnhashedPackageJson(rootDir: string): InstalledPluginIndex {
+  const index = createIndexWithFileSignatures(rootDir);
+  const packageJsonPath = writePackageManifest(rootDir, "Installed");
+  const record = index.plugins[0];
+  if (!record) {
+    throw new Error("expected index record");
+  }
+  record.packageJson = {
+    path: "package.json",
+    hash: "",
+    fileSignature: fileSignature(packageJsonPath),
+  };
+  return {
+    ...index,
+    plugins: [record],
+  };
+}
+
 describe("loadPluginManifestRegistryForInstalledIndex", () => {
   it("reuses frozen installed-index fingerprints when file signatures are persisted", () => {
     const rootDir = makeTempDir();
@@ -179,6 +198,23 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     expect(second).not.toBe(first);
   });
 
+  it("fingerprints immutable inventory without inspecting plugin files", () => {
+    const rootDir = makeTempDir();
+    writePlugin(rootDir, "installed", "installed-");
+    const index = createIndexWithUnhashedPackageJson(rootDir);
+    const realpathSpy = vi.spyOn(fs, "realpathSync");
+    const statSpy = vi.spyOn(fs, "statSync");
+    try {
+      resolveInstalledManifestRegistryIndexFingerprint(index);
+      resolveInstalledManifestRegistryIndexFingerprint(index);
+      expect(realpathSpy).not.toHaveBeenCalled();
+      expect(statSpy).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+      statSpy.mockRestore();
+    }
+  });
+
   it("does not cache shallow-frozen installed-index fingerprints with mutable nested records", () => {
     const rootDir = makeTempDir();
     writePlugin(rootDir, "installed", "installed-");
@@ -201,7 +237,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     expect(second).not.toBe(first);
   });
 
-  it("does not cache frozen installed-index fingerprints that depend on live file state", () => {
+  it("keeps frozen installed-index fingerprints process-stable without file signatures", () => {
     const rootDir = makeTempDir();
     writePlugin(rootDir, "installed", "installed-");
     const index = deepFreeze(createIndex(rootDir));
@@ -212,7 +248,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     fs.utimesSync(manifestPath, nextMtime, nextMtime);
     const second = resolveInstalledManifestRegistryIndexFingerprint(index);
 
-    expect(second).not.toBe(first);
+    expect(second).toBe(first);
   });
 
   it("reconstructs installed-index manifest registries when manifest files change", () => {
@@ -300,7 +336,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
       includeDisabled: true,
     });
     const realpathSpy = vi.spyOn(fs, "realpathSync");
-    let packagePathCalls: unknown[][] = [];
+    let packagePathCalls: unknown[][];
     try {
       loadPluginManifestRegistryForInstalledIndex({
         index,
@@ -339,6 +375,29 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     });
   });
 
+  it("reuses a prepared manifest graph without reopening plugin manifests", () => {
+    const rootDir = makeTempDir();
+    writePlugin(rootDir, "installed", "installed-");
+    const index = createIndex(rootDir);
+    const env = { OPENCLAW_VERSION: "2026.4.25", VITEST: "true" };
+    const manifestRegistry = loadPluginManifestRegistryForInstalledIndex({
+      index,
+      env,
+      includeDisabled: true,
+    });
+    fs.unlinkSync(path.join(rootDir, "openclaw.plugin.json"));
+
+    const reused = loadPluginManifestRegistryForInstalledIndex({
+      index,
+      env,
+      manifestRegistry,
+      includeDisabled: true,
+    });
+
+    expect(reused.plugins).toEqual(manifestRegistry.plugins);
+    expect(reused.diagnostics).toEqual([]);
+  });
+
   it("reconstructs bundle candidates with their bundle manifest format", () => {
     const rootDir = makeTempDir();
     fs.mkdirSync(path.join(rootDir, ".claude-plugin"), { recursive: true });
@@ -358,7 +417,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
         ...index,
         plugins: [
           {
-            ...index.plugins[0],
+            ...expectDefined(index.plugins[0], "index.plugins[0] test invariant"),
             pluginId: "claude-bundle",
             manifestPath: path.join(rootDir, ".claude-plugin", "plugin.json"),
             source: rootDir,
@@ -382,7 +441,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     expect(registry.plugins[0]?.skills).toEqual(["commands"]);
   });
 
-  it("hydrates package channel command metadata while reconstructing from an older index", () => {
+  it("hydrates package metadata while dropping setup fields with mismatched CLI names", () => {
     const rootDir = makeTempDir();
     writePlugin(rootDir, "installed", "installed-");
     fs.writeFileSync(
@@ -392,9 +451,50 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
           channel: {
             id: "installed",
             label: "Installed",
+            approvalFlags: ["native", "unsupported"],
             commands: {
               nativeCommandsAutoEnabled: true,
               nativeSkillsAutoEnabled: false,
+            },
+            setup: {
+              fields: [
+                {
+                  key: "tenant",
+                  kind: "choice",
+                  choices: ["alpha", "beta"],
+                  cli: {
+                    flags: "--tenant <tenant>",
+                    negatedFlags: "--no-tenant",
+                    description: "Installed tenant",
+                  },
+                },
+                {
+                  key: "credential",
+                  kind: "string",
+                  cli: {
+                    flags: "--token <value>",
+                    description: "Installed credential",
+                  },
+                },
+                {
+                  key: "tenant",
+                  kind: "boolean",
+                  cli: {
+                    flags: "--tenant",
+                    negatedFlags: "--no-other",
+                    description: "Mismatched tenant toggle",
+                  },
+                },
+                {
+                  key: "useEnv",
+                  kind: "boolean",
+                  cli: {
+                    flags: "--use-env",
+                    negatedFlags: "--no-use-env",
+                    description: "Use environment credentials",
+                  },
+                },
+              ],
             },
           },
         },
@@ -408,7 +508,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
         ...index,
         plugins: [
           {
-            ...index.plugins[0],
+            ...expectDefined(index.plugins[0], "index.plugins[0] test invariant"),
             packageChannel: {
               id: "installed",
               label: "Installed",
@@ -430,6 +530,30 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     expect(registry.plugins[0]?.channelCatalogMeta?.commands).toEqual({
       nativeCommandsAutoEnabled: true,
       nativeSkillsAutoEnabled: false,
+    });
+    expect(registry.plugins[0]?.packageChannel?.approvalFlags).toEqual(["native"]);
+    expect(registry.plugins[0]?.packageManifest?.channel?.setup).toEqual({
+      fields: [
+        {
+          key: "tenant",
+          kind: "choice",
+          choices: ["alpha", "beta"],
+          cli: {
+            flags: "--tenant <tenant>",
+            negatedFlags: "--no-tenant",
+            description: "Installed tenant",
+          },
+        },
+        {
+          key: "useEnv",
+          kind: "boolean",
+          cli: {
+            flags: "--use-env",
+            negatedFlags: "--no-use-env",
+            description: "Use environment credentials",
+          },
+        },
+      ],
     });
   });
 
@@ -460,7 +584,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
         ...index,
         plugins: [
           {
-            ...index.plugins[0],
+            ...expectDefined(index.plugins[0], "index.plugins[0] test invariant"),
             packageJson: {
               path: "..meta/package.json",
               hash: "old-index-hash",
@@ -513,7 +637,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
           ...index,
           plugins: [
             {
-              ...index.plugins[0],
+              ...expectDefined(index.plugins[0], "index.plugins[0] test invariant"),
               packageJson: {
                 path: "package.json",
                 hash: "old-index-hash",
@@ -566,6 +690,47 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
     expect(registry.plugins[0]?.channelCatalogMeta).toBeUndefined();
   });
 
+  it("normalizes persisted channel CLI option value types", () => {
+    const rootDir = makeTempDir();
+    writePlugin(rootDir, "installed", "installed-");
+    const index = createIndex(rootDir);
+    const registry = loadPluginManifestRegistryForInstalledIndex({
+      index: {
+        ...index,
+        plugins: [
+          {
+            ...index.plugins[0],
+            packageChannel: {
+              id: "installed",
+              cliAddOptions: [
+                {
+                  flags: "--limit <n>",
+                  description: "Limit",
+                  valueType: "int",
+                },
+                {
+                  flags: "--ignored <value>",
+                  description: "Ignored",
+                  valueType: "string",
+                },
+              ],
+            },
+          },
+        ],
+      } as unknown as InstalledPluginIndex,
+      env: {
+        OPENCLAW_VERSION: "2026.4.25",
+        VITEST: "true",
+      },
+      includeDisabled: true,
+    });
+
+    expect(registry.plugins[0]?.packageChannel?.cliAddOptions).toEqual([
+      { flags: "--limit <n>", description: "Limit", valueType: "int" },
+      { flags: "--ignored <value>", description: "Ignored" },
+    ]);
+  });
+
   it("round-trips bundle metadata through the persisted index before reconstruction", async () => {
     const stateDir = makeTempDir();
     const rootDir = makeTempDir();
@@ -582,7 +747,7 @@ describe("loadPluginManifestRegistryForInstalledIndex", () => {
 
     const index = createIndex(rootDir);
     const persistedPlugin = {
-      ...index.plugins[0],
+      ...expectDefined(index.plugins[0], "index.plugins[0] test invariant"),
       pluginId: "claude-bundle",
       manifestPath: path.join(rootDir, ".claude-plugin", "plugin.json"),
       source: rootDir,

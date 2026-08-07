@@ -26,6 +26,7 @@ export {
   normalizeFreshness,
   normalizeToIsoDate,
   parseIsoDateRange,
+  parseWebSearchTimeFilters,
   readCachedSearchPayload,
   readConfiguredSecretString,
   readProviderEnvValue,
@@ -76,21 +77,3 @@ export type {
   WebSearchProviderToolDefinition,
   WebSearchProviderToolExecutionContext,
 };
-
-/**
- * @deprecated Implement provider-owned `createTool(...)` directly on the
- * returned WebSearchProviderPlugin instead of routing through core.
- */
-export function createPluginBackedWebSearchProvider(
-  provider: WebSearchProviderPlugin,
-): WebSearchProviderPlugin {
-  return {
-    ...provider,
-    createTool: () => {
-      throw new Error(
-        `createPluginBackedWebSearchProvider(${provider.id}) is no longer supported. ` +
-          "Define provider-owned createTool(...) directly in the extension's WebSearchProviderPlugin.",
-      );
-    },
-  };
-}

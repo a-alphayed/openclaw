@@ -1,21 +1,24 @@
+// Broad helper coverage for runEmbeddedAttempt prompt, stream, and tool seams.
 import { describe, expect, it, vi } from "vitest";
 import { streamSimple } from "../../../llm/stream.js";
 
 vi.mock("../context-engine-capabilities.js", () => ({
   resolveContextEngineCapabilities: async () => ({ llm: undefined }),
 }));
+import type { LlmRuntime } from "@openclaw/ai";
+import { defaultLlmRuntime } from "@openclaw/ai/internal/runtime";
+import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "@openclaw/ai/internal/shared";
 import type { OpenClawConfig } from "../../../config/config.js";
-import { addSession, resetProcessRegistryForTests } from "../../bash-process-registry.js";
+import { addSession } from "../../bash-process-registry.js";
 import { createProcessSessionFixture } from "../../bash-process-registry.test-helpers.js";
+import { resetProcessRegistryForTests } from "../../bash-process-registry.test-support.js";
 import { wrapPluginSystemContextSection } from "../../hook-system-context-boundary.js";
-import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "../../system-prompt-cache-boundary.js";
 import { buildAgentSystemPrompt } from "../../system-prompt.js";
+import type { NormalizedUsage } from "../../usage.js";
 import {
-  resetEmbeddedAgentBaseStreamFnCacheForTest,
   resolveEmbeddedAgentBaseStreamFn,
-  resolveEmbeddedAgentStreamFn,
+  resolveEmbeddedAgentStreamFn as resolveEmbeddedAgentStreamFnImpl,
 } from "../stream-resolution.js";
-import { resolveBootstrapContextTargets } from "./attempt-bootstrap-routing.js";
 import { buildContextEnginePromptCacheInfo } from "./attempt.context-engine-helpers.js";
 import {
   buildAfterTurnRuntimeContext,
@@ -28,15 +31,23 @@ import {
   shouldWarnOnOrphanedUserRepair,
 } from "./attempt.prompt-helpers.js";
 import { composeSystemPromptWithHookContext } from "./attempt.thread-helpers.js";
-import {
-  decodeHtmlEntitiesInObject,
-  wrapStreamFnRepairMalformedToolCallArguments,
-} from "./attempt.tool-call-argument-repair.js";
+import { wrapStreamFnRepairMalformedToolCallArguments } from "./attempt.tool-call-argument-repair.js";
 import {
   wrapStreamFnSanitizeMalformedToolCalls,
   wrapStreamFnTrimToolCallNames,
 } from "./attempt.tool-call-normalization.js";
 import { buildEmbeddedAttemptToolRunContext } from "./attempt.tool-run-context.js";
+
+const llmRuntime = {
+  ...defaultLlmRuntime,
+  streamSimple,
+} as LlmRuntime;
+
+function resolveEmbeddedAgentStreamFn(
+  params: Omit<Parameters<typeof resolveEmbeddedAgentStreamFnImpl>[0], "llmRuntime">,
+) {
+  return resolveEmbeddedAgentStreamFnImpl({ ...params, llmRuntime });
+}
 
 type FakeWrappedStream = {
   result: () => Promise<unknown>;
@@ -47,6 +58,8 @@ function createFakeStream(params: {
   events: unknown[];
   resultMessage: unknown;
 }): FakeWrappedStream {
+  // Minimal stream compatible with wrappers that decorate result and iteration
+  // without needing a real provider stream.
   return {
     async result() {
       return params.resultMessage;
@@ -67,6 +80,7 @@ async function invokeWrappedTestStream(
   ) => (...args: never[]) => FakeWrappedStream | Promise<FakeWrappedStream>,
   baseFn: (...args: never[]) => unknown,
 ): Promise<FakeWrappedStream> {
+  // Helper keeps wrapper tests focused on mutated stream behavior.
   const wrappedFn = wrap(baseFn);
   return await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
 }
@@ -78,10 +92,7 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function requireContentItem(
-  content: Array<{ type?: string; text?: string; name?: string }> | unknown[],
-  index = 0,
-) {
+function requireContentItem(content: unknown[], index = 0) {
   return requireRecord(content[index], `content item ${index}`);
 }
 
@@ -89,20 +100,14 @@ function wrappedPluginSystemContext(text: string): string {
   return wrapPluginSystemContextSection(text) ?? "";
 }
 
-function expectSingleTextContent(
-  content: Array<{ type?: string; text?: string }> | unknown[],
-  textFragment: string,
-) {
+function expectSingleTextContent(content: unknown[], textFragment: string) {
   expect(content).toHaveLength(1);
   const item = requireContentItem(content);
   expect(item.type).toBe("text");
   expect(item.text).toContain(textFragment);
 }
 
-function expectSingleToolCallContent(
-  content: Array<{ type?: string; name?: string }> | unknown[],
-  name: string,
-) {
+function expectSingleToolCallContent(content: unknown[], name: string) {
   expect(content).toHaveLength(1);
   const item = requireContentItem(content);
   expect(item.type).toBe("toolCall");
@@ -110,6 +115,7 @@ function expectSingleToolCallContent(
 }
 
 function firstBaseContext(baseFn: ReturnType<typeof vi.fn>): { messages: unknown[] } {
+  // Wrapper tests assert the context passed to the underlying stream function.
   const call = baseFn.mock.calls.at(0);
   if (!call) {
     throw new Error("expected base stream call");
@@ -133,60 +139,7 @@ describe("buildEmbeddedAttemptToolRunContext", () => {
 });
 
 describe("resolvePromptBuildHookResult", () => {
-  function createBeforeAgentStartOnlyHookRunner() {
-    return {
-      hasHooks: vi.fn(
-        (
-          hookName:
-            | "agent_turn_prepare"
-            | "heartbeat_prompt_contribution"
-            | "before_prompt_build"
-            | "before_agent_start",
-        ) => hookName === "before_agent_start",
-      ),
-      runBeforePromptBuild: vi.fn(async () => undefined),
-      runBeforeAgentStart: vi.fn(async () => ({ prependContext: "from-hook" })),
-    };
-  }
-
-  it("reuses precomputed before_agent_start result without invoking hook again", async () => {
-    const hookRunner = createBeforeAgentStartOnlyHookRunner();
-    const result = await resolvePromptBuildHookResult({
-      config: {},
-      prompt: "hello",
-      messages: [],
-      hookCtx: {},
-      hookRunner,
-      beforeAgentStartResult: { prependContext: "from-cache", systemPrompt: "agent-start-system" },
-    });
-
-    expect(hookRunner.runBeforeAgentStart).not.toHaveBeenCalled();
-    expect(result).toEqual({
-      prependContext: "from-cache",
-      appendContext: undefined,
-      systemPrompt: "agent-start-system",
-      prependSystemContext: undefined,
-      appendSystemContext: undefined,
-    });
-  });
-
-  it("calls before_agent_start hook when precomputed result is absent", async () => {
-    const hookRunner = createBeforeAgentStartOnlyHookRunner();
-    const messages = [{ role: "user", content: "ctx" }];
-    const result = await resolvePromptBuildHookResult({
-      config: {},
-      prompt: "hello",
-      messages,
-      hookCtx: {},
-      hookRunner,
-    });
-
-    expect(hookRunner.runBeforeAgentStart).toHaveBeenCalledTimes(1);
-    expect(hookRunner.runBeforeAgentStart).toHaveBeenCalledWith({ prompt: "hello", messages }, {});
-    expect(result.prependContext).toBe("from-hook");
-  });
-
-  it("merges prompt-build and before_agent_start context fields in deterministic order", async () => {
+  it("preserves prompt-build context fields", async () => {
     const hookRunner = {
       hasHooks: vi.fn(() => true),
       runBeforePromptBuild: vi.fn(async () => ({
@@ -195,12 +148,6 @@ describe("resolvePromptBuildHookResult", () => {
         prependSystemContext: "prompt prepend",
         appendSystemContext: "prompt append",
       })),
-      runBeforeAgentStart: vi.fn(async () => ({
-        prependContext: "agent start context",
-        appendContext: "agent start append context",
-        prependSystemContext: "agent start prepend",
-        appendSystemContext: "agent start append",
-      })),
     };
 
     const result = await resolvePromptBuildHookResult({
@@ -211,14 +158,10 @@ describe("resolvePromptBuildHookResult", () => {
       hookRunner,
     });
 
-    expect(result.prependContext).toBe("prompt context\n\nagent start context");
-    expect(result.appendContext).toBe("prompt append context\n\nagent start append context");
-    expect(result.prependSystemContext).toBe(
-      `${wrappedPluginSystemContext("prompt prepend")}\n\n${wrappedPluginSystemContext("agent start prepend")}`,
-    );
-    expect(result.appendSystemContext).toBe(
-      `${wrappedPluginSystemContext("prompt append")}\n\n${wrappedPluginSystemContext("agent start append")}`,
-    );
+    expect(result.prependContext).toBe("prompt context");
+    expect(result.appendContext).toBe("prompt append context");
+    expect(result.prependSystemContext).toBe(wrappedPluginSystemContext("prompt prepend"));
+    expect(result.appendSystemContext).toBe(wrappedPluginSystemContext("prompt append"));
   });
 
   it("applies heartbeat prompt contributions only during heartbeat turns", async () => {
@@ -229,7 +172,6 @@ describe("resolvePromptBuildHookResult", () => {
         appendContext: "heartbeat append",
       })),
       runBeforePromptBuild: vi.fn(async () => undefined),
-      runBeforeAgentStart: vi.fn(async () => undefined),
     };
 
     const heartbeatResult = await resolvePromptBuildHookResult({
@@ -334,23 +276,6 @@ describe("resolvePromptModeForSession", () => {
   });
 });
 
-describe("resolveBootstrapContextTargets", () => {
-  it("keeps BOOTSTRAP.md in system Project Context only for full bootstrap turns", () => {
-    expect(resolveBootstrapContextTargets({ bootstrapMode: "full" })).toEqual({
-      includeBootstrapInSystemContext: true,
-      includeBootstrapInRuntimeContext: false,
-    });
-    expect(resolveBootstrapContextTargets({ bootstrapMode: "limited" })).toEqual({
-      includeBootstrapInSystemContext: false,
-      includeBootstrapInRuntimeContext: false,
-    });
-    expect(resolveBootstrapContextTargets({ bootstrapMode: "none" })).toEqual({
-      includeBootstrapInSystemContext: false,
-      includeBootstrapInRuntimeContext: false,
-    });
-  });
-});
-
 describe("shouldWarnOnOrphanedUserRepair", () => {
   it("warns for user and manual runs", () => {
     expect(shouldWarnOnOrphanedUserRepair("user")).toBe(true);
@@ -379,8 +304,61 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       merged: true,
       removeLeaf: true,
       prompt:
-        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "[Queued user message from a previous active turn; preserved as context only. Continue with the active prompt below.]\n" +
         "older active-turn message\n\nnewest inbound message",
+    });
+  });
+
+  it("drops stale internal orphan context when a fresh prompt is present", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "newest inbound message",
+        trigger: "user",
+        leafMessage: {
+          content: "NO_REPLY stale subagent completion",
+          provenance: { kind: "inter_session", sourceTool: "subagent_announce" },
+        },
+      }),
+    ).toEqual({
+      merged: false,
+      removeLeaf: true,
+      prompt: "newest inbound message",
+    });
+  });
+
+  it("does not replay the initiating user turn into an approved-exec continuation", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "authenticated approved-exec result",
+        trigger: "user",
+        leafMessage: {
+          content: "run the command again",
+          provenance: { kind: "inter_session", sourceTool: "exec_approval_followup" },
+        },
+      }),
+    ).toEqual({
+      merged: false,
+      removeLeaf: true,
+      prompt: "authenticated approved-exec result",
+    });
+  });
+
+  it("preserves user-directed inter-session orphan context", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "newest inbound message",
+        trigger: "user",
+        leafMessage: {
+          content: "forwarded user request",
+          provenance: { kind: "inter_session", sourceTool: "sessions_send" },
+        },
+      }),
+    ).toEqual({
+      merged: true,
+      removeLeaf: true,
+      prompt:
+        "[Queued user message from a previous active turn; preserved as context only. Continue with the active prompt below.]\n" +
+        "forwarded user request\n\nnewest inbound message",
     });
   });
 
@@ -413,7 +391,7 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       merged: true,
       removeLeaf: true,
       prompt:
-        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "[Queued user message from a previous active turn; preserved as context only. Continue with the active prompt below.]\n" +
         "ok\n\nplease inspect this token",
     });
   });
@@ -435,7 +413,7 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       merged: true,
       removeLeaf: true,
       prompt:
-        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "[Queued user message from a previous active turn; preserved as context only. Continue with the active prompt below.]\n" +
         "please inspect this\n" +
         "[image_url] https://example.test/cat.png\n" +
         "[input_audio] https://example.test/cat.wav\n\n" +
@@ -521,7 +499,7 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       merged: true,
       removeLeaf: true,
       prompt:
-        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "[Queued user message from a previous active turn; preserved as context only. Continue with the active prompt below.]\n" +
         "older active-turn message\n\nHEARTBEAT_OK",
     });
   });
@@ -529,7 +507,6 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
 
 describe("resolveEmbeddedAgentStreamFn", () => {
   it("reuses the session's original base stream across later wrapper mutations", () => {
-    resetEmbeddedAgentBaseStreamFnCacheForTest();
     const baseStreamFn = vi.fn();
     const wrapperStreamFn = vi.fn();
     const session = {
@@ -951,7 +928,8 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     await firstStream.result();
 
     const secondStream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
-    for await (const item of secondStream) {
+    for await (const ignoredItem of secondStream) {
+      void ignoredItem;
       // drain
     }
     const secondResult = (await secondStream.result()) as {
@@ -986,7 +964,8 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     await firstStream.result();
 
     const secondStream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
-    for await (const item of secondStream) {
+    for await (const ignoredItem of secondStream) {
+      void ignoredItem;
       // drain
     }
     const secondResult = (await secondStream.result()) as {
@@ -1033,7 +1012,8 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     });
 
     const firstStream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
-    for await (const item of firstStream) {
+    for await (const ignoredItem of firstStream) {
+      void ignoredItem;
       // drain
     }
     await firstStream.result();
@@ -1083,7 +1063,8 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     });
 
     const firstStream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
-    for await (const item of firstStream) {
+    for await (const ignoredItem of firstStream) {
+      void ignoredItem;
       // drain
     }
     await firstStream.result();
@@ -1147,7 +1128,8 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     await firstStream.result();
 
     const secondStream = await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
-    for await (const item of secondStream) {
+    for await (const ignoredItem of secondStream) {
+      void ignoredItem;
       // drain
     }
     await secondStream.result();
@@ -1244,9 +1226,57 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     expect(finalToolCall.name).toBe("read");
   });
 
-  it("recovers malformed non-blank names when id is missing", async () => {
-    const finalToolCall = { type: "toolCall", name: "functionsread3" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
+  it.each([
+    {
+      name: "recovers malformed non-blank names when id is missing",
+      toolCall: { type: "toolCall", name: "functionsread3" },
+      allowedTools: ["read", "write"],
+      expectedName: "read",
+    },
+    {
+      name: "recovers canonical tool names from canonical ids when name is empty",
+      toolCall: { type: "toolCall", id: "read", name: "" },
+      allowedTools: ["read", "write"],
+      expectedName: "read",
+    },
+    {
+      name: "recovers tool names from ids when name is whitespace-only",
+      toolCall: { type: "toolCall", id: "functionswrite4", name: "   " },
+      allowedTools: ["read", "write"],
+      expectedName: "write",
+    },
+    {
+      name: "prefers explicit trimmed canonical names over conflicting malformed ids",
+      toolCall: { type: "toolCall", id: "functionswrite4", name: " read " },
+      allowedTools: ["read", "write"],
+      expectedName: "read",
+    },
+    {
+      name: "does not rewrite composite names that mention multiple tools",
+      toolCall: { type: "toolCall", id: "functionsread3", name: "read write" },
+      allowedTools: ["read", "write"],
+      expectedName: "read write",
+    },
+    {
+      name: "fails closed for malformed non-blank names that are ambiguous",
+      toolCall: { type: "toolCall", id: "functions.exec2", name: "functions.exec2" },
+      allowedTools: ["exec", "exec2"],
+      expectedName: "functions.exec2",
+    },
+    {
+      name: "matches malformed ids case-insensitively across common separators",
+      toolCall: { type: "toolCall", id: "Functions.Read_7", name: "" },
+      allowedTools: ["read", "write"],
+      expectedName: "read",
+    },
+    {
+      name: "does not override explicit non-blank tool names with inferred ids",
+      toolCall: { type: "toolCall", id: "functionswrite4", name: "someOtherTool" },
+      allowedTools: ["read", "write"],
+      expectedName: "someOtherTool",
+    },
+  ])("$name", async ({ toolCall, allowedTools, expectedName }) => {
+    const finalMessage = { role: "assistant", content: [toolCall] };
     const baseFn = vi.fn(() =>
       createFakeStream({
         events: [],
@@ -1254,42 +1284,10 @@ describe("wrapStreamFnTrimToolCallNames", () => {
       }),
     );
 
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
+    const stream = await invokeWrappedStream(baseFn, new Set(allowedTools));
     await stream.result();
 
-    expect(finalToolCall.name).toBe("read");
-  });
-
-  it("recovers canonical tool names from canonical ids when name is empty", async () => {
-    const finalToolCall = { type: "toolCall", id: "read", name: "" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("read");
-  });
-
-  it("recovers tool names from ids when name is whitespace-only", async () => {
-    const finalToolCall = { type: "toolCall", id: "functionswrite4", name: "   " };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("write");
+    expect(toolCall.name).toBe(expectedName);
   });
 
   it("stops final blank tool names before dispatch and still assigns fallback ids", async () => {
@@ -1309,7 +1307,7 @@ describe("wrapStreamFnTrimToolCallNames", () => {
 
     expectSingleTextContent(result.content, '"blank tool name"');
     expect(finalToolCall.name).toBe("");
-    expect(finalToolCall.id).toBe("call_auto_1");
+    expect(finalToolCall.id).toMatch(/^call_[0-9a-f]{24}$/);
   });
 
   it("assigns fallback ids when both name and id are missing", async () => {
@@ -1326,7 +1324,33 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     await stream.result();
 
     expect(finalToolCall.name).toBeUndefined();
-    expect(finalToolCall.id).toBe("call_auto_1");
+    expect(finalToolCall.id).toMatch(/^call_[0-9a-f]{24}$/);
+  });
+
+  it("does not reuse fallback ids across assistant response streams", async () => {
+    const ids: string[] = [];
+    for (let responseIndex = 0; responseIndex < 2; responseIndex += 1) {
+      const finalToolCall: { type: string; name: string; id?: string } = {
+        type: "toolCall",
+        name: "read",
+      };
+      const baseFn = vi.fn(() =>
+        createFakeStream({
+          events: [],
+          resultMessage: { role: "assistant", content: [finalToolCall] },
+        }),
+      );
+      const stream = await invokeWrappedStream(baseFn, new Set(["read"]));
+      await stream.result();
+      if (!finalToolCall.id) {
+        throw new Error("missing fallback tool call id");
+      }
+      ids.push(finalToolCall.id);
+    }
+
+    expect(ids[0]).toMatch(/^call_[0-9a-f]{24}$/);
+    expect(ids[1]).toMatch(/^call_[0-9a-f]{24}$/);
+    expect(ids[1]).not.toBe(ids[0]);
   });
 
   it("prefers explicit canonical names over conflicting canonical ids", async () => {
@@ -1344,85 +1368,6 @@ describe("wrapStreamFnTrimToolCallNames", () => {
 
     expect(finalToolCall.name).toBe("read");
     expect(finalToolCall.id).toBe("write");
-  });
-
-  it("prefers explicit trimmed canonical names over conflicting malformed ids", async () => {
-    const finalToolCall = { type: "toolCall", id: "functionswrite4", name: " read " };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("read");
-  });
-
-  it("does not rewrite composite names that mention multiple tools", async () => {
-    const finalToolCall = { type: "toolCall", id: "functionsread3", name: "read write" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("read write");
-  });
-
-  it("fails closed for malformed non-blank names that are ambiguous", async () => {
-    const finalToolCall = { type: "toolCall", id: "functions.exec2", name: "functions.exec2" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["exec", "exec2"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("functions.exec2");
-  });
-
-  it("matches malformed ids case-insensitively across common separators", async () => {
-    const finalToolCall = { type: "toolCall", id: "Functions.Read_7", name: "" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("read");
-  });
-  it("does not override explicit non-blank tool names with inferred ids", async () => {
-    const finalToolCall = { type: "toolCall", id: "functionswrite4", name: "someOtherTool" };
-    const finalMessage = { role: "assistant", content: [finalToolCall] };
-    const baseFn = vi.fn(() =>
-      createFakeStream({
-        events: [],
-        resultMessage: finalMessage,
-      }),
-    );
-
-    const stream = await invokeWrappedStream(baseFn, new Set(["read", "write"]));
-    await stream.result();
-
-    expect(finalToolCall.name).toBe("someOtherTool");
   });
 
   it("fails closed when malformed ids could map to multiple allowlisted tools", async () => {
@@ -1514,11 +1459,12 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     const result = await stream.result();
 
     expect(partialToolCall.name).toBe("read");
-    expect(partialToolCall.id).toBe("call_auto_1");
+    expect(partialToolCall.id).toMatch(/^call_[0-9a-f]{24}$/);
     expect(finalToolCallA.name).toBe("exec");
-    expect(finalToolCallA.id).toBe("call_auto_1");
+    expect(finalToolCallA.id).toBe(partialToolCall.id);
     expect(finalToolCallB.name).toBe("write");
-    expect(finalToolCallB.id).toBe("call_auto_2");
+    expect(finalToolCallB.id).toMatch(/^call_[0-9a-f]{24}$/);
+    expect(finalToolCallB.id).not.toBe(finalToolCallA.id);
     expect(result).toBe(finalMessage);
   });
 
@@ -1556,7 +1502,7 @@ describe("wrapStreamFnTrimToolCallNames", () => {
     expect(finalToolCallA.name).toBe("read");
     expect(finalToolCallB.name).toBe("write");
     expect(finalToolCallA.id).toBe("edit:22");
-    expect(finalToolCallB.id).toBe("call_auto_1");
+    expect(finalToolCallB.id).toMatch(/^call_[0-9a-f]{24}$/);
   });
 });
 
@@ -1614,6 +1560,43 @@ describe("wrapStreamFnSanitizeMalformedToolCalls", () => {
       preserveSignatures: true,
       dropThinkingBlocks: false,
     } as never);
+    const stream = wrapped({} as never, { messages } as never, {} as never) as
+      | FakeWrappedStream
+      | Promise<FakeWrappedStream>;
+    await Promise.resolve(stream);
+
+    expect(baseFn).toHaveBeenCalledTimes(1);
+    const seenContext = firstBaseContext(baseFn);
+    expect(seenContext.messages).toBe(messages);
+  });
+
+  it("preserves deferred directory tool calls allowed only for replay", async () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_hidden", name: "hidden_catalog_tool", arguments: {} },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call_hidden",
+        content: [{ type: "toolResult", result: { ok: true } }],
+      },
+    ];
+    const baseFn = vi.fn((_model, _context) =>
+      createFakeStream({ events: [], resultMessage: { role: "assistant", content: [] } }),
+    );
+
+    const wrapped = wrapStreamFnSanitizeMalformedToolCalls(
+      baseFn as never,
+      new Set(["tool_describe", "tool_call", "hidden_catalog_tool"]),
+      {
+        validateAnthropicTurns: true,
+        preserveSignatures: true,
+        dropThinkingBlocks: false,
+      } as never,
+    );
     const stream = wrapped({} as never, { messages } as never, {} as never) as
       | FakeWrappedStream
       | Promise<FakeWrappedStream>;
@@ -3209,44 +3192,6 @@ describe("wrapStreamFnRepairMalformedToolCallArguments", () => {
   });
 });
 
-describe("decodeHtmlEntitiesInObject", () => {
-  it("decodes HTML entities in string values", () => {
-    const result = decodeHtmlEntitiesInObject(
-      "source .env &amp;&amp; psql &quot;$DB&quot; -c &lt;query&gt;",
-    );
-    expect(result).toBe('source .env && psql "$DB" -c <query>');
-  });
-
-  it("recursively decodes nested objects", () => {
-    const input = {
-      command: "cd ~/dev &amp;&amp; npm run build",
-      args: ["--flag=&quot;value&quot;", "&lt;input&gt;"],
-      nested: { deep: "a &amp; b" },
-    };
-    const result = decodeHtmlEntitiesInObject(input) as Record<string, unknown>;
-    expect(result.command).toBe("cd ~/dev && npm run build");
-    expect((result.args as string[])[0]).toBe('--flag="value"');
-    expect((result.args as string[])[1]).toBe("<input>");
-    expect((result.nested as Record<string, string>).deep).toBe("a & b");
-  });
-
-  it("passes through non-string primitives unchanged", () => {
-    expect(decodeHtmlEntitiesInObject(42)).toBe(42);
-    expect(decodeHtmlEntitiesInObject(null)).toBe(null);
-    expect(decodeHtmlEntitiesInObject(true)).toBe(true);
-    expect(decodeHtmlEntitiesInObject(undefined)).toBe(undefined);
-  });
-
-  it("returns strings without entities unchanged", () => {
-    const input = "plain string with no entities";
-    expect(decodeHtmlEntitiesInObject(input)).toBe(input);
-  });
-
-  it("decodes numeric character references", () => {
-    expect(decodeHtmlEntitiesInObject("&#39;hello&#39;")).toBe("'hello'");
-    expect(decodeHtmlEntitiesInObject("&#x27;world&#x27;")).toBe("'world'");
-  });
-});
 describe("prependSystemPromptAddition", () => {
   it("prepends context-engine addition to the system prompt", () => {
     const result = prependSystemPromptAddition({
@@ -3291,7 +3236,7 @@ describe("buildAfterTurnRuntimeContext", () => {
           sessionId: "session-123",
           config: {} as OpenClawConfig,
           skillsSnapshot: undefined,
-          provider: "openai-codex",
+          provider: "openai",
           modelId: "gpt-5.4",
           thinkLevel: "off",
           reasoningLevel: "on",
@@ -3314,12 +3259,28 @@ describe("buildAfterTurnRuntimeContext", () => {
       expect(activeProcessSessions?.some((session) => session.sessionId === "sess-other")).toBe(
         false,
       );
+      expect(legacy.transcriptStorage).toEqual({ kind: "sqlite" });
     } finally {
       resetProcessRegistryForTests();
     }
   });
 
   it("uses primary model when compaction.model is not set", () => {
+    const runtimeAuthPlan = {
+      providerForAuth: "openai",
+      authProfileProviderForAuth: "openai",
+      harnessAuthProvider: "openai",
+      forwardedAuthProfileId: "openai:p1",
+      forwardedAuthProfileSource: "user" as const,
+      modelRoute: {
+        provider: "openai",
+        modelId: "gpt-5.4",
+        api: "openai-chatgpt-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authRequirement: "subscription" as const,
+        requestTransportOverrides: "none" as const,
+      },
+    };
     const legacy = buildAfterTurnRuntimeContext({
       attempt: {
         sessionKey: "agent:main:session:abc",
@@ -3327,9 +3288,11 @@ describe("buildAfterTurnRuntimeContext", () => {
         messageProvider: "slack",
         agentAccountId: "acct-1",
         authProfileId: "openai:p1",
+        authProfileIdSource: "user",
+        runtimePlan: { auth: runtimeAuthPlan } as never,
         config: {} as OpenClawConfig,
         skillsSnapshot: undefined,
-        provider: "openai-codex",
+        provider: "openai",
         modelId: "gpt-5.4",
         thinkLevel: "off",
         reasoningLevel: "on",
@@ -3341,10 +3304,64 @@ describe("buildAfterTurnRuntimeContext", () => {
       agentDir: "/tmp/agent",
     });
 
-    expect(legacy.provider).toBe("openai-codex");
+    expect(legacy.provider).toBe("openai");
     expect(legacy.model).toBe("gpt-5.4");
+    expect(legacy.authProfileIdSource).toBe("user");
+    expect(legacy.runtimeAuthPlan).toBe(runtimeAuthPlan);
   });
 
+  it("keeps the primary model for a locked after-turn runtime context", () => {
+    const runtimeContext = buildAfterTurnRuntimeContext({
+      attempt: {
+        sessionKey: "agent:main:session:locked",
+        config: {
+          agents: { defaults: { compaction: { model: "anthropic/claude-opus-4-6" } } },
+        } as OpenClawConfig,
+        skillsSnapshot: undefined,
+        provider: "openai",
+        modelId: "gpt-5.5",
+        agentHarnessId: "openclaw",
+        modelSelectionLocked: true,
+        thinkLevel: "off",
+      },
+      workspaceDir: "/tmp/workspace",
+      agentDir: "/tmp/agent",
+    });
+
+    expect(runtimeContext.modelSelectionLocked).toBe(true);
+    expect(runtimeContext.provider).toBe("openai");
+    expect(runtimeContext.model).toBe("gpt-5.5");
+  });
+
+  it("publishes the storage-neutral session target in runtime context", () => {
+    const sessionTarget = {
+      agentId: "main",
+      sessionId: "session-abc",
+      sessionKey: "agent:main:session:abc",
+      storePath: "/tmp/state/agents/main/sessions/sessions.json",
+      threadId: 42,
+    };
+
+    const runtimeContext = buildAfterTurnRuntimeContext({
+      attempt: {
+        sessionId: "ignored-session-id",
+        sessionKey: "agent:main:fallback",
+        sessionTarget,
+        config: {} as OpenClawConfig,
+        skillsSnapshot: undefined,
+        provider: "openai",
+        modelId: "gpt-5.4",
+        thinkLevel: "off",
+        reasoningLevel: "on",
+      },
+      workspaceDir: "/tmp/workspace",
+      agentDir: "/tmp/agent",
+      activeAgentId: "main",
+    });
+
+    expect(runtimeContext.transcriptStorage).toEqual({ kind: "sqlite" });
+    expect(runtimeContext.sessionTarget).toEqual(sessionTarget);
+  });
   it("resolves compaction.model override in runtime context so all context engines use the correct model", () => {
     const legacy = buildAfterTurnRuntimeContext({
       attempt: {
@@ -3356,14 +3373,19 @@ describe("buildAfterTurnRuntimeContext", () => {
         config: {
           agents: {
             defaults: {
+              models: {
+                "openrouter/anthropic/claude-sonnet-4-5": {
+                  alias: "summary",
+                },
+              },
               compaction: {
-                model: "openrouter/anthropic/claude-sonnet-4-5",
+                model: "summary",
               },
             },
           },
         } as OpenClawConfig,
         skillsSnapshot: undefined,
-        provider: "openai-codex",
+        provider: "openai",
         modelId: "gpt-5.4",
         thinkLevel: "off",
         reasoningLevel: "on",
@@ -3375,12 +3397,11 @@ describe("buildAfterTurnRuntimeContext", () => {
       agentDir: "/tmp/agent",
     });
 
-    // buildEmbeddedCompactionRuntimeContext now resolves the override eagerly
-    // so that context engines (including third-party ones) receive the correct
-    // compaction model in the runtime context.
+    // Resolve aliases before handing runtime context to any context engine;
+    // otherwise third-party engines can dispatch the bare alias as a model id.
     expect(legacy.provider).toBe("openrouter");
     expect(legacy.model).toBe("anthropic/claude-sonnet-4-5");
-    // Auth profile dropped because provider changed from openai-codex to openrouter.
+    // Auth profile dropped because provider changed from openai to openrouter.
     expect(legacy.authProfileId).toBeUndefined();
   });
   it("includes resolved auth profile fields for context-engine afterTurn compaction", () => {
@@ -3402,7 +3423,7 @@ describe("buildAfterTurnRuntimeContext", () => {
         authProfileId: "openai:p1",
         config: { plugins: { slots: { contextEngine: "lossless-claw" } } } as OpenClawConfig,
         skillsSnapshot: undefined,
-        provider: "openai-codex",
+        provider: "openai",
         modelId: "gpt-5.4",
         thinkLevel: "off",
         reasoningLevel: "on",
@@ -3418,7 +3439,7 @@ describe("buildAfterTurnRuntimeContext", () => {
     });
 
     expect(legacy.authProfileId).toBe("openai:p1");
-    expect(legacy.provider).toBe("openai-codex");
+    expect(legacy.provider).toBe("openai");
     expect(legacy.model).toBe("gpt-5.4");
     expect(legacy.workspaceDir).toBe("/tmp/workspace");
     expect(legacy.cwd).toBe("/tmp/task-repo");
@@ -3434,8 +3455,13 @@ describe("buildAfterTurnRuntimeContext", () => {
       output: 5,
       cacheRead: 40,
       cacheWrite: 2,
+      contextUsage: {
+        state: "available",
+        promptTokens: 23,
+        totalTokens: 28,
+      },
       total: 57,
-    };
+    } satisfies NormalizedUsage;
     const promptCache = buildContextEnginePromptCacheInfo({ lastCallUsage });
     const legacy = buildAfterTurnRuntimeContextFromUsage({
       attempt: {
@@ -3446,7 +3472,7 @@ describe("buildAfterTurnRuntimeContext", () => {
         authProfileId: "openai:p1",
         config: { plugins: { slots: { contextEngine: "lossless-claw" } } } as OpenClawConfig,
         skillsSnapshot: undefined,
-        provider: "openai-codex",
+        provider: "openai",
         modelId: "gpt-5.4",
         thinkLevel: "off",
         reasoningLevel: "on",
@@ -3460,7 +3486,7 @@ describe("buildAfterTurnRuntimeContext", () => {
       promptCache,
     });
 
-    expect(legacy.currentTokenCount).toBe(52);
+    expect(legacy.currentTokenCount).toBe(23);
     expect(legacy.promptCache?.lastCallUsage?.total).toBe(57);
   });
 
@@ -3478,7 +3504,7 @@ describe("buildAfterTurnRuntimeContext", () => {
         config: {} as OpenClawConfig,
         skillsSnapshot: undefined,
         senderId: "user-123",
-        provider: "openai-codex",
+        provider: "openai",
         modelId: "gpt-5.4",
         thinkLevel: "off",
         reasoningLevel: "on",
@@ -3495,3 +3521,4 @@ describe("buildAfterTurnRuntimeContext", () => {
     expect(legacy.currentMessageId).toBe("msg-42");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

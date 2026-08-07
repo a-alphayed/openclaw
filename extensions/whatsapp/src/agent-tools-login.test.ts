@@ -1,3 +1,4 @@
+// Whatsapp tests cover agent tools login plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { startWebLoginWithQr, waitForWebLogin } from "../login-qr-api.js";
 import { createWhatsAppLoginTool } from "./agent-tools-login.js";
@@ -13,6 +14,21 @@ const waitForWebLoginMock = vi.mocked(waitForWebLogin);
 describe("createWhatsAppLoginTool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("fully anchors the QR data URL pattern for grammar-constrained models", () => {
+    const tool = createWhatsAppLoginTool();
+    const pattern = (tool.parameters as { properties: { currentQrDataUrl?: { pattern?: string } } })
+      .properties.currentQrDataUrl?.pattern;
+
+    expect(pattern).toBe("^data:image/png;base64,.+$");
+    expect(pattern?.startsWith("^")).toBe(true);
+    expect(pattern?.endsWith("$")).toBe(true);
+
+    const expression = new RegExp(pattern ?? "");
+    expect(expression.test("data:image/png;base64,YQ==")).toBe(true);
+    expect(expression.test("data:image/png;base64,")).toBe(false);
+    expect(expression.test("data:image/jpeg;base64,YQ==")).toBe(false);
   });
 
   it("passes the caller's current QR back into wait actions", async () => {

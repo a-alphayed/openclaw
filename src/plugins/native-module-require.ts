@@ -1,7 +1,9 @@
+// Resolves native module require paths for plugin runtime loading.
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import Module from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const nodeRequire = createRequire(import.meta.url);
 type ResolveFilename = (
@@ -12,8 +14,21 @@ type ResolveFilename = (
 ) => string;
 const moduleWithResolver = Module as typeof Module & {
   _resolveFilename?: ResolveFilename;
+  registerHooks?: (options: {
+    resolve?: (
+      specifier: string,
+      context: { parentURL?: string | undefined },
+      nextResolve: (
+        specifier: string,
+        context?: { parentURL?: string | undefined },
+      ) => {
+        url: string;
+      },
+    ) => { shortCircuit?: boolean; url: string };
+  }) => { deregister: () => void };
 };
 
+/** True for file extensions Node can load through the native JS module loader. */
 export function isJavaScriptModulePath(modulePath: string): boolean {
   return [".js", ".mjs", ".cjs"].includes(path.extname(modulePath).toLowerCase());
 }
@@ -38,10 +53,12 @@ function isSourceTransformFallbackError(error: unknown, modulePath: string): boo
   return (
     code === "ERR_REQUIRE_ESM" ||
     code === "ERR_REQUIRE_ASYNC_MODULE" ||
+    code === "ERR_REQUIRE_ESM_RACE_CONDITION" ||
     isMissingTargetModuleError(candidate, modulePath)
   );
 }
 
+/** Attempts native require before falling back to source transform paths. */
 export function tryNativeRequireJavaScriptModule(
   modulePath: string,
   options: {
@@ -74,6 +91,7 @@ export function tryNativeRequireJavaScriptModule(
   }
 }
 
+/** Clears a native-loaded module and dependency subtree under the plugin dependency root. */
 export function clearNativeRequireJavaScriptModuleCache(
   modulePath: string,
   options: { dependencyRoot?: string } = {},
@@ -133,7 +151,8 @@ function requireWithOptionalAliases(
   return withNativeRequireAliases(aliasMap, () => nodeRequire(modulePath));
 }
 
-export function withNativeRequireAliases<T>(
+/** Runs a native require block with temporary CJS/ESM alias hooks and restores both afterward. */
+function withNativeRequireAliases<T>(
   aliasMap: Record<string, string> | undefined,
   run: () => T,
 ): T {
@@ -141,6 +160,18 @@ export function withNativeRequireAliases<T>(
     return run();
   }
   const originalResolveFilename = moduleWithResolver["_resolveFilename"];
+  const esmHooks = moduleWithResolver.registerHooks?.({
+    resolve(specifier, context, nextResolve) {
+      const aliasTarget = aliasMap[specifier];
+      if (aliasTarget) {
+        return {
+          shortCircuit: true,
+          url: pathToFileURL(aliasTarget).href,
+        };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
   moduleWithResolver["_resolveFilename"] = ((request, parent, isMain, options) => {
     const aliasTarget = aliasMap[request];
     if (aliasTarget) {
@@ -152,5 +183,6 @@ export function withNativeRequireAliases<T>(
     return run();
   } finally {
     moduleWithResolver["_resolveFilename"] = originalResolveFilename;
+    esmHooks?.deregister();
   }
 }

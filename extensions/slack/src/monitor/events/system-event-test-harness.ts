@@ -1,3 +1,4 @@
+// Slack plugin module implements system event test harness behavior.
 import type { SlackMonitorContext } from "../context.js";
 
 export type SlackSystemEventHandler = (args: {
@@ -8,7 +9,7 @@ export type SlackSystemEventHandler = (args: {
 export type SlackSystemEventTestOverrides = {
   dmPolicy?: "open" | "pairing" | "allowlist" | "disabled";
   allowFrom?: string[];
-  channelType?: "im" | "channel";
+  channelType?: "im" | "channel" | "group" | "mpim";
   channelUsers?: string[];
   reactionMode?: "off" | "own" | "all" | "allowlist";
   reactionAllowlist?: Array<string | number>;
@@ -28,6 +29,8 @@ export function createSlackSystemEventTestHarness(overrides?: SlackSystemEventTe
     runtime: { error: () => {} },
     botUserId: "U_BOT",
     botId: "B_BOT",
+    teamId: "T_TEST",
+    installationIdentity: { kind: "workspace", teamId: "T_TEST" },
     dmEnabled: true,
     dmPolicy: overrides?.dmPolicy ?? "open",
     defaultRequireMention: true,
@@ -46,6 +49,8 @@ export function createSlackSystemEventTestHarness(overrides?: SlackSystemEventTe
     reactionAllowlist: overrides?.reactionAllowlist ?? [],
     shouldDropMismatchedSlackEvent: () => false,
     isChannelAllowed: () => true,
+    rememberSlackChannelType: () => {},
+    recallSlackChannelType: () => undefined,
     resolveChannelName: async () => ({
       name: channelType === "im" ? "direct" : "general",
       type: channelType,

@@ -1,4 +1,6 @@
+// Runs the broad verification graph used by Crabbox/Testbox: check then test.
 import { performance } from "node:perf_hooks";
+import { booleanFlag, parseFlagArgs } from "./lib/arg-utils.mjs";
 import { formatMs, printTimingSummary } from "./lib/check-timing-summary.mjs";
 import { runManagedCommand } from "./lib/managed-child-process.mjs";
 
@@ -6,6 +8,40 @@ const stages = [
   { name: "check", args: ["check"] },
   { name: "test", args: ["test"] },
 ];
+
+/**
+ * Renders CLI usage for the verification wrapper.
+ */
+function usage() {
+  return [
+    "Usage: node scripts/verify.mjs",
+    "",
+    "Runs the full verification graph: pnpm check, then pnpm test.",
+    "",
+    "Options:",
+    "  -h, --help  Show this help.",
+  ].join("\n");
+}
+
+/**
+ * Parses verify wrapper CLI args.
+ */
+function parseVerifyArgs(argv) {
+  return parseFlagArgs(
+    argv,
+    { help: false },
+    [
+      booleanFlag("--help", "help", true, { repeatable: true }),
+      booleanFlag("-h", "help", true, { repeatable: true }),
+    ],
+    {
+      ignoreDoubleDash: false,
+      onUnhandledArg(arg) {
+        throw new Error(`unknown argument: ${arg}\n\n${usage()}`);
+      },
+    },
+  );
+}
 
 async function runStage(stage) {
   console.error(`CRABBOX_PHASE:${stage.name}`);
@@ -22,7 +58,24 @@ async function runStage(stage) {
   };
 }
 
-export async function main() {
+/**
+ * Runs verification stages in order and stops at the first failure.
+ */
+async function main(argv = process.argv.slice(2)) {
+  let args;
+  try {
+    args = parseVerifyArgs(argv);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+    return;
+  }
+  if (args.help) {
+    console.log(usage());
+    process.exitCode = 0;
+    return;
+  }
+
   const timings = [];
   for (const stage of stages) {
     const result = await runStage(stage);

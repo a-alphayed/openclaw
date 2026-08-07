@@ -1,10 +1,17 @@
+/** Reads or waits for descendant subagent summaries after isolated cron orchestration. */
 import { readLatestAssistantReply, waitForAgentRunsToDrain } from "../../agents/run-wait.js";
 import { listDescendantRunsForRequester } from "../../agents/subagent-registry-read.js";
-import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+import { stripHeartbeatToken } from "../../auto-reply/heartbeat.js";
+import {
+  HEARTBEAT_TOKEN,
+  isSilentReplyPayloadText,
+  SILENT_REPLY_TOKEN,
+} from "../../auto-reply/tokens.js";
+import { isFastTestRuntimeEnv } from "../../infra/env.js";
 import { isLikelyInterimCronMessage } from "./subagent-followup-hints.js";
 
 function resolveCronSubagentTimings() {
-  const fastTestMode = process.env.OPENCLAW_TEST_FAST === "1";
+  const fastTestMode = isFastTestRuntimeEnv();
   return {
     waitMinMs: fastTestMode ? 10 : 30_000,
     finalReplyGraceMs: fastTestMode ? 50 : 5_000,
@@ -12,6 +19,7 @@ function resolveCronSubagentTimings() {
   };
 }
 
+/** Reads completed descendant subagent replies when the orchestrator only emitted interim text. */
 export async function readDescendantSubagentFallbackReply(params: {
   sessionKey: string;
   runStartedAt: number;
@@ -19,11 +27,11 @@ export async function readDescendantSubagentFallbackReply(params: {
   const descendants = listDescendantRunsForRequester(params.sessionKey)
     .filter(
       (entry) =>
-        typeof entry.endedAt === "number" &&
-        entry.endedAt >= params.runStartedAt &&
+        typeof entry.execution.endedAt === "number" &&
+        entry.execution.endedAt >= params.runStartedAt &&
         entry.childSessionKey.trim().length > 0,
     )
-    .toSorted((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
+    .toSorted((a, b) => (a.execution.endedAt ?? 0) - (b.execution.endedAt ?? 0));
   if (descendants.length === 0) {
     return undefined;
   }
@@ -35,14 +43,16 @@ export async function readDescendantSubagentFallbackReply(params: {
       continue;
     }
     const current = latestByChild.get(childKey);
-    if (!current || (entry.endedAt ?? 0) >= (current.endedAt ?? 0)) {
+    if (!current || (entry.execution.endedAt ?? 0) >= (current.execution.endedAt ?? 0)) {
       latestByChild.set(childKey, entry);
     }
   }
 
   const replies: string[] = [];
+  // Limit fallback synthesis to the latest few children so a noisy run does not
+  // flood the cron announce with stale descendant output.
   const latestRuns = [...latestByChild.values()]
-    .toSorted((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
+    .toSorted((a, b) => (a.execution.endedAt ?? 0) - (b.execution.endedAt ?? 0))
     .slice(-4);
   for (const entry of latestRuns) {
     const frozenResultText = entry.completion?.resultText;
@@ -50,7 +60,7 @@ export async function readDescendantSubagentFallbackReply(params: {
       typeof frozenResultText === "string" && frozenResultText.trim()
         ? frozenResultText.trim()
         : undefined;
-    const usesInternalTranscript = typeof entry.execution?.transcriptFile === "string";
+    const usesInternalTranscript = entry.execution?.transcriptTarget !== undefined;
     let reply = usesInternalTranscript ? frozenReply : undefined;
     if (!reply && !usesInternalTranscript) {
       reply = (await readLatestAssistantReply({ sessionKey: entry.childSessionKey }))?.trim();
@@ -94,7 +104,7 @@ export async function waitForDescendantSubagentSummary(params: {
   // Snapshot the currently active descendant run IDs.
   const getActiveRuns = () =>
     listDescendantRunsForRequester(params.sessionKey).filter(
-      (entry) => typeof entry.endedAt !== "number",
+      (entry) => typeof entry.execution.endedAt !== "number",
     );
 
   const initialActiveRuns = getActiveRuns();
@@ -125,8 +135,14 @@ export async function waitForDescendantSubagentSummary(params: {
     if (
       latest &&
       latest.toUpperCase() !== SILENT_REPLY_TOKEN.toUpperCase() &&
+      // Parent heartbeat acknowledgments remain in chat.history after the
+      // child settles and must not masquerade as descendant output.
+      !stripHeartbeatToken(latest, { mode: "heartbeat", maxAckChars: 0 }).shouldSkip &&
+      !isSilentReplyPayloadText(latest, HEARTBEAT_TOKEN) &&
       (latest !== initialReply || !isLikelyInterimCronMessage(latest))
     ) {
+      // Ignore the original interim acknowledgement; only a new synthesis or a
+      // non-interim reply should replace descendant fallback text.
       return latest;
     }
     return undefined;
@@ -137,7 +153,9 @@ export async function waitForDescendantSubagentSummary(params: {
     if (latest) {
       return latest;
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, timings.gracePollMs));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, timings.gracePollMs);
+    });
   }
 
   // Final read after grace period expires.

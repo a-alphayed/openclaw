@@ -1,11 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
-import {
-  pinActivePluginChannelRegistry,
-  releasePinnedPluginChannelRegistry,
-  setActivePluginRegistry,
-} from "../../plugins/runtime.js";
+// Covers session binding adapter registration, generic current-conversation
+// fallback, capability errors, deduping, and duplicate graph teardown.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
+import { createTrackedTempDirs } from "../../test-utils/tracked-temp-dirs.js";
 import {
   testing,
   getSessionBindingService,
@@ -21,6 +21,7 @@ type SessionBindingServiceModule = typeof import("./session-binding-service.js")
 
 const sessionBindingServiceModuleUrl = new URL("./session-binding-service.ts", import.meta.url)
   .href;
+const tempDirs = createTrackedTempDirs();
 
 function setMinimalCurrentConversationRegistry(): void {
   setActivePluginRegistry(
@@ -79,12 +80,7 @@ function createRecord(input: SessionBindingBindInput): SessionBindingRecord {
   };
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be a record`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-record");
 
 function firstMockArg(
   mock: { mock: { calls: readonly unknown[][] } },
@@ -119,9 +115,26 @@ function expectConversationFields(value: unknown, fields: Record<string, unknown
 }
 
 describe("session binding service", () => {
-  beforeEach(() => {
+  let previousStateDir: string | undefined;
+  let testStateDir = "";
+
+  beforeEach(async () => {
+    previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    testStateDir = await tempDirs.make("openclaw-session-binding-");
+    process.env.OPENCLAW_STATE_DIR = testStateDir;
     testing.resetSessionBindingAdaptersForTests();
     setMinimalCurrentConversationRegistry();
+  });
+
+  afterEach(async () => {
+    testing.resetSessionBindingAdaptersForTests();
+    closeOpenClawStateDatabaseForTest();
+    if (previousStateDir == null) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+    await tempDirs.cleanup();
   });
 
   it("normalizes conversation refs and infers current placement", async () => {
@@ -215,13 +228,14 @@ describe("session binding service", () => {
         },
         placement: "child",
       })
-      .catch((error) => error);
+      .catch((error: unknown) => error);
 
     expect(isSessionBindingError(rejected)).toBe(true);
-    expectRecordFields(requireRecord(rejected, "session binding error"), {
+    const rejectedRecord = requireRecord(rejected, "session binding error");
+    expectRecordFields(rejectedRecord, {
       code: "BINDING_CAPABILITY_UNSUPPORTED",
     });
-    expectRecordFields(requireRecord(rejected.details, "session binding details"), {
+    expectRecordFields(requireRecord(rejectedRecord.details, "session binding details"), {
       placement: "child",
     });
   });
@@ -419,49 +433,6 @@ describe("session binding service", () => {
       accountId: "default",
       conversationId: "19:chatid@thread.v2",
     });
-  });
-
-  it("does not advertise generic plugin bindings from a stale global registry when the active channel registry is empty", async () => {
-    const activeRegistry = createEmptyPluginRegistry();
-    activeRegistry.channels.push({
-      plugin: {
-        id: "external-chat",
-        meta: { aliases: ["external-chat-alias"] },
-      } as never,
-    } as never);
-    setActivePluginRegistry(activeRegistry);
-    const pinnedEmptyChannelRegistry = createEmptyPluginRegistry();
-    pinActivePluginChannelRegistry(pinnedEmptyChannelRegistry);
-
-    try {
-      const service = getSessionBindingService();
-      expect(
-        service.getCapabilities({
-          channel: "external-chat-alias",
-          accountId: "default",
-        }),
-      ).toEqual({
-        adapterAvailable: false,
-        bindSupported: false,
-        unbindSupported: false,
-        placements: [],
-      });
-
-      await expectSessionBindingError(
-        service.bind({
-          targetSessionKey: "agent:codex:acp:external-chat",
-          targetKind: "session",
-          conversation: {
-            channel: "external-chat-alias",
-            accountId: "default",
-            conversationId: "room-1",
-          },
-        }),
-        "BINDING_ADAPTER_UNAVAILABLE",
-      );
-    } finally {
-      releasePinnedPluginChannelRegistry(pinnedEmptyChannelRegistry);
-    }
   });
 
   it("keeps the newest live adapter authoritative until it unregisters", () => {

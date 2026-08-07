@@ -1,17 +1,24 @@
+// Coverage for terminal attempt trajectory status classification.
 import { describe, expect, it } from "vitest";
 import {
-  NON_DELIVERABLE_TERMINAL_TURN_REASON,
   resolveAttemptTrajectoryTerminal,
   resolveTerminalAssistantTexts,
-  type ResolveAttemptTrajectoryTerminalParams,
 } from "./attempt-trajectory-status.js";
+
+const NON_DELIVERABLE_TERMINAL_TURN_REASON = "non_deliverable_terminal_turn";
+
+type ResolveAttemptTrajectoryTerminalParams = Parameters<
+  typeof resolveAttemptTrajectoryTerminal
+>[0];
 
 function baseParams(
   overrides: Partial<ResolveAttemptTrajectoryTerminalParams> = {},
 ): ResolveAttemptTrajectoryTerminalParams {
+  // Default to a completed but non-deliverable attempt; tests opt in to each
+  // kind of terminal progress.
   return {
-    aborted: false,
-    timedOut: false,
+    failed: false,
+    interrupted: false,
     assistantTexts: [],
     toolMetas: [],
     didSendViaMessagingTool: false,
@@ -39,12 +46,62 @@ describe("attempt trajectory status", () => {
     ).toEqual({ status: "success" });
   });
 
+  it("marks length-limited visible text as non-deliverable without terminal output", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          assistantTexts: ["Partial answer."],
+          lastAssistantStopReason: "length",
+        }),
+      ),
+    ).toEqual({
+      status: "error",
+      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
+    });
+  });
+
+  it("does not treat streamed partial payloads as completed length-limited output", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          assistantTexts: ["Partial answer."],
+          synthesizedPayloadCount: 1,
+          lastAssistantStopReason: "length",
+        }),
+      ),
+    ).toEqual({
+      status: "error",
+      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
+    });
+  });
+
+  it("keeps length-limited turns successful when terminal output was delivered", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          assistantTexts: [],
+          lastAssistantStopReason: "length",
+          hasTerminalOutput: true,
+        }),
+      ),
+    ).toEqual({ status: "success" });
+  });
+
   it("keeps committed messaging tool delivery as success even without assistant text", () => {
     expect(
       resolveAttemptTrajectoryTerminal(
         baseParams({
           didSendViaMessagingTool: true,
           messagingToolSentTargets: [{ channel: "telegram" }],
+        }),
+      ),
+    ).toEqual({ status: "success" });
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          didSendViaMessagingTool: true,
+          messagingToolSentTargets: [{ channel: "telegram" }],
+          lastAssistantStopReason: "length",
         }),
       ),
     ).toEqual({ status: "success" });
@@ -153,6 +210,8 @@ describe("attempt trajectory status", () => {
   });
 
   it("marks terminal tool-use attempts as non-deliverable without explicit delivery", () => {
+    // Visible planning text before tool_use is not final delivery; the attempt
+    // only succeeds if a committed delivery or async handoff occurred.
     expect(
       resolveAttemptTrajectoryTerminal(
         baseParams({
@@ -177,6 +236,21 @@ describe("attempt trajectory status", () => {
     ).toEqual({ status: "success" });
   });
 
+  it("marks internally aborted tool-use attempts without delivery as non-deliverable", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          interrupted: false,
+          toolMetas: [{ toolName: "web_search" }],
+          lastAssistantStopReason: "toolUse",
+        }),
+      ),
+    ).toEqual({
+      status: "error",
+      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
+    });
+  });
+
   it("keeps async-started media tool-use attempts as terminal progress", () => {
     expect(
       resolveAttemptTrajectoryTerminal(
@@ -189,10 +263,15 @@ describe("attempt trajectory status", () => {
   });
 
   it("preserves prompt errors and interrupts", () => {
+    expect(resolveAttemptTrajectoryTerminal(baseParams({ failed: true }))).toEqual({
+      status: "error",
+    });
+    expect(resolveAttemptTrajectoryTerminal(baseParams({ interrupted: true }))).toEqual({
+      status: "interrupted",
+    });
     expect(
-      resolveAttemptTrajectoryTerminal(baseParams({ promptError: new Error("boom") })),
-    ).toEqual({ status: "error" });
-    expect(resolveAttemptTrajectoryTerminal(baseParams({ timedOut: true }))).toEqual({
+      resolveAttemptTrajectoryTerminal(baseParams({ failed: true, interrupted: true })),
+    ).toEqual({
       status: "interrupted",
     });
   });

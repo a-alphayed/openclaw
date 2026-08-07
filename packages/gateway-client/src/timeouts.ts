@@ -1,3 +1,4 @@
+// Gateway Client module implements timeouts behavior.
 function parseStrictPositiveInteger(value: string): number | undefined {
   const trimmed = value.trim();
   if (!/^\+?\d+$/u.test(trimmed)) {
@@ -7,11 +8,50 @@ function parseStrictPositiveInteger(value: string): number | undefined {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function isTestRuntimeEnv(env: NodeJS.ProcessEnv): boolean {
+  return (
+    env.VITEST === "true" ||
+    env.VITEST === "1" ||
+    env.VITEST_POOL_ID !== undefined ||
+    env.VITEST_WORKER_ID !== undefined ||
+    env.NODE_ENV === "test" ||
+    (env !== process.env &&
+      (process.env.VITEST === "true" ||
+        process.env.VITEST === "1" ||
+        process.env.VITEST_POOL_ID !== undefined ||
+        process.env.VITEST_WORKER_ID !== undefined ||
+        process.env.NODE_ENV === "test"))
+  );
+}
+
+/** Maximum delay Node timers can represent without overflow warnings. */
 export const MAX_SAFE_TIMEOUT_DELAY_MS = 2_147_483_647;
+/** Default server-side window for gateway preauth handshakes. */
 export const DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** Starts the browser-safe deadline that covers Gateway connect preparation and hello. */
+export function startGatewayConnectTimeout(onTimeout: () => void): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(onTimeout, DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS);
+  timer.unref?.();
+  return timer;
+}
+
+/** Clears either pending Gateway handshake phase without retaining its timer. */
+export function clearGatewayConnectTimeout(timer: ReturnType<typeof setTimeout> | null): null {
+  if (timer !== null) {
+    clearTimeout(timer);
+  }
+  return null;
+}
+
+/** Default deadline for a single non-streaming Gateway request. */
+export const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000;
+/** Minimum client watchdog delay for connect challenge setup. */
 export const MIN_CONNECT_CHALLENGE_TIMEOUT_MS = 250;
+/** Default maximum client watchdog delay, aligned with the preauth server timeout. */
 export const MAX_CONNECT_CHALLENGE_TIMEOUT_MS = DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;
 
+/** Clamps arbitrary timer delays to Node's safe range and an optional floor. */
 export function resolveSafeTimeoutDelayMs(delayMs: number, opts?: { minMs?: number }): number {
   const rawMinMs = opts?.minMs ?? 1;
   const minMs = Math.min(
@@ -22,6 +62,23 @@ export function resolveSafeTimeoutDelayMs(delayMs: number, opts?: { minMs?: numb
   return Math.min(MAX_SAFE_TIMEOUT_DELAY_MS, Math.max(minMs, candidateMs));
 }
 
+/** Adds grace time while preserving safe timer bounds if inputs overflow or are invalid. */
+export function addSafeTimeoutDelayGraceMs(
+  delayMs: number,
+  graceMs: number,
+  opts?: { minMs?: number },
+): number {
+  if (!Number.isFinite(delayMs) || !Number.isFinite(graceMs)) {
+    return resolveSafeTimeoutDelayMs(MAX_SAFE_TIMEOUT_DELAY_MS, opts);
+  }
+  const withGrace = delayMs + graceMs;
+  return resolveSafeTimeoutDelayMs(
+    Number.isFinite(withGrace) ? withGrace : MAX_SAFE_TIMEOUT_DELAY_MS,
+    opts,
+  );
+}
+
+/** Resolves optional timeout values through a fallback and safe timer clamp. */
 export function resolveFiniteTimeoutDelayMs(
   delayMs: number | null | undefined,
   fallbackMs: number,
@@ -32,6 +89,7 @@ export function resolveFiniteTimeoutDelayMs(
   return resolveSafeTimeoutDelayMs(candidateMs, opts);
 }
 
+/** Clamps connect challenge watchdog timeouts to the gateway-supported range. */
 export function clampConnectChallengeTimeoutMs(
   timeoutMs: number,
   maxTimeoutMs = MAX_CONNECT_CHALLENGE_TIMEOUT_MS,
@@ -42,6 +100,7 @@ export function clampConnectChallengeTimeoutMs(
   );
 }
 
+/** Reads the connect challenge watchdog override from the process environment. */
 export function getConnectChallengeTimeoutMsFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): number | undefined {
@@ -61,6 +120,7 @@ function normalizePositiveTimeoutMs(timeoutMs: unknown): number | undefined {
     : undefined;
 }
 
+/** Resolves the client watchdog timeout using explicit, env, then preauth defaults. */
 export function resolveConnectChallengeTimeoutMs(
   timeoutMs?: number | null,
   params?: {
@@ -85,25 +145,15 @@ export function resolveConnectChallengeTimeoutMs(
   return clampConnectChallengeTimeoutMs(configuredPreauthTimeoutMs, maxTimeoutMs);
 }
 
-export function getPreauthHandshakeTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
-  const configuredTimeout =
-    env.OPENCLAW_HANDSHAKE_TIMEOUT_MS || (env.VITEST && env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS);
-  if (configuredTimeout) {
-    const parsed = parseStrictPositiveInteger(configuredTimeout);
-    if (parsed !== undefined) {
-      return resolveSafeTimeoutDelayMs(parsed);
-    }
-  }
-  return DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;
-}
-
+/** Resolves the server preauth timeout from env, explicit config, or default. */
 export function resolvePreauthHandshakeTimeoutMs(params?: {
   env?: NodeJS.ProcessEnv;
   configuredTimeoutMs?: number | null;
 }): number {
   const env = params?.env ?? process.env;
   const configuredTimeout =
-    env.OPENCLAW_HANDSHAKE_TIMEOUT_MS || (env.VITEST && env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS);
+    env.OPENCLAW_HANDSHAKE_TIMEOUT_MS ||
+    (isTestRuntimeEnv(env) ? env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS : undefined);
   if (configuredTimeout) {
     const parsed = parseStrictPositiveInteger(configuredTimeout);
     if (parsed !== undefined) {

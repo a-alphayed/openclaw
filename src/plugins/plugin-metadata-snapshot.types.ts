@@ -3,7 +3,16 @@ import type { PluginDiscoveryResult } from "./discovery.js";
 import type { InstalledPluginIndex } from "./installed-plugin-index-types.js";
 import type { PluginManifestRecord, PluginManifestRegistry } from "./manifest-registry.js";
 import type { PluginDiagnostic } from "./manifest-types.js";
+import type {
+  PluginManifestProviderEndpoint,
+  PluginManifestProviderRequestProvider,
+} from "./manifest.js";
 import type { PluginRegistrySnapshotSource } from "./plugin-registry-snapshot.types.js";
+
+export type PluginMetadataSnapshotPluginIdScope = {
+  key: string;
+  resolve: (params: { index: InstalledPluginIndex }) => readonly string[] | undefined;
+};
 
 export type PluginMetadataSnapshotOwnerMaps = {
   channels: ReadonlyMap<string, readonly string[]>;
@@ -14,9 +23,11 @@ export type PluginMetadataSnapshotOwnerMaps = {
   setupProviders: ReadonlyMap<string, readonly string[]>;
   commandAliases: ReadonlyMap<string, readonly string[]>;
   contracts: ReadonlyMap<string, readonly string[]>;
+  providerEndpoints?: readonly PluginManifestProviderEndpoint[];
+  providerRequests?: ReadonlyMap<string, PluginManifestProviderRequestProvider>;
 };
 
-export type PluginMetadataSnapshotMetrics = {
+type PluginMetadataSnapshotMetrics = {
   registrySnapshotMs: number;
   manifestRegistryMs: number;
   ownerMapsMs: number;
@@ -25,10 +36,9 @@ export type PluginMetadataSnapshotMetrics = {
   manifestPluginCount: number;
 };
 
-export type PluginMetadataSnapshotRegistryDiagnostic = {
+type PluginMetadataSnapshotRegistryDiagnostic = {
   level: "info" | "warn";
   code:
-    | "persisted-registry-disabled"
     | "persisted-registry-missing"
     | "persisted-registry-stale-policy"
     | "persisted-registry-stale-source";
@@ -38,6 +48,7 @@ export type PluginMetadataSnapshotRegistryDiagnostic = {
 export type PluginMetadataSnapshot = {
   policyHash: string;
   configFingerprint?: string;
+  pluginIds?: readonly string[];
   registrySource?: PluginRegistrySnapshotSource;
   workspaceDir?: string;
   index: InstalledPluginIndex;
@@ -52,7 +63,10 @@ export type PluginMetadataSnapshot = {
   discovery?: PluginDiscoveryResult;
 };
 
-export type PluginMetadataRegistryView = Pick<PluginMetadataSnapshot, "index" | "manifestRegistry">;
+export type PluginMetadataRegistryView = Pick<
+  PluginMetadataSnapshot,
+  "index" | "manifestRegistry" | "discovery"
+>;
 
 export type PluginMetadataManifestView = Pick<PluginMetadataSnapshot, "index" | "plugins">;
 
@@ -62,10 +76,12 @@ export type LoadPluginMetadataSnapshotParams = {
   stateDir?: string;
   env?: NodeJS.ProcessEnv;
   index?: InstalledPluginIndex;
+  pluginIds?: readonly string[];
+  pluginIdScope?: PluginMetadataSnapshotPluginIdScope;
   preferPersisted?: boolean;
+  allowCurrent?: boolean;
 };
 
 export type ResolvePluginMetadataSnapshotParams = LoadPluginMetadataSnapshotParams & {
-  allowCurrent?: boolean;
   allowWorkspaceScopedCurrent?: boolean;
 };

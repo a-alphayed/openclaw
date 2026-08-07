@@ -1,5 +1,7 @@
+// Verifies bundled MCP plugin metadata and package output.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { isRecord } from "../utils.js";
@@ -10,7 +12,9 @@ import {
   createBundleMcpTempHarness,
   createBundleProbePlugin,
   withBundleHomeEnv,
+  writeBundleTextFiles,
   writeClaudeBundleManifest,
+  resolveBundlePluginRoot,
 } from "./bundle-mcp.test-support.js";
 
 function getServerArgs(value: unknown): unknown[] | undefined {
@@ -107,7 +111,10 @@ describe("loadEnabledBundleMcpConfig", () => {
           cfg: config,
         });
         const resolvedServerPath = await fs.realpath(serverPath);
-        const loadedServer = loaded.config.mcpServers.bundleProbe;
+        const loadedServer = expectDefined(
+          loaded.config.mcpServers.bundleProbe,
+          "loaded.config.mcpServers.bundleProbe test invariant",
+        );
         const loadedArgs = getServerArgs(loadedServer);
         const loadedServerPath = typeof loadedArgs?.[0] === "string" ? loadedArgs[0] : undefined;
         const resolvedPluginRoot = await fs.realpath(pluginRoot);
@@ -158,6 +165,77 @@ describe("loadEnabledBundleMcpConfig", () => {
     expect(loaded.config.mcpServers.bundleProbe).toMatchObject({
       command: "node",
     });
+  });
+
+  it("loads MCP servers declared by an enabled native plugin", async () => {
+    const workspaceDir = await tempHarness.createTempDir("openclaw-native-mcp-workspace-");
+    const pluginRoot = await tempHarness.createTempDir("openclaw-native-mcp-plugin-");
+    const loaded = loadEnabledBundleMcpConfig({
+      workspaceDir,
+      cfg: createEnabledBundleConfig(["native-mcp"]),
+      manifestRegistry: {
+        plugins: [
+          {
+            id: "native-mcp",
+            origin: "global",
+            format: "openclaw",
+            channels: [],
+            providers: [],
+            cliBackends: [],
+            skills: [],
+            hooks: [],
+            rootDir: pluginRoot,
+            source: path.join(pluginRoot, "index.js"),
+            manifestPath: path.join(pluginRoot, "openclaw.plugin.json"),
+            mcpServers: {
+              app: {
+                transport: "stdio",
+                command: "node",
+                args: ["./mcp-server.js"],
+              },
+            },
+          },
+        ],
+      },
+    });
+
+    expectNoDiagnostics(loaded.diagnostics);
+    expect(loaded.config.mcpServers.app).toEqual({
+      transport: "stdio",
+      command: "node",
+      args: [path.join(pluginRoot, "mcp-server.js")],
+      cwd: pluginRoot,
+    });
+  });
+
+  it("skips MCP servers declared by a disabled native plugin", async () => {
+    const workspaceDir = await tempHarness.createTempDir("openclaw-native-mcp-workspace-");
+    const pluginRoot = await tempHarness.createTempDir("openclaw-native-mcp-plugin-");
+    const loaded = loadEnabledBundleMcpConfig({
+      workspaceDir,
+      cfg: { plugins: { entries: { "native-mcp": { enabled: false } } } },
+      manifestRegistry: {
+        plugins: [
+          {
+            id: "native-mcp",
+            origin: "global",
+            format: "openclaw",
+            channels: [],
+            providers: [],
+            cliBackends: [],
+            skills: [],
+            hooks: [],
+            rootDir: pluginRoot,
+            source: path.join(pluginRoot, "index.js"),
+            manifestPath: path.join(pluginRoot, "openclaw.plugin.json"),
+            mcpServers: { app: { command: "node", args: ["./mcp-server.js"] } },
+          },
+        ],
+      },
+    });
+
+    expectNoDiagnostics(loaded.diagnostics);
+    expect(loaded.config.mcpServers).toStrictEqual({});
   });
 
   it("merges inline bundle MCP servers and skips disabled bundles", async () => {
@@ -257,6 +335,53 @@ describe("loadEnabledBundleMcpConfig", () => {
             normalizePathForAssertion("local-probe.mjs")!,
           ],
         });
+      },
+    );
+  });
+
+  it("loads Link-style Codex bundle MCP config", async () => {
+    await withBundleHomeEnv(
+      tempHarness,
+      "openclaw-bundle-link",
+      async ({ homeDir, workspaceDir }) => {
+        const pluginRoot = resolveBundlePluginRoot(homeDir, "link");
+        await writeBundleTextFiles(pluginRoot, {
+          ".codex-plugin/plugin.json": `${JSON.stringify(
+            {
+              name: "link",
+              skills: "./skills/",
+              mcpServers: "./.mcp.json",
+            },
+            null,
+            2,
+          )}\n`,
+          ".mcp.json": `${JSON.stringify(
+            {
+              mcpServers: {
+                link: {
+                  command: "pnpx",
+                  args: ["@stripe/link-cli", "--mcp"],
+                },
+              },
+            },
+            null,
+            2,
+          )}\n`,
+        });
+
+        const loaded = loadEnabledBundleMcpConfig({
+          workspaceDir,
+          cfg: createEnabledBundleConfig(["link"]),
+        });
+        const loadedServer = loaded.config.mcpServers.link;
+
+        expectNoDiagnostics(loaded.diagnostics);
+        expect(isRecord(loadedServer) ? loadedServer.command : undefined).toBe("pnpx");
+        expect(getServerArgs(loadedServer)).toEqual(["@stripe/link-cli", "--mcp"]);
+        await expectResolvedPathEqual(
+          isRecord(loadedServer) ? loadedServer.cwd : undefined,
+          pluginRoot,
+        );
       },
     );
   });

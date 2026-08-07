@@ -1,12 +1,15 @@
+/** Audits installed daemon service definitions for drift and repair candidates. */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { normalizeEnvVarKey } from "../infra/host-env-security.js";
-import { parseTcpPort } from "../infra/tcp-port.js";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { normalizeStringEntries, sortUniqueStrings } from "../shared/string-normalization.js";
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { resolveInlineCommandMatch } from "../infra/shell-inline-command.js";
+import { POSIX_SHELL_WRAPPERS } from "../infra/shell-wrapper-resolution.js";
+import { parseTcpPort } from "../infra/tcp-port.js";
+import { VERSION } from "../version.js";
 import { resolveLaunchAgentPlistPath } from "./launchd.js";
 import { isBunRuntime, isNodeRuntime } from "./runtime-binary.js";
 import {
@@ -18,7 +21,7 @@ import { getMinimalServicePathPartsFromEnv } from "./service-env.js";
 import { SERVICE_PROXY_ENV_KEYS } from "./service-env.js";
 import {
   collectInlineManagedServiceEnvKeys,
-  hasInlineEnvironmentSource,
+  collectInlineServiceEnvKeys,
   isEnvironmentFileOnlySource,
 } from "./service-managed-env.js";
 import { isNonMinimalServicePathEntry, normalizeServicePathEntry } from "./service-path-policy.js";
@@ -40,11 +43,9 @@ export type ServiceConfigIssue = {
   level?: "recommended" | "aggressive";
 };
 
-export type ServiceConfigAudit = {
-  ok: boolean;
-  issues: ServiceConfigIssue[];
-};
-
+export type ServiceConfigAudit =
+  | { ok: true; issues: ServiceConfigIssue[] }
+  | { ok: false; issues: ServiceConfigIssue[] };
 export const SERVICE_AUDIT_CODES = {
   gatewayCommandMissing: "gateway-command-missing",
   gatewayEntrypointMismatch: "gateway-entrypoint-mismatch",
@@ -60,6 +61,7 @@ export const SERVICE_AUDIT_CODES = {
   gatewayRuntimeNodeVersionManager: "gateway-runtime-node-version-manager",
   gatewayRuntimeNodeSystemMissing: "gateway-runtime-node-system-missing",
   gatewayTokenDrift: "gateway-token-drift",
+  gatewayServiceVersionMismatch: "gateway-service-version-mismatch",
   launchdKeepAlive: "launchd-keep-alive",
   launchdRunAtLoad: "launchd-run-at-load",
   systemdAfterNetworkOnline: "systemd-after-network-online",
@@ -68,6 +70,7 @@ export const SERVICE_AUDIT_CODES = {
   systemdKillModeProcessOrNone: "systemd-kill-mode-process-or-none",
 } as const;
 
+/** Returns whether audit issues require migrating a daemon to a stable Node runtime. */
 export function needsNodeRuntimeMigration(issues: ServiceConfigIssue[]): boolean {
   return issues.some(
     (issue) =>
@@ -78,6 +81,22 @@ export function needsNodeRuntimeMigration(issues: ServiceConfigIssue[]): boolean
 
 function hasGatewaySubcommand(programArguments?: string[]): boolean {
   return Boolean(programArguments?.some((arg) => arg === "gateway"));
+}
+
+const POSIX_SERVICE_INLINE_COMMAND_FLAGS = new Set(["-c"]);
+const POSIX_SERVICE_SHELL_WRAPPERS: ReadonlySet<string> = POSIX_SHELL_WRAPPERS;
+
+function isOpaquePosixShellInlineCommand(programArguments: string[]): boolean {
+  const executable = programArguments[0]?.trim();
+  const shellName = executable ? path.posix.basename(executable).toLowerCase() : "";
+  if (!POSIX_SERVICE_SHELL_WRAPPERS.has(shellName)) {
+    return false;
+  }
+  return (
+    resolveInlineCommandMatch(programArguments, POSIX_SERVICE_INLINE_COMMAND_FLAGS, {
+      allowCombinedC: true,
+    }).command !== null
+  );
 }
 
 function parseSystemdUnit(content: string): {
@@ -91,6 +110,8 @@ function parseSystemdUnit(content: string): {
   let restartSec: string | undefined;
   let killMode: string | undefined;
 
+  // Parse only unit keys relevant to service resilience; this is not a full
+  // systemd parser and intentionally ignores sections.
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) {
@@ -160,7 +181,7 @@ async function auditSystemdUnit(
   issues: ServiceConfigIssue[],
 ) {
   const unitPath = resolveSystemdUserUnitPath(env);
-  let content = "";
+  let content;
   try {
     content = await fs.readFile(unitPath, "utf8");
   } catch {
@@ -209,7 +230,7 @@ async function auditLaunchdPlist(
   issues: ServiceConfigIssue[],
 ) {
   const plistPath = resolveLaunchAgentPlistPath(env);
-  let content = "";
+  let content;
   try {
     content = await fs.readFile(plistPath, "utf8");
   } catch {
@@ -240,7 +261,10 @@ function auditGatewayCommand(programArguments: string[] | undefined, issues: Ser
   if (!programArguments || programArguments.length === 0) {
     return;
   }
-  if (!hasGatewaySubcommand(programArguments)) {
+  if (
+    !hasGatewaySubcommand(programArguments) &&
+    !isOpaquePosixShellInlineCommand(programArguments)
+  ) {
     issues.push({
       code: SERVICE_AUDIT_CODES.gatewayCommandMissing,
       message: "Service command does not include the gateway subcommand",
@@ -269,21 +293,19 @@ function readGatewayServiceCommandPortState(
   if (!programArguments || programArguments.length === 0) {
     return { kind: "missing" };
   }
+  let latest: GatewayServiceCommandPort = { kind: "missing" };
   for (let index = 0; index < programArguments.length; index += 1) {
     const arg = programArguments[index];
     if (arg === "--port") {
-      return parseGatewayPortArg(programArguments[index + 1]);
+      latest = parseGatewayPortArg(programArguments[index + 1]);
+      index += 1;
+      continue;
     }
-    if (arg.startsWith("--port=")) {
-      return parseGatewayPortArg(arg.slice("--port=".length));
+    if (arg?.startsWith("--port=")) {
+      latest = parseGatewayPortArg(arg.slice("--port=".length));
     }
   }
-  return { kind: "missing" };
-}
-
-export function readGatewayServiceCommandPort(programArguments?: string[]): number | undefined {
-  const servicePort = readGatewayServiceCommandPortState(programArguments);
-  return servicePort.kind === "valid" ? servicePort.port : undefined;
+  return latest;
 }
 
 function auditGatewayServicePort(params: {
@@ -363,55 +385,11 @@ function auditManagedServiceEnvironment(
   });
 }
 
-function normalizeServiceEnvKey(key: string): string | null {
-  return normalizeEnvVarKey(key, { portable: true })?.toUpperCase() ?? null;
-}
-
-function readEnvironmentValueSource(
-  command: GatewayServiceCommand,
-  normalizedKey: string,
-): GatewayServiceEnvironmentValueSource | undefined {
-  for (const [rawKey, source] of Object.entries(command?.environmentValueSources ?? {})) {
-    if (normalizeServiceEnvKey(rawKey) === normalizedKey) {
-      return source;
-    }
-  }
-  return undefined;
-}
-
-const SERVICE_PROXY_ENV_KEY_SET = new Set(
-  SERVICE_PROXY_ENV_KEYS.flatMap((key) => {
-    const normalized = normalizeServiceEnvKey(key);
-    return normalized ? [normalized] : [];
-  }),
-);
-
-function collectInlineProxyEnvKeys(command: GatewayServiceCommand): string[] {
-  if (!command?.environment) {
-    return [];
-  }
-  const inlineKeys: string[] = [];
-  for (const [rawKey, value] of Object.entries(command.environment)) {
-    if (typeof value !== "string" || !value.trim()) {
-      continue;
-    }
-    const normalized = normalizeServiceEnvKey(rawKey);
-    if (!normalized || !SERVICE_PROXY_ENV_KEY_SET.has(normalized)) {
-      continue;
-    }
-    if (!hasInlineEnvironmentSource(readEnvironmentValueSource(command, normalized))) {
-      continue;
-    }
-    inlineKeys.push(normalized);
-  }
-  return sortUniqueStrings(inlineKeys);
-}
-
 function auditProxyServiceEnvironment(
   command: GatewayServiceCommand,
   issues: ServiceConfigIssue[],
 ) {
-  const inlineKeys = collectInlineProxyEnvKeys(command);
+  const inlineKeys = collectInlineServiceEnvKeys(command, SERVICE_PROXY_ENV_KEYS);
   if (inlineKeys.length === 0) {
     return;
   }
@@ -538,7 +516,7 @@ async function auditGatewayRuntime(
   if (isBunRuntime(execPath)) {
     issues.push({
       code: SERVICE_AUDIT_CODES.gatewayRuntimeBun,
-      message: "Gateway service uses Bun; Bun is incompatible with WhatsApp + Telegram channels.",
+      message: "Gateway service uses Bun; OpenClaw runtime state requires node:sqlite.",
       detail: execPath,
       level: "recommended",
     });
@@ -562,7 +540,7 @@ async function auditGatewayRuntime(
         issues.push({
           code: SERVICE_AUDIT_CODES.gatewayRuntimeNodeSystemMissing,
           message:
-            "System Node 22 LTS (22.19+) or Node 24 not found; install it before migrating away from version managers.",
+            "System Node 22 LTS (22.22.3+) or Node 24.15+ not found; install it before migrating away from version managers.",
           level: "recommended",
         });
       }
@@ -599,6 +577,20 @@ export function checkTokenDrift(params: {
   return null;
 }
 
+function auditGatewayServiceVersion(command: GatewayServiceCommand, issues: ServiceConfigIssue[]) {
+  const serviceVersion = command?.environment?.OPENCLAW_SERVICE_VERSION?.trim();
+  if (!serviceVersion || serviceVersion === VERSION) {
+    return;
+  }
+
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayServiceVersionMismatch,
+    message: `Gateway service was installed by OpenClaw ${serviceVersion}; current CLI is ${VERSION}.`,
+    detail: command?.sourcePath,
+    level: "recommended",
+  });
+}
+
 export async function auditGatewayServiceConfig(params: {
   env: Record<string, string | undefined>;
   command: GatewayServiceCommand;
@@ -620,6 +612,7 @@ export async function auditGatewayServiceConfig(params: {
   auditManagedServiceEnvironment(params.command, issues, params.expectedManagedServiceEnvKeys);
   auditProxyServiceEnvironment(params.command, issues);
   auditGatewayToken(params.command, issues, params.expectedGatewayToken);
+  auditGatewayServiceVersion(params.command, issues);
   auditGatewayServicePath(params.command, issues, params.env, platform, params.expectedServicePath);
   await auditGatewayRuntime(params.env, params.command, issues, platform);
 
@@ -629,5 +622,5 @@ export async function auditGatewayServiceConfig(params: {
     await auditLaunchdPlist(params.env, issues);
   }
 
-  return { ok: issues.length === 0, issues };
+  return issues.length === 0 ? { ok: true, issues } : { ok: false, issues };
 }

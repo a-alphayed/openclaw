@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
+// Checks channel-agnostic core surfaces for channel-specific coupling.
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
+import { visitModuleSpecifiers } from "./lib/guard-inventory-utils.mjs";
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import {
   collectTypeScriptFiles,
   getPropertyNameText,
-  resolveRepoRoot,
   runAsScript,
   toLine,
 } from "./lib/ts-guard-utils.mjs";
@@ -117,6 +119,9 @@ function isModuleSpecifierStringNode(node) {
   );
 }
 
+/**
+ * Finds channel-specific references inside channel-agnostic protected sources.
+ */
 export function findChannelAgnosticBoundaryViolations(
   content,
   fileName = "source.ts",
@@ -130,51 +135,33 @@ export function findChannelAgnosticBoundaryViolations(
 
   const sourceFile = ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true);
   const violations = [];
+  const moduleViolations = new Map();
+  if (checkModuleSpecifiers) {
+    visitModuleSpecifiers(
+      ts,
+      sourceFile,
+      ({ kind, node, specifier, specifierNode }) => {
+        if (moduleSpecifierMatcher(specifier)) {
+          const verb =
+            kind === "export"
+              ? "re-exports"
+              : kind === "dynamic-import"
+                ? "dynamically imports"
+                : "imports";
+          moduleViolations.set(node, {
+            line: toLine(sourceFile, specifierNode),
+            reason: verb + ' channel module "' + specifier + '"',
+          });
+        }
+      },
+      { includeCommonJs: true, includeImportMetaUrl: true, includeImportTypes: true },
+    );
+  }
 
   const visit = (node) => {
-    if (
-      checkModuleSpecifiers &&
-      ts.isImportDeclaration(node) &&
-      ts.isStringLiteral(node.moduleSpecifier)
-    ) {
-      const specifier = node.moduleSpecifier.text;
-      if (moduleSpecifierMatcher(specifier)) {
-        violations.push({
-          line: toLine(sourceFile, node.moduleSpecifier),
-          reason: `imports channel module "${specifier}"`,
-        });
-      }
-    }
-
-    if (
-      checkModuleSpecifiers &&
-      ts.isExportDeclaration(node) &&
-      node.moduleSpecifier &&
-      ts.isStringLiteral(node.moduleSpecifier)
-    ) {
-      const specifier = node.moduleSpecifier.text;
-      if (moduleSpecifierMatcher(specifier)) {
-        violations.push({
-          line: toLine(sourceFile, node.moduleSpecifier),
-          reason: `re-exports channel module "${specifier}"`,
-        });
-      }
-    }
-
-    if (
-      checkModuleSpecifiers &&
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length > 0 &&
-      ts.isStringLiteral(node.arguments[0])
-    ) {
-      const specifier = node.arguments[0].text;
-      if (moduleSpecifierMatcher(specifier)) {
-        violations.push({
-          line: toLine(sourceFile, node.arguments[0]),
-          reason: `dynamically imports channel module "${specifier}"`,
-        });
-      }
+    const moduleViolation = moduleViolations.get(node);
+    if (moduleViolation) {
+      violations.push(moduleViolation);
     }
 
     if (
@@ -236,6 +223,9 @@ export function findChannelAgnosticBoundaryViolations(
   return violations;
 }
 
+/**
+ * Finds reverse dependencies from channel core into plugin/runtime surfaces.
+ */
 export function findChannelCoreReverseDependencyViolations(content, fileName = "source.ts") {
   return findChannelAgnosticBoundaryViolations(content, fileName, {
     checkModuleSpecifiers: true,
@@ -246,6 +236,9 @@ export function findChannelCoreReverseDependencyViolations(content, fileName = "
   });
 }
 
+/**
+ * Finds user-facing channel names in ACP-owned text sources.
+ */
 export function findAcpUserFacingChannelNameViolations(content, fileName = "source.ts") {
   const sourceFile = ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true);
   const violations = [];
@@ -265,6 +258,9 @@ export function findAcpUserFacingChannelNameViolations(content, fileName = "sour
   return violations;
 }
 
+/**
+ * Finds raw system mark literals where shared constants should be used.
+ */
 export function findSystemMarkLiteralViolations(content, fileName = "source.ts") {
   const sourceFile = ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true);
   const violations = [];
@@ -307,6 +303,9 @@ const boundaryRuleSets = [
   },
 ];
 
+/**
+ * Runs all channel-agnostic boundary checks.
+ */
 export async function main() {
   const violations = [];
   for (const ruleSet of boundaryRuleSets) {

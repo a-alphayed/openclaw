@@ -1,5 +1,7 @@
+// Parses report CLI output arguments and writes optional artifacts.
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { parseFlagArgs, stringFlag } from "./arg-utils.mjs";
 
 export function parseReportCliArgs(argv) {
   const options = {
@@ -7,28 +9,32 @@ export function parseReportCliArgs(argv) {
     jsonPath: null,
     markdownPath: null,
   };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--") {
-      continue;
-    }
-    if (arg === "--root") {
-      options.rootDir = argv[++index];
-      continue;
-    }
-    if (arg === "--json") {
-      options.jsonPath = argv[++index];
-      continue;
-    }
-    if (arg === "--markdown") {
-      options.markdownPath = argv[++index];
-      continue;
-    }
-    throw new Error(`Unsupported argument: ${arg}`);
-  }
-  return options;
+  return parseFlagArgs(
+    argv,
+    options,
+    [
+      ["--root", "rootDir"],
+      ["--json", "jsonPath"],
+      ["--markdown", "markdownPath"],
+    ].map(([flag, key]) =>
+      stringFlag(flag, key, {
+        allowInline: false,
+        missingValueMessage: `Expected ${flag} <value>.`,
+        rejectShortOptions: true,
+      }),
+    ),
+    {
+      duplicateOptionMessage: (flag) => `${flag} was provided more than once.`,
+      onUnhandledArg(arg) {
+        throw new Error(`Unsupported argument: ${arg}`);
+      },
+    },
+  );
 }
 
+/**
+ * Writes an optional report artifact, creating its parent directory first.
+ */
 export async function writeReportArtifact(filePath, content) {
   if (!filePath) {
     return;

@@ -1,5 +1,7 @@
+// Subagent announce timeout tests cover retry timing and fallback requester
+// resolution when completion delivery cannot finish immediately.
+import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { clampTimerTimeoutMs } from "../shared/number-coercion.js";
 import { createSubagentAnnounceDeliveryRuntimeMock } from "./subagent-announce.test-support.js";
 
 type GatewayCall = {
@@ -110,6 +112,8 @@ vi.mock("./subagent-announce-delivery.js", () => ({
     directIdempotencyKey?: string;
     internalEvents?: unknown;
   }) => {
+    // Retry behavior is modeled here because the outer announce flow only sees
+    // whether direct delivery eventually succeeded or failed.
     const buildRequest = () => ({
       method: "agent",
       expectFinal: true,
@@ -134,8 +138,7 @@ vi.mock("./subagent-announce-delivery.js", () => ({
       clampTimerTimeoutMs(configOverride.agents?.defaults?.subagents?.announceTimeoutMs) ?? 120_000;
     const retryDelaysMs =
       process.env.OPENCLAW_TEST_FAST === "1" ? [8, 16, 32] : [5_000, 10_000, 20_000];
-    let retryIndex = 0;
-    for (;;) {
+    for (const delayMs of [...retryDelaysMs, undefined]) {
       const request = buildRequest();
       gatewayCalls.push(request);
       try {
@@ -143,13 +146,12 @@ vi.mock("./subagent-announce-delivery.js", () => ({
         return { delivered: true, path: "direct" };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const delayMs = retryDelaysMs[retryIndex];
         if (!/gateway timeout/i.test(message) || delayMs == null) {
           return { delivered: false, path: "direct", error: message };
         }
-        retryIndex += 1;
       }
     }
+    throw new Error("unreachable direct delivery retry loop exit");
   },
   loadRequesterSessionEntry: (sessionKey: string) => ({
     cfg: configOverride,
@@ -194,7 +196,7 @@ vi.mock("./subagent-announce.runtime.js", () => ({
   waitForEmbeddedAgentRunEnd: (sessionId: string, timeoutMs?: number) =>
     waitForEmbeddedAgentRunEndMock(sessionId, timeoutMs),
 }));
-vi.mock("./subagent-announce.registry.runtime.js", () => ({
+vi.mock("./subagent-registry-runtime.js", () => ({
   countActiveDescendantRuns: () => 0,
   countPendingDescendantRuns: () => pendingDescendantRuns,
   countPendingDescendantRunsExcludingRun: () => 0,
@@ -465,6 +467,80 @@ describe("subagent announce timeout config", () => {
       (directAgentCall?.params?.internalEvents as Array<{ result?: string }>) ?? [];
     expect(internalEvents[0]?.result).toContain("3 tool call(s)");
     expect(internalEvents[0]?.result).not.toContain("data");
+  });
+
+  it("uses timeout progress without replacing an authoritative empty terminal fact", async () => {
+    chatHistoryMessages = [
+      { role: "user", content: "do a complex task" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+      },
+      { role: "toolResult", toolCallId: "call-1", content: "private tool output" },
+    ];
+
+    await runAnnounceFlowForTest("run-timeout-empty-terminal-progress", {
+      outcome: { status: "timeout" },
+      roundOneReply: undefined,
+      terminalReply: { disposition: "empty" },
+    });
+
+    const directAgentCall = findFinalDirectAgentCall();
+    const internalEvents =
+      (directAgentCall?.params?.internalEvents as Array<{ result?: string }>) ?? [];
+    expect(internalEvents[0]?.result).toBe("1 tool call(s) made without visible output.");
+    expect(internalEvents[0]?.result).not.toContain("private tool output");
+  });
+
+  it("keeps authoritative visible timeout output without transcript inference", async () => {
+    chatHistoryMessages = [
+      { role: "assistant", content: [{ type: "text", text: "stale transcript output" }] },
+    ];
+
+    await runAnnounceFlowForTest("run-timeout-visible-terminal", {
+      outcome: { status: "timeout" },
+      roundOneReply: undefined,
+      terminalReply: { disposition: "visible", text: "authoritative progress" },
+    });
+
+    const directAgentCall = findFinalDirectAgentCall();
+    const internalEvents =
+      (directAgentCall?.params?.internalEvents as Array<{ result?: string }>) ?? [];
+    expect(internalEvents[0]?.result).toBe("authoritative progress");
+    expect(gatewayCalls.some((call) => call.method === "chat.history")).toBe(false);
+  });
+
+  it("keeps authoritative silence on timeout without transcript inference", async () => {
+    chatHistoryMessages = [
+      { role: "assistant", content: [{ type: "text", text: "stale transcript output" }] },
+    ];
+
+    await runAnnounceFlowForTest("run-timeout-silent-terminal", {
+      outcome: { status: "timeout" },
+      roundOneReply: undefined,
+      terminalReply: { disposition: "silent" },
+    });
+
+    expect(findFinalDirectAgentCall()).toBeUndefined();
+    expect(gatewayCalls.some((call) => call.method === "chat.history")).toBe(false);
+  });
+
+  it("keeps authoritative empty success intentional without transcript inference", async () => {
+    chatHistoryMessages = [
+      { role: "assistant", content: [{ type: "text", text: "stale transcript output" }] },
+    ];
+
+    await runAnnounceFlowForTest("run-ok-empty-terminal", {
+      outcome: { status: "ok" },
+      roundOneReply: undefined,
+      terminalReply: { disposition: "empty" },
+    });
+
+    const directAgentCall = findFinalDirectAgentCall();
+    const internalEvents =
+      (directAgentCall?.params?.internalEvents as Array<{ result?: string }>) ?? [];
+    expect(internalEvents[0]?.result).toBe("(no output)");
+    expect(gatewayCalls.some((call) => call.method === "chat.history")).toBe(false);
   });
 
   it("keeps delete-mode timeout retryable while the embedded child request is still active", async () => {

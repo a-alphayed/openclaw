@@ -1,3 +1,4 @@
+// Failure output tests cover CLI error formatting and failure summaries.
 import { describe, expect, it } from "vitest";
 import { formatCliFailureLines } from "./failure-output.js";
 
@@ -34,4 +35,31 @@ describe("formatCliFailureLines", () => {
     ]);
     expect(lines.join("\n")).toContain("Error: boom");
   });
+
+  it.each(["--debug", "--verbose"])("prints stack details for the root %s option", (debugFlag) => {
+    const lines = formatCliFailureLines({
+      title: "The CLI command failed.",
+      error: new Error("boom"),
+      argv: ["node", "openclaw", "proxy", "run", debugFlag],
+      env: {},
+    });
+
+    expect(lines).toContain("[openclaw] Stack:");
+    expect(lines).toContain("[openclaw] Error: boom");
+  });
+
+  it.each(["--debug", "--verbose"])(
+    "does not enable root stack traces for a child %s option",
+    (debugFlag) => {
+      const lines = formatCliFailureLines({
+        title: "The CLI command failed.",
+        error: new Error("boom"),
+        argv: ["node", "openclaw", "proxy", "run", "--", "child", debugFlag],
+        env: {},
+      });
+
+      expect(lines).not.toContain("[openclaw] Stack:");
+      expect(lines).toContain("[openclaw] Debug: set OPENCLAW_DEBUG=1 to include the stack trace.");
+    },
+  );
 });

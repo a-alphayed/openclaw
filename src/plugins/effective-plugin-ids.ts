@@ -1,11 +1,13 @@
+/** Resolves effective plugin ids from config, installed records, and activation metadata. */
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import {
   listExplicitlyDisabledChannelIdsForConfig,
   listPotentialConfiguredChannelIds,
 } from "../channels/config-presence.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
-import { sortUniqueStrings } from "../shared/string-normalization.js";
+import { isVitestRuntimeEnv } from "../infra/env.js";
 import {
   listExplicitConfiguredChannelIdsForConfig,
   loadGatewayStartupPluginPlan,
@@ -14,6 +16,8 @@ import {
 import { normalizePluginsConfig } from "./config-state.js";
 import { loadManifestMetadataSnapshot } from "./manifest-contract-eligibility.js";
 import { passesManifestOwnerBasePolicy } from "./manifest-owner-policy.js";
+import type { PluginManifestRecord } from "./manifest-registry.js";
+import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import { defaultSlotIdForKey } from "./slots.js";
 
 function collectConfiguredChannelIds(
@@ -46,6 +50,7 @@ function collectBundledChannelOwnerPluginIds(params: {
   env: NodeJS.ProcessEnv;
   workspaceDir?: string;
   bundledPluginsDir?: string;
+  manifestRecords?: readonly PluginManifestRecord[];
 }): string[] {
   const plugins = normalizePluginsConfig(params.config.plugins);
   const channelIds = new Set(
@@ -60,18 +65,20 @@ function collectBundledChannelOwnerPluginIds(params: {
     ? {
         ...params.env,
         OPENCLAW_BUNDLED_PLUGINS_DIR: params.bundledPluginsDir,
-        ...(params.env.VITEST || process.env.VITEST
+        ...(isVitestRuntimeEnv(params.env) || isVitestRuntimeEnv()
           ? { OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1" }
           : {}),
       }
     : params.env;
-  const snapshot = loadManifestMetadataSnapshot({
-    config: params.config,
-    env,
-    workspaceDir: params.workspaceDir,
-  });
+  const records =
+    params.manifestRecords ??
+    loadManifestMetadataSnapshot({
+      config: params.config,
+      env,
+      workspaceDir: params.workspaceDir,
+    }).plugins;
   const pluginIds = new Set<string>();
-  for (const plugin of snapshot.plugins) {
+  for (const plugin of records) {
     if (plugin.origin !== "bundled") {
       continue;
     }
@@ -140,15 +147,28 @@ function collectSelectedContextEnginePluginIds(config: OpenClawConfig): string[]
   return [pluginId];
 }
 
+/** Lists plugin ids that are effectively enabled for a config/discovery context. */
 export function resolveEffectivePluginIds(params: {
   config: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   workspaceDir?: string;
   bundledPluginsDir?: string;
+  /** Prepared metadata for this invocation. Without it every lookup below rebuilds
+   * the registry, so callers that already hold a snapshot must pass it. */
+  metadataSnapshot?: PluginMetadataSnapshot;
 }): string[] {
+  // Effective ids are a whole-config question. A plugin-scoped snapshot only carries
+  // its own manifests, and a bundled-plugins-dir override rewrites the discovery env,
+  // so neither can answer it — those callers keep re-deriving.
+  const prepared =
+    params.bundledPluginsDir || params.metadataSnapshot?.pluginIds
+      ? undefined
+      : params.metadataSnapshot;
   const autoEnabled = applyPluginAutoEnable({
     config: params.config,
     env: params.env,
+    ...(prepared ? { manifestRegistry: prepared.manifestRegistry } : {}),
+    ...(prepared?.discovery ? { discovery: prepared.discovery } : {}),
   });
   const effectiveConfig = autoEnabled.config;
   const ids = new Set(collectExplicitEffectivePluginIds(effectiveConfig));
@@ -165,6 +185,7 @@ export function resolveEffectivePluginIds(params: {
     activationSourceConfig: params.config,
     workspaceDir: params.workspaceDir,
     env: params.env,
+    manifestRecords: prepared?.plugins,
   })) {
     ids.add(pluginId);
   }
@@ -173,6 +194,7 @@ export function resolveEffectivePluginIds(params: {
     channelIds: configuredChannelIds,
     env: params.env,
     workspaceDir: params.workspaceDir,
+    manifestRecords: prepared?.plugins,
     ...(params.bundledPluginsDir ? { bundledPluginsDir: params.bundledPluginsDir } : {}),
   })) {
     ids.add(pluginId);
@@ -182,6 +204,7 @@ export function resolveEffectivePluginIds(params: {
     activationSourceConfig: params.config,
     workspaceDir: params.workspaceDir,
     env: params.env,
+    ...(prepared ? { metadataSnapshot: prepared } : {}),
   }).pluginIds) {
     ids.add(pluginId);
   }

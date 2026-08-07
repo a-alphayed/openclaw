@@ -1,3 +1,4 @@
+// Discord plugin module implements listeners.reactions behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -468,7 +469,8 @@ async function handleDiscordReactionEvent(
         return reactionBase;
       }
       const emojiLabel = formatDiscordReactionEmoji(data.emoji);
-      const actorLabel = formatDiscordUserTag(user);
+      // Reaction removals do not include member/user details in Discord's gateway payload.
+      const actorLabel = formatDiscordUserTag(user) || user.id;
       const guildSlug =
         guildInfo?.slug ||
         (data.guild?.name

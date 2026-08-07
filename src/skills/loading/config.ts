@@ -1,17 +1,21 @@
+// Skill loading config helpers resolve configured skill sources and enablement.
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { hasConfiguredSecretInput } from "../../config/types.secrets.js";
 import type { SkillConfig } from "../../config/types.skills.js";
+import {
+  findActiveDegradedSecretOwner,
+  listActiveDegradedSecretOwners,
+} from "../../secrets/runtime-degraded-state.js";
 import {
   evaluateRuntimeEligibility,
   hasBinary,
   isConfigPathTruthyWithDefaults,
-  resolveConfigPath,
-  resolveRuntimePlatform,
 } from "../../shared/config-eval.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../../shared/string-coerce.js";
-import { normalizeStringEntries } from "../../shared/string-normalization.js";
 import type { SkillEligibilityContext, SkillEntry, SkillsInstallPreferences } from "../types.js";
 import { resolveSkillKey } from "./frontmatter.js";
 import { resolveSkillSource } from "./source.js";
@@ -21,7 +25,8 @@ const DEFAULT_CONFIG_VALUES: Record<string, boolean> = {
   "browser.evaluateEnabled": true,
 };
 
-export { hasBinary, resolveConfigPath, resolveRuntimePlatform };
+/** Platform helpers re-exported for skill loading callers and tests. */
+export { hasBinary };
 
 export function resolveSkillsInstallPreferences(config?: OpenClawConfig): SkillsInstallPreferences {
   const raw = config?.skills?.install;
@@ -34,7 +39,10 @@ export function resolveSkillsInstallPreferences(config?: OpenClawConfig): Skills
   return { preferBrew, nodeManager };
 }
 
-export function isConfigPathTruthy(config: OpenClawConfig | undefined, pathStr: string): boolean {
+export function isSkillConfigPathTruthy(
+  config: OpenClawConfig | undefined,
+  pathStr: string,
+): boolean {
   return isConfigPathTruthyWithDefaults(config, pathStr, DEFAULT_CONFIG_VALUES);
 }
 
@@ -53,7 +61,35 @@ export function resolveSkillConfig(
   return entry;
 }
 
-function normalizeAllowlist(input: unknown): string[] | undefined {
+/** Returns whether cold startup isolated this exact skill's configured secret. */
+export function isSkillSecretOwnerUnavailable(skillKey: string): boolean {
+  return Boolean(findActiveDegradedSecretOwner("capability", `skill:${skillKey}`));
+}
+
+/** Returns whether cold startup isolated any configured skill secret. */
+export function hasUnavailableSkillSecretOwners(): boolean {
+  return listActiveDegradedSecretOwners().some(
+    (owner) =>
+      owner.degradationState !== "stale" &&
+      owner.ownerKind === "capability" &&
+      owner.ownerId.startsWith("skill:"),
+  );
+}
+
+export function isSkillEnvRequirementSatisfied(params: {
+  envName: string;
+  skillConfig?: SkillConfig;
+  primaryEnv?: string;
+}): boolean {
+  const { envName, skillConfig, primaryEnv } = params;
+  return (
+    normalizeOptionalString(process.env[envName]) !== undefined ||
+    normalizeOptionalString(skillConfig?.env?.[envName]) !== undefined ||
+    (primaryEnv === envName && hasConfiguredSecretInput(skillConfig?.apiKey))
+  );
+}
+
+function normalizeAllowlist(input: unknown): ReadonlySet<string> | undefined {
   if (!input) {
     return undefined;
   }
@@ -61,7 +97,7 @@ function normalizeAllowlist(input: unknown): string[] | undefined {
     return undefined;
   }
   const normalized = normalizeStringEntries(input);
-  return normalized.length > 0 ? normalized : undefined;
+  return normalized.length > 0 ? new Set(normalized) : undefined;
 }
 
 const BUNDLED_SOURCES = new Set(["openclaw-bundled"]);
@@ -70,35 +106,38 @@ function isBundledSkill(entry: SkillEntry): boolean {
   return BUNDLED_SOURCES.has(resolveSkillSource(entry.skill));
 }
 
-export function resolveBundledAllowlist(config?: OpenClawConfig): string[] | undefined {
+export function resolveBundledAllowlist(config?: OpenClawConfig): ReadonlySet<string> | undefined {
   return normalizeAllowlist(config?.skills?.allowBundled);
 }
 
-export function isBundledSkillAllowed(entry: SkillEntry, allowlist?: string[]): boolean {
-  if (!allowlist || allowlist.length === 0) {
+export function isBundledSkillAllowed(entry: SkillEntry, allowlist?: ReadonlySet<string>): boolean {
+  if (!allowlist || allowlist.size === 0) {
     return true;
   }
   if (!isBundledSkill(entry)) {
     return true;
   }
   const key = resolveSkillKey(entry.skill, entry);
-  return allowlist.includes(key) || allowlist.includes(entry.skill.name);
+  return allowlist.has(key) || allowlist.has(entry.skill.name);
 }
 
 export function shouldIncludeSkill(params: {
   entry: SkillEntry;
   config?: OpenClawConfig;
+  bundledAllowlist: ReadonlySet<string> | undefined;
   eligibility?: SkillEligibilityContext;
 }): boolean {
-  const { entry, config, eligibility } = params;
+  const { entry, config, bundledAllowlist, eligibility } = params;
   const skillKey = resolveSkillKey(entry.skill, entry);
   const skillConfig = resolveSkillConfig(config, skillKey);
-  const allowBundled = normalizeAllowlist(config?.skills?.allowBundled);
 
   if (skillConfig?.enabled === false) {
     return false;
   }
-  if (!isBundledSkillAllowed(entry, allowBundled)) {
+  if (isSkillSecretOwnerUnavailable(skillKey)) {
+    return false;
+  }
+  if (!isBundledSkillAllowed(entry, bundledAllowlist)) {
     return false;
   }
   return evaluateRuntimeEligibility({
@@ -110,11 +149,11 @@ export function shouldIncludeSkill(params: {
     hasRemoteBin: eligibility?.remote?.hasBin,
     hasAnyRemoteBin: eligibility?.remote?.hasAnyBin,
     hasEnv: (envName) =>
-      Boolean(
-        process.env[envName] ||
-        skillConfig?.env?.[envName] ||
-        (skillConfig?.apiKey && entry.metadata?.primaryEnv === envName),
-      ),
-    isConfigPathTruthy: (configPath) => isConfigPathTruthy(config, configPath),
+      isSkillEnvRequirementSatisfied({
+        envName,
+        skillConfig,
+        primaryEnv: entry.metadata?.primaryEnv,
+      }),
+    isConfigPathTruthy: (configPath) => isSkillConfigPathTruthy(config, configPath),
   });
 }

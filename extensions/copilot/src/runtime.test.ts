@@ -1,3 +1,4 @@
+// Copilot tests cover runtime plugin behavior.
 import { normalize, resolve, sep } from "node:path";
 import type { CopilotClient, CopilotClientOptions } from "@github/copilot-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -66,7 +67,6 @@ function makeOptions(overrides: Partial<ClientCreateOptions> = {}): ClientCreate
     copilotHome: overrides.copilotHome ?? "copilot-home",
     useLoggedInUser: overrides.useLoggedInUser ?? true,
     gitHubToken: overrides.gitHubToken,
-    cwd: overrides.cwd,
   };
 }
 
@@ -85,7 +85,7 @@ function makeFake(options: FakeFactoryOptions = {}) {
 
     const client: FakeClient = {
       id,
-      copilotHome: clientOptions.copilotHome ?? "",
+      copilotHome: clientOptions.baseDirectory ?? "",
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => {
         stops.push(id);
@@ -122,6 +122,20 @@ describe("createCopilotClientPool", () => {
     expect(first.client).toBe(second.client);
     expect(first.key).toEqual(second.key);
     expect(sdk.ctorCalls.length).toBe(1);
+  });
+
+  it("keeps hardened empty-mode clients separate from normal clients", async () => {
+    const sdk = makeFake();
+    const pool = createCopilotClientPool({ sdkFactory: sdk.fake });
+    const key = makeKey();
+
+    const normal = await pool.acquire(key, makeOptions());
+    const isolated = await pool.acquire(key, { ...makeOptions(), mode: "empty" });
+
+    expect(normal.client).not.toBe(isolated.client);
+    expect(normal.key.clientMode).toBeUndefined();
+    expect(isolated.key.clientMode).toBe("empty");
+    expect(sdk.ctorCalls.map((options) => options.mode)).toEqual([undefined, "empty"]);
   });
 
   it("different agentId same copilotHome creates distinct clients", async () => {
@@ -278,11 +292,11 @@ describe("createCopilotClientPool", () => {
     const sdkFactory = async (clientOptions: CopilotClientOptions) => {
       attempt += 1;
       if (attempt === 1) {
-        throw new Error(`constructor failed for ${String(clientOptions.copilotHome)}`);
+        throw new Error(`constructor failed for ${String(clientOptions.baseDirectory)}`);
       }
       return {
         id: attempt,
-        copilotHome: clientOptions.copilotHome,
+        copilotHome: clientOptions.baseDirectory,
         start: vi.fn(async () => undefined),
         stop: vi.fn(async () => []),
         createSession: vi.fn(async () => ({})),
@@ -420,7 +434,7 @@ describe("createCopilotClientPool", () => {
   it("normalizes non-Error stop failures during dispose", async () => {
     const sdk = makeFake({
       stop: () => {
-        throw "stop-string";
+        throw toLintErrorObject("stop-string", "Non-Error thrown");
       },
     });
     const pool = createCopilotClientPool({ sdkFactory: sdk.fake });
@@ -455,7 +469,7 @@ describe("createCopilotClientPool", () => {
       expect(first.client).toBe(second.client);
       expect(first.key.copilotHome).toBe(normalizedHome);
       expect(second.key.copilotHome).toBe(normalizedHome);
-      expect(String(sdk.ctorCalls[0]?.copilotHome)).toBe(normalizedHome);
+      expect(String(sdk.ctorCalls[0]?.baseDirectory)).toBe(normalizedHome);
     } finally {
       Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
     }
@@ -483,6 +497,20 @@ describe("createCopilotClientPool", () => {
     expect(first.key.copilotHome).toBe(normalizedHome);
     expect(second.key.copilotHome).toBe(normalizedHome);
     expect(sdk.ctorCalls.length).toBe(1);
-    expect(String(sdk.ctorCalls[0]?.copilotHome)).toBe(normalizedHome);
+    expect(String(sdk.ctorCalls[0]?.baseDirectory)).toBe(normalizedHome);
   });
 });
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}

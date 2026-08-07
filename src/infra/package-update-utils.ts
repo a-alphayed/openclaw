@@ -1,8 +1,9 @@
-import fsSync from "node:fs";
-import path from "node:path";
+// Inspects installed package metadata for update/install verification.
 import { readRootJsonObjectSync } from "@openclaw/fs-safe/json";
-import { isRecord } from "../shared/record-coerce.js";
 
+// Package update utilities inspect installed package metadata without trusting
+// paths outside the provided package root.
+/** Return expected integrity only for concrete semver package specs. */
 export function expectedIntegrityForUpdate(
   spec: string | undefined,
   integrity: string | undefined,
@@ -25,7 +26,7 @@ export function expectedIntegrityForUpdate(
   return integrity;
 }
 
-function readInstalledPackageManifest(dir: string): Record<string, unknown> | undefined {
+export function readInstalledPackageManifest(dir: string): Record<string, unknown> | undefined {
   const result = readRootJsonObjectSync({
     rootDir: dir,
     relativePath: "package.json",
@@ -34,33 +35,8 @@ function readInstalledPackageManifest(dir: string): Record<string, unknown> | un
   return result.ok ? result.value : undefined;
 }
 
+/** Read the installed package version from a package root. */
 export async function readInstalledPackageVersion(dir: string): Promise<string | undefined> {
   const manifest = readInstalledPackageManifest(dir);
   return typeof manifest?.version === "string" ? manifest.version : undefined;
-}
-
-export function readInstalledPackagePeerDependencies(dir: string): Record<string, string> {
-  const manifest = readInstalledPackageManifest(dir);
-  const peerDependencies = isRecord(manifest?.peerDependencies) ? manifest.peerDependencies : {};
-  return Object.fromEntries(
-    Object.entries(peerDependencies).filter((entry): entry is [string, string] => {
-      const [, value] = entry;
-      return typeof value === "string";
-    }),
-  );
-}
-
-export function installedPackageNeedsOpenClawPeerLinkRepair(dir: string): boolean {
-  const peerDependencies = readInstalledPackagePeerDependencies(dir);
-  if (!Object.hasOwn(peerDependencies, "openclaw")) {
-    return false;
-  }
-
-  try {
-    fsSync.statSync(path.join(dir, "node_modules", "openclaw"));
-    return false;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    return code === "ENOENT" || code === "ENOTDIR";
-  }
 }

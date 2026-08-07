@@ -1,15 +1,25 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { setTimeout as scheduleNativeTimeout } from "node:timers";
+import { expectDefined } from "@openclaw/normalization-core";
+// Cron store tests cover persisted scheduled job state and run metadata.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadLegacyCronQuarantineForMigration } from "../commands/doctor/cron/legacy-quarantine-migration.js";
 import {
-  loadCronQuarantineFile,
+  archiveLegacyCronStoreForMigration,
+  loadLegacyCronStoreForMigration,
+} from "../commands/doctor/cron/legacy-store-migration.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
+import {
+  loadCronJobsStoreWithConfigJobs,
+  loadCronJobsStoreSync,
+  loadCronQuarantinedJobs,
   loadCronStore,
-  loadCronStoreSync,
-  resolveCronQuarantinePath,
   resolveCronStorePath,
-  saveCronQuarantineFile,
+  saveCronJobsStore,
+  saveCronQuarantinedJobs,
   saveCronStore,
 } from "./store.js";
 import type { CronStoreFile } from "./types.js";
@@ -35,6 +45,10 @@ async function makeStorePath() {
   };
 }
 
+function resolveLegacyCronQuarantinePath(storePath: string): string {
+  return storePath.replace(/\.json$/, "-quarantine.json");
+}
+
 function makeStore(jobId: string, enabled: boolean): CronStoreFile {
   const now = Date.now();
   return {
@@ -56,23 +70,6 @@ function makeStore(jobId: string, enabled: boolean): CronStoreFile {
   };
 }
 
-async function captureRenameDestinations(action: () => Promise<void>): Promise<string[]> {
-  const renamedDestinations: string[] = [];
-  const origRename = fs.rename.bind(fs);
-  const spy = vi.spyOn(fs, "rename").mockImplementation(async (src, dest) => {
-    renamedDestinations.push(String(dest));
-    return origRename(src, dest);
-  });
-
-  try {
-    await action();
-  } finally {
-    spy.mockRestore();
-  }
-
-  return renamedDestinations;
-}
-
 async function expectPathMissing(targetPath: string): Promise<void> {
   try {
     await fs.stat(targetPath);
@@ -83,14 +80,18 @@ async function expectPathMissing(targetPath: string): Promise<void> {
   throw new Error(`expected path to be missing: ${targetPath}`);
 }
 
+const requireRecord = createRequireRecord("record", "expected-label");
+
 describe("resolveCronStorePath", () => {
+  const envSnapshot = captureEnv(["OPENCLAW_HOME", "HOME"]);
+
   afterEach(() => {
-    vi.unstubAllEnvs();
+    envSnapshot.restore();
   });
 
   it("uses OPENCLAW_HOME for tilde expansion", () => {
-    vi.stubEnv("OPENCLAW_HOME", "/srv/openclaw-home");
-    vi.stubEnv("HOME", "/home/other");
+    setTestEnvValue("OPENCLAW_HOME", "/srv/openclaw-home");
+    setTestEnvValue("HOME", "/home/other");
 
     const result = resolveCronStorePath("~/cron/jobs.json");
     expect(result).toBe(path.resolve("/srv/openclaw-home", "cron", "jobs.json"));
@@ -104,14 +105,16 @@ describe("cron store", () => {
     expect(loaded).toEqual({ version: 1, jobs: [] });
   });
 
-  it("throws when store contains invalid JSON", async () => {
+  it("throws when doctor migration reads invalid legacy JSON", async () => {
     const store = await makeStorePath();
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(store.storePath, "{ not json", "utf-8");
-    await expect(loadCronStore(store.storePath)).rejects.toThrow(/Failed to parse cron store/i);
+    await expect(loadLegacyCronStoreForMigration(store.storePath)).rejects.toThrow(
+      /Failed to parse cron store/i,
+    );
   });
 
-  it("accepts JSON5 syntax when loading an existing cron store", async () => {
+  it("accepts JSON5 syntax when loading a legacy cron store for doctor migration", async () => {
     const store = await makeStorePath();
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(
@@ -137,16 +140,19 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
     expect(loaded.version).toBe(1);
     expect(loaded.jobs).toHaveLength(1);
     expect(loaded.jobs[0]?.id).toBe("job-1");
     expect(loaded.jobs[0]?.enabled).toBe(true);
   });
 
-  it("loads legacy top-level array stores instead of treating them as empty", async () => {
+  it("loads legacy top-level array stores for doctor migration", async () => {
     const store = await makeStorePath();
-    const first = makeStore("legacy-array-1", true).jobs[0];
+    const first = expectDefined(
+      makeStore("legacy-array-1", true).jobs[0],
+      'makeStore("legacy-array-1", true).jobs[0] test invariant',
+    );
     const second = makeStore("legacy-array-2", false).jobs[0];
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(
@@ -155,7 +161,7 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
 
     expect(loaded.version).toBe(1);
     expect(loaded.jobs.map((job) => job.id)).toEqual(["legacy-array-1", "legacy-array-2"]);
@@ -163,48 +169,44 @@ describe("cron store", () => {
     expect(loaded.jobs[1]?.enabled).toBe(false);
   });
 
-  it("loads legacy top-level array stores synchronously", async () => {
+  it("does not load legacy top-level array stores synchronously from core", async () => {
     const store = await makeStorePath();
     const job = makeStore("legacy-array-sync", true).jobs[0];
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(store.storePath, JSON.stringify([job], null, 2), "utf-8");
 
-    const loaded = loadCronStoreSync(store.storePath);
+    const loaded = loadCronJobsStoreSync(store.storePath);
 
-    expect(loaded.jobs).toHaveLength(1);
-    expect(loaded.jobs[0]?.id).toBe("legacy-array-sync");
-    expect(loaded.jobs[0]?.state).toStrictEqual(job.state);
+    expect(loaded.jobs).toHaveLength(0);
   });
 
-  it("preserves legacy top-level array jobs through a load-add-save round trip", async () => {
+  it("lets doctor import legacy top-level array jobs into SQLite and archive the source", async () => {
     const store = await makeStorePath();
-    const legacy = makeStore("legacy-array-preserved", true).jobs[0];
+    const legacy = expectDefined(
+      makeStore("legacy-array-preserved", true).jobs[0],
+      'makeStore("legacy-array-preserved", true).jobs[0] test invariant',
+    );
     legacy.state = { nextRunAtMs: legacy.createdAtMs + 60_000 };
-    const added = makeStore("new-job", true).jobs[0];
+    const added = expectDefined(
+      makeStore("new-job", true).jobs[0],
+      'makeStore("new-job", true).jobs[0] test invariant',
+    );
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(store.storePath, JSON.stringify([legacy], null, 2), "utf-8");
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
     loaded.jobs.push(added);
     await saveCronStore(store.storePath, loaded);
+    await archiveLegacyCronStoreForMigration(store.storePath);
 
-    const config = JSON.parse(await fs.readFile(store.storePath, "utf-8")) as {
-      version?: unknown;
-      jobs?: Array<Record<string, unknown>>;
-    };
-    const stateFile = JSON.parse(
-      await fs.readFile(store.storePath.replace(/\.json$/, "-state.json"), "utf-8"),
-    ) as { jobs: Record<string, { state?: Record<string, unknown> }> };
-
-    expect(config.version).toBe(1);
-    expect(config.jobs?.map((job) => job.id)).toEqual(["legacy-array-preserved", "new-job"]);
-    expect(config.jobs?.[0]?.state).toStrictEqual({});
-    expect(stateFile.jobs["legacy-array-preserved"]?.state?.nextRunAtMs).toBe(
-      legacy.createdAtMs + 60_000,
-    );
+    const roundTrip = await loadCronStore(store.storePath);
+    expect(roundTrip.jobs.map((job) => job.id)).toEqual(["legacy-array-preserved", "new-job"]);
+    expect(roundTrip.jobs[0]?.state.nextRunAtMs).toBe(legacy.createdAtMs + 60_000);
+    await expectPathMissing(store.storePath);
+    expect(await fs.stat(`${store.storePath}.migrated`)).toBeTruthy();
   });
 
-  it("skips non-object persisted jobs instead of hydrating scalar rows", async () => {
+  it("skips non-object legacy persisted jobs during doctor migration", async () => {
     const store = await makeStorePath();
     const valid = makeStore("job-valid", true).jobs[0];
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
@@ -221,16 +223,77 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
 
     expect(loaded.jobs).toHaveLength(1);
     expect(loaded.jobs[0]?.id).toBe("job-valid");
     expect(loaded.jobs[0]?.state).toStrictEqual({});
   });
 
-  it("fails closed instead of overwriting unrecognized quarantine files", async () => {
+  it("loads malformed legacy stores for doctor without archiving first", async () => {
+    const store = await makeStorePath();
+    const valid = expectDefined(
+      makeStore("job-valid-unarchived", true).jobs[0],
+      'makeStore("job-valid-unarchived", true).jobs[0] test invariant',
+    );
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(
+      store.storePath,
+      JSON.stringify(
+        {
+          version: 1,
+          jobs: [
+            valid,
+            {
+              id: "bad-schedule-unarchived",
+              name: "bad schedule",
+              enabled: true,
+              createdAtMs: valid.createdAtMs,
+              updatedAtMs: valid.updatedAtMs,
+              schedule: ["every", 60_000],
+              sessionTarget: "main",
+              wakeMode: "now",
+              payload: { kind: "systemEvent", text: "tick" },
+              state: {},
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const loaded = await loadLegacyCronStoreForMigration(store.storePath);
+
+    expect(loaded.store.jobs.map((job) => job.id)).toEqual([
+      "job-valid-unarchived",
+      "bad-schedule-unarchived",
+    ]);
+    expect(await fs.stat(store.storePath)).toBeTruthy();
+    await expectPathMissing(`${store.storePath}.migrated`);
+  });
+
+  it("does not synchronously import legacy files from core reads", async () => {
+    const store = await makeStorePath();
+    const valid = makeStore("job-valid-sync-unarchived", true).jobs[0];
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(
+      store.storePath,
+      JSON.stringify({ version: 1, jobs: ["bad-row", valid] }, null, 2),
+      "utf-8",
+    );
+
+    const loaded = loadCronJobsStoreSync(store.storePath);
+
+    expect(loaded.jobs.map((job) => job.id)).toEqual([]);
+    expect(await fs.stat(store.storePath)).toBeTruthy();
+    await expectPathMissing(`${store.storePath}.migrated`);
+  });
+
+  it("rejects unrecognized historical quarantine files without modifying them", async () => {
     const { storePath } = await makeStorePath();
-    const quarantinePath = resolveCronQuarantinePath(storePath);
+    const quarantinePath = resolveLegacyCronQuarantinePath(storePath);
     await fs.mkdir(path.dirname(storePath), { recursive: true });
     await fs.writeFile(
       quarantinePath,
@@ -238,16 +301,9 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    await expect(loadCronQuarantineFile(quarantinePath)).rejects.toThrow(
+    await expect(loadLegacyCronQuarantineForMigration(storePath)).rejects.toThrow(
       /Unsupported cron quarantine file shape/,
     );
-    await expect(
-      saveCronQuarantineFile({
-        storePath,
-        nowMs: 123,
-        entries: [{ sourceIndex: 0, reason: "missing-schedule", job: { id: "new-row" } }],
-      }),
-    ).rejects.toThrow(/Unsupported cron quarantine file shape/);
 
     const preserved = JSON.parse(await fs.readFile(quarantinePath, "utf-8")) as {
       jobs: Array<Record<string, unknown>>;
@@ -255,23 +311,80 @@ describe("cron store", () => {
     expect(preserved.jobs[0]?.raw).toBe("keep-me");
   });
 
-  it("does not rewrite quarantine files when every entry is already present", async () => {
+  it("stores quarantined jobs in SQLite and preserves the first recovery timestamp", async () => {
     const { storePath } = await makeStorePath();
-    const quarantinePath = resolveCronQuarantinePath(storePath);
+    const quarantinePath = resolveLegacyCronQuarantinePath(storePath);
     const entry = { sourceIndex: 0, reason: "missing-schedule", job: { id: "same-row" } };
 
-    await saveCronQuarantineFile({ storePath, nowMs: 100, entries: [entry] });
-    const firstRaw = await fs.readFile(quarantinePath, "utf-8");
-    await saveCronQuarantineFile({ storePath, nowMs: 200, entries: [entry] });
+    saveCronQuarantinedJobs({ storePath, nowMs: 100, entries: [entry] });
+    saveCronQuarantinedJobs({ storePath, nowMs: 200, entries: [entry] });
 
-    expect(await fs.readFile(quarantinePath, "utf-8")).toBe(firstRaw);
+    expect(loadCronQuarantinedJobs(storePath)).toEqual([{ ...entry, quarantinedAtMs: 100 }]);
+    await expectPathMissing(quarantinePath);
+  });
+
+  it("rolls back quarantine records when the cron row update cannot commit", async () => {
+    const { storePath } = await makeStorePath();
+    const store = makeStore("atomic-quarantine-job", true);
+    await saveCronStore(storePath, store);
+    const database = openOpenClawStateDatabase().db;
+    database.exec(
+      "CREATE TEMP TRIGGER fail_cron_quarantine_update BEFORE UPDATE ON cron_jobs BEGIN SELECT RAISE(ABORT, 'cron update rejected'); END",
+    );
+    try {
+      await expect(
+        saveCronJobsStore(storePath, store, {
+          quarantine: {
+            nowMs: 123,
+            entries: [{ sourceIndex: 0, reason: "invalid-schedule", job: { id: "bad-row" } }],
+          },
+        }),
+      ).rejects.toThrow("cron update rejected");
+      expect(loadCronQuarantinedJobs(storePath)).toEqual([]);
+      expect((await loadCronStore(storePath)).jobs.map((job) => job.id)).toEqual([
+        "atomic-quarantine-job",
+      ]);
+    } finally {
+      database.exec("DROP TRIGGER fail_cron_quarantine_update");
+    }
+  });
+
+  it("keeps valid cron row metadata aligned when an earlier SQLite row is malformed", async () => {
+    const { storePath } = await makeStorePath();
+    const malformed = expectDefined(
+      makeStore("malformed-first", true).jobs[0],
+      "malformed cron fixture",
+    );
+    const surviving = expectDefined(
+      makeStore("surviving-second", true).jobs[0],
+      "surviving cron fixture",
+    );
+    surviving.state = { nextRunAtMs: 987_654 };
+    await saveCronStore(storePath, { version: 1, jobs: [malformed, surviving] });
+    openOpenClawStateDatabase()
+      .db.prepare("UPDATE cron_jobs SET schedule_kind = ? WHERE store_key = ? AND job_id = ?")
+      .run("unsupported", path.resolve(storePath), malformed.id);
+
+    const loaded = await loadCronJobsStoreWithConfigJobs(storePath);
+
+    expect(loaded.store.jobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect(loaded.configJobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect(loaded.configJobIndexes).toEqual([1]);
+    expect(loaded.configJobRuntimeEntries[0]?.state?.nextRunAtMs).toBe(987_654);
+    expect(loaded.invalidConfigRows).toEqual([
+      expect.objectContaining({
+        sourceIndex: 0,
+        reason: "invalid-schedule",
+        job: expect.objectContaining({ id: malformed.id }),
+      }),
+    ]);
   });
 
   it("loads split cron state synchronously for task reconciliation", async () => {
     const { storePath } = await makeStorePath();
     await saveCronStore(storePath, makeStore("job-sync", true));
 
-    const loaded = loadCronStoreSync(storePath);
+    const loaded = loadCronJobsStoreSync(storePath);
 
     expect(loaded.jobs).toHaveLength(1);
     expect(loaded.jobs[0]?.id).toBe("job-sync");
@@ -279,7 +392,7 @@ describe("cron store", () => {
     expect(loaded.jobs[0]?.updatedAtMs).toBeTypeOf("number");
   });
 
-  it("loads split cron state synchronously for legacy jobId rows", async () => {
+  it("loads split cron state for legacy jobId rows during doctor migration", async () => {
     const { storePath } = await makeStorePath();
     const statePath = storePath.replace(/\.json$/, "-state.json");
     await fs.mkdir(path.dirname(storePath), { recursive: true });
@@ -321,13 +434,13 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = loadCronStoreSync(storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(storePath)).store;
 
     expect(loaded.jobs[0]?.state).toEqual({ runningAtMs: 456 });
     expect(loaded.jobs[0]?.updatedAtMs).toBe(123);
   });
 
-  it("compares split state identity for flat legacy cron rows", async () => {
+  it("compares split state identity for flat legacy cron rows during doctor migration", async () => {
     const { storePath } = await makeStorePath();
     const statePath = storePath.replace(/\.json$/, "-state.json");
     await fs.mkdir(path.dirname(storePath), { recursive: true });
@@ -375,7 +488,7 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(storePath)).store;
 
     expect(loaded.jobs[0]?.state.nextRunAtMs).toBeUndefined();
   });
@@ -390,7 +503,7 @@ describe("cron store", () => {
     await expectPathMissing(`${store.storePath}.bak`);
   });
 
-  it("backs up previous content before replacing the store", async () => {
+  it("replaces cron jobs in SQLite without rewriting legacy files", async () => {
     const store = await makeStorePath();
     const first = makeStore("job-1", true);
     const second = makeStore("job-2", false);
@@ -398,18 +511,13 @@ describe("cron store", () => {
     await saveCronStore(store.storePath, first);
     await saveCronStore(store.storePath, second);
 
-    const currentRaw = await fs.readFile(store.storePath, "utf-8");
-    const backupRaw = await fs.readFile(`${store.storePath}.bak`, "utf-8");
-    const current = JSON.parse(currentRaw);
-    const backup = JSON.parse(backupRaw);
-    // jobs.json now contains config-only (state stripped to {}).
-    expect(current.jobs[0].id).toBe("job-2");
-    expect(current.jobs[0].state).toStrictEqual({});
-    expect(backup.jobs[0].id).toBe("job-1");
-    expect(backup.jobs[0].state).toStrictEqual({});
+    const loaded = await loadCronStore(store.storePath);
+    expect(loaded.jobs.map((job) => job.id)).toEqual(["job-2"]);
+    await expectPathMissing(store.storePath);
+    await expectPathMissing(`${store.storePath}.bak`);
   });
 
-  it("skips backup files for runtime-only state churn", async () => {
+  it("persists runtime-only state churn in SQLite", async () => {
     const store = await makeStorePath();
     const first = makeStore("job-1", true);
     const second: CronStoreFile = {
@@ -428,70 +536,520 @@ describe("cron store", () => {
     await saveCronStore(store.storePath, first);
     await saveCronStore(store.storePath, second);
 
-    // jobs.json should NOT be rewritten (only runtime changed).
-    const configRaw = await fs.readFile(store.storePath, "utf-8");
-    const config = JSON.parse(configRaw);
-    expect(config.jobs[0].state).toStrictEqual({});
-    expect(config.jobs[0]).not.toHaveProperty("updatedAtMs");
-
-    // State file should contain runtime fields.
-    const statePath = store.storePath.replace(/\.json$/, "-state.json");
-    const stateRaw = await fs.readFile(statePath, "utf-8");
-    const stateFile = JSON.parse(stateRaw);
-    expect(stateFile.jobs[first.jobs[0].id].state.nextRunAtMs).toBe(
-      first.jobs[0].createdAtMs + 60_000,
+    const loaded = await loadCronStore(store.storePath);
+    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(first.jobs[0], "first.jobs[0] test invariant").createdAtMs + 60_000,
     );
-    expect(typeof stateFile.jobs[first.jobs[0].id].scheduleIdentity).toBe("string");
-
+    expect(loaded.jobs[0]?.state.lastRunAtMs).toBe(
+      expectDefined(first.jobs[0], "first.jobs[0] test invariant").createdAtMs + 30_000,
+    );
+    await expectPathMissing(store.storePath);
+    await expectPathMissing(store.storePath.replace(/\.json$/, "-state.json"));
     await expectPathMissing(`${store.storePath}.bak`);
   });
 
-  it("drops stale split runtime nextRunAtMs when schedule identity changes across restart", async () => {
+  it("round-trips the auto-disable reason through runtime state JSON", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("auto-disabled-job", false);
+    const job = expectDefined(payload.jobs[0], "payload.jobs[0] test invariant");
+    await saveCronStore(store.storePath, payload);
+
+    job.state = {
+      consecutiveErrors: 10,
+      autoDisabled: {
+        reason: "consecutive-failures",
+        atMs: job.updatedAtMs,
+        consecutiveErrors: 10,
+      },
+    };
+    await saveCronStore(store.storePath, payload, { stateOnly: true });
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.state).toMatchObject(job.state);
+  });
+
+  it("stores queued reservations separately from active run markers", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("job-queued-phase", true);
+    const job = expectDefined(payload.jobs[0], "payload.jobs[0] test invariant");
+    job.state = {
+      nextRunAtMs: job.createdAtMs,
+      startupCatchupAtMs: job.createdAtMs,
+      pacedNextRunAtMs: job.createdAtMs,
+      queuedAtMs: job.createdAtMs + 1,
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    const queuedRow = openOpenClawStateDatabase()
+      .db.prepare("SELECT running_at_ms, state_json FROM cron_jobs WHERE job_id = ?")
+      .get(job.id) as { running_at_ms: number | null; state_json: string };
+    expect(queuedRow.running_at_ms).toBeNull();
+    expect(JSON.parse(queuedRow.state_json)).toMatchObject({
+      queuedAtMs: job.createdAtMs + 1,
+      startupCatchupAtMs: job.createdAtMs,
+      pacedNextRunAtMs: job.createdAtMs,
+    });
+    expect((await loadCronStore(store.storePath)).jobs[0]?.state).toMatchObject({
+      queuedAtMs: job.createdAtMs + 1,
+      startupCatchupAtMs: job.createdAtMs,
+      pacedNextRunAtMs: job.createdAtMs,
+    });
+
+    job.state.queuedAtMs = undefined;
+    job.state.runningAtMs = job.createdAtMs + 2;
+    await saveCronStore(store.storePath, payload, { stateOnly: true });
+
+    const activated = (await loadCronStore(store.storePath)).jobs[0]?.state;
+    expect(activated?.queuedAtMs).toBeUndefined();
+    expect(activated?.runningAtMs).toBe(job.createdAtMs + 2);
+  });
+
+  it("updates runtime state without replacing concurrent cron config", async () => {
+    const store = await makeStorePath();
+    const stale = makeStore("job-state-only", true);
+    const current: CronStoreFile = {
+      version: 1,
+      jobs: [
+        {
+          ...expectDefined(stale.jobs[0], "stale.jobs[0] test invariant"),
+          name: "Job current",
+          updatedAtMs: expectDefined(stale.jobs[0], "stale.jobs[0] test invariant").updatedAtMs + 1,
+        },
+        expectDefined(
+          makeStore("job-added-concurrently", true).jobs[0],
+          'makeStore("job-added-concurrently", true).jobs[0] test invariant',
+        ),
+      ],
+    };
+    expectDefined(stale.jobs[0], "stale.jobs[0] test invariant").state = {
+      nextRunAtMs:
+        expectDefined(stale.jobs[0], "stale.jobs[0] test invariant").createdAtMs + 60_000,
+    };
+    expectDefined(stale.jobs[0], "stale.jobs[0] test invariant").updatedAtMs += 2;
+
+    await saveCronStore(store.storePath, makeStore("job-state-only", true));
+    await saveCronStore(store.storePath, current);
+    await saveCronStore(store.storePath, stale, { stateOnly: true });
+
+    const loaded = await loadCronStore(store.storePath);
+    expect(loaded.jobs.map((job) => job.id)).toEqual(["job-state-only", "job-added-concurrently"]);
+    expect(loaded.jobs[0]?.name).toBe("Job current");
+    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(stale.jobs[0], "stale.jobs[0] test invariant").createdAtMs + 60_000,
+    );
+  });
+
+  it("round-trips agent-turn external content provenance through SQLite", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("hook-job", true);
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").sessionTarget = "isolated";
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
+      kind: "agentTurn",
+      message: "Summarize hook payload",
+      externalContentSource: "webhook",
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toMatchObject({
+      kind: "agentTurn",
+      message: "Summarize hook payload",
+      externalContentSource: "webhook",
+    });
+  });
+
+  it("round-trips the toolsAllow default-cap flag through SQLite", async () => {
+    // The flag must survive a gateway restart: without it, a CLI-resolved run
+    // would re-hit the prepare.ts toolsAllow rejection after reload (#91499).
+    const store = await makeStorePath();
+    const payload = makeStore("tools-allow-default-job", true);
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").sessionTarget = "isolated";
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
+      kind: "agentTurn",
+      message: "scheduled continuation",
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toMatchObject({
+      kind: "agentTurn",
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    });
+  });
+
+  it("does not persist a default-cap flag for an explicit toolsAllow restriction", async () => {
+    // An explicit user restriction is fail-closed: it carries no flag, so a CLI
+    // run still surfaces the prepare.ts rejection rather than silently dropping
+    // the requested policy.
+    const store = await makeStorePath();
+    const payload = makeStore("tools-allow-explicit-job", true);
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").sessionTarget = "isolated";
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
+      kind: "agentTurn",
+      message: "scheduled continuation",
+      toolsAllow: ["read"],
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    const reloaded = (await loadCronStore(store.storePath)).jobs[0]?.payload;
+    expect(reloaded).toMatchObject({ kind: "agentTurn", toolsAllow: ["read"] });
+    expect(reloaded && "toolsAllowIsDefault" in reloaded).toBe(false);
+  });
+
+  it("round-trips command payloads through SQLite", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("command-job", true);
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").sessionTarget = "isolated";
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").payload = {
+      kind: "command",
+      argv: ["sh", "-lc", 'printf %s "$1"', "  "],
+      cwd: "/srv/example",
+      env: { FOO: "bar" },
+      input: "stdin",
+      timeoutSeconds: 45,
+      noOutputTimeoutSeconds: 10,
+      outputMaxBytes: 4096,
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toEqual({
+      kind: "command",
+      argv: ["sh", "-lc", 'printf %s "$1"', "  "],
+      cwd: "/srv/example",
+      env: { FOO: "bar" },
+      input: "stdin",
+      timeoutSeconds: 45,
+      noOutputTimeoutSeconds: 10,
+      outputMaxBytes: 4096,
+    });
+  });
+
+  it("round-trips a trigger-script systemEvent tool cap through SQLite", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("trigger-system-event-cap", true);
+    const job = expectDefined(
+      payload.jobs[0],
+      'makeStore("trigger-system-event-cap", true).jobs[0] test invariant',
+    );
+    job.trigger = { script: "return { fire: false }" };
+    job.payload = {
+      kind: "systemEvent",
+      text: "changed",
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toEqual({
+      kind: "systemEvent",
+      text: "changed",
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    });
+  });
+
+  it("round-trips a command payload tool cap through SQLite", async () => {
+    const store = await makeStorePath();
+    const payload = makeStore("command-cap-job", true);
+    const job = expectDefined(
+      payload.jobs[0],
+      'makeStore("command-cap-job", true).jobs[0] test invariant',
+    );
+    job.sessionTarget = "isolated";
+    job.payload = {
+      kind: "command",
+      argv: ["echo", "hi"],
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    };
+
+    await saveCronStore(store.storePath, payload);
+
+    expect((await loadCronStore(store.storePath)).jobs[0]?.payload).toEqual({
+      kind: "command",
+      argv: ["echo", "hi"],
+      toolsAllow: ["read", "cron"],
+      toolsAllowIsDefault: true,
+    });
+  });
+
+  it("round-trips completion destinations through SQLite delivery columns", async () => {
+    const { storePath } = await makeStorePath();
+    const job = expectDefined(
+      makeStore("sqlite-webhook-delivery-job", true).jobs[0],
+      'makeStore("sqlite-webhook-delivery-job", true).jobs[0] test invariant',
+    );
+    job.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      threadId: "topic-9",
+      accountId: "bot-1",
+      bestEffort: true,
+      completionDestination: {
+        mode: "webhook",
+        to: "https://example.invalid/legacy-completion",
+      },
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+
+    expect((await loadCronStore(storePath)).jobs[0]?.delivery).toEqual({
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      threadId: "topic-9",
+      accountId: "bot-1",
+      bestEffort: true,
+      completionDestination: {
+        mode: "webhook",
+        to: "https://example.invalid/legacy-completion",
+      },
+    });
+  });
+
+  it("round-trips a numeric delivery thread id through SQLite delivery columns", async () => {
+    const { storePath } = await makeStorePath();
+    const job = expectDefined(
+      makeStore("sqlite-numeric-thread-id-job", true).jobs[0],
+      'makeStore("sqlite-numeric-thread-id-job", true).jobs[0] test invariant',
+    );
+    job.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      threadId: 1008013,
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+
+    const loadedThreadId = (await loadCronStore(storePath)).jobs[0]?.delivery?.threadId;
+    expect(loadedThreadId).toBe(1008013);
+    expect(typeof loadedThreadId).toBe("number");
+  });
+
+  it.each(["42", "1737500000.123456", "007"])(
+    "keeps a numeric-looking delivery thread id %s as a string through SQLite delivery columns",
+    async (threadId) => {
+      const { storePath } = await makeStorePath();
+      const job = expectDefined(
+        makeStore(`sqlite-string-thread-id-job-${threadId}`, true).jobs[0],
+        "makeStore(`sqlite-string-thread-id-job-${threadId}`, true).jobs[0] test invariant",
+      );
+      job.delivery = {
+        mode: "announce",
+        channel: "telegram",
+        to: "telegram:chat-1",
+        threadId,
+      };
+
+      await saveCronStore(storePath, { version: 1, jobs: [job] });
+
+      const loadedThreadId = (await loadCronStore(storePath)).jobs[0]?.delivery?.threadId;
+      expect(loadedThreadId).toBe(threadId);
+      expect(typeof loadedThreadId).toBe("string");
+    },
+  );
+
+  it("does not resurrect a cleared thread id from the stored config copy", async () => {
+    const { storePath } = await makeStorePath();
+    const job = expectDefined(
+      makeStore("sqlite-early-row-thread-id-job", true).jobs[0],
+      'makeStore("sqlite-early-row-thread-id-job", true).jobs[0] test invariant',
+    );
+    job.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      threadId: 1008013,
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+    openOpenClawStateDatabase()
+      .db.prepare("UPDATE cron_jobs SET delivery_thread_id = NULL WHERE job_id = ?")
+      .run(job.id);
+
+    const loadedThreadId = (await loadCronStore(storePath)).jobs[0]?.delivery?.threadId;
+    expect(loadedThreadId).toBeUndefined();
+  });
+
+  it("uses the normalized thread id when the stored config copy is stale", async () => {
+    const { storePath } = await makeStorePath();
+    const job = expectDefined(
+      makeStore("sqlite-stale-thread-id-job", true).jobs[0],
+      'makeStore("sqlite-stale-thread-id-job", true).jobs[0] test invariant',
+    );
+    job.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      threadId: 1008013,
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+    openOpenClawStateDatabase()
+      .db.prepare("UPDATE cron_jobs SET delivery_thread_id = ? WHERE job_id = ?")
+      .run("replacement", job.id);
+
+    const loadedThreadId = (await loadCronStore(storePath)).jobs[0]?.delivery?.threadId;
+    expect(loadedThreadId).toBe("replacement");
+  });
+
+  it("disambiguates identical thread id text using the normalized type marker", async () => {
+    const { storePath } = await makeStorePath();
+    const numberJob = expectDefined(
+      makeStore("sqlite-thread-id-number", true).jobs[0],
+      'makeStore("sqlite-thread-id-number", true).jobs[0] test invariant',
+    );
+    numberJob.delivery = { mode: "announce", channel: "telegram", to: "telegram:a", threadId: 42 };
+    const stringJob = expectDefined(
+      makeStore("sqlite-thread-id-string", true).jobs[0],
+      'makeStore("sqlite-thread-id-string", true).jobs[0] test invariant',
+    );
+    stringJob.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:b",
+      threadId: "42",
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [numberJob, stringJob] });
+
+    const jobs = (await loadCronStore(storePath)).jobs;
+    expect(jobs[0]?.delivery?.threadId).toBe(42);
+    expect(typeof jobs[0]?.delivery?.threadId).toBe("number");
+    expect(jobs[1]?.delivery?.threadId).toBe("42");
+    expect(typeof jobs[1]?.delivery?.threadId).toBe("string");
+  });
+
+  it("round-trips explicit failure destination field clears through SQLite delivery columns", async () => {
+    const { storePath } = await makeStorePath();
+    const job = expectDefined(
+      makeStore("sqlite-failure-destination-clear-job", true).jobs[0],
+      'makeStore("sqlite-failure-destination-clear-job", true).jobs[0] test invariant',
+    );
+    job.sessionTarget = "isolated";
+    job.payload = { kind: "agentTurn", message: "hello" };
+    job.delivery = {
+      mode: "announce",
+      channel: "telegram",
+      to: "telegram:chat-1",
+      failureDestination: {
+        channel: undefined,
+        to: "slack:C123",
+        accountId: undefined,
+        mode: undefined,
+      },
+    };
+
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+
+    const delivery = (await loadCronStore(storePath)).jobs[0]?.delivery;
+    expect(delivery?.failureDestination).toEqual({
+      channel: undefined,
+      to: "slack:C123",
+      accountId: undefined,
+      mode: undefined,
+    });
+    expect(Object.hasOwn(delivery?.failureDestination as object, "channel")).toBe(true);
+    expect(Object.hasOwn(delivery?.failureDestination as object, "accountId")).toBe(true);
+    expect(Object.hasOwn(delivery?.failureDestination as object, "mode")).toBe(true);
+
+    const loaded = await loadCronJobsStoreWithConfigJobs(storePath);
+    const configDelivery = requireRecord(loaded.configJobs[0]?.delivery, "config delivery");
+    const configFailureDestination = requireRecord(
+      configDelivery.failureDestination,
+      "config failure destination",
+    );
+    expect(Object.hasOwn(configFailureDestination, "channel")).toBe(true);
+    expect(Object.hasOwn(configFailureDestination, "accountId")).toBe(true);
+    expect(Object.hasOwn(configFailureDestination, "mode")).toBe(true);
+  });
+
+  it("drops stale split runtime nextRunAtMs when doctor imports edited legacy config", async () => {
     const { storePath } = await makeStorePath();
     const payload = makeStore("job-restart-drift", true);
-    const staleNextRunAtMs = payload.jobs[0].createdAtMs + 3_600_000;
-    payload.jobs[0].schedule = { kind: "cron", expr: "0 6 * * *", tz: "UTC" };
-    payload.jobs[0].state = { nextRunAtMs: staleNextRunAtMs };
-
-    await saveCronStore(storePath, payload);
-
-    const config = JSON.parse(await fs.readFile(storePath, "utf-8")) as {
-      jobs: Array<Record<string, unknown>>;
+    const staleNextRunAtMs =
+      expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs + 3_600_000;
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").schedule = {
+      kind: "cron",
+      expr: "30 6 * * 0,6",
+      tz: "UTC",
     };
-    config.jobs[0].schedule = { kind: "cron", expr: "30 6 * * 0,6", tz: "UTC" };
-    await fs.writeFile(storePath, JSON.stringify(config, null, 2), "utf-8");
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(storePath, JSON.stringify(payload, null, 2), "utf-8");
+    await fs.writeFile(
+      storePath.replace(/\.json$/, "-state.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: {
+          [expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").id]: {
+            updatedAtMs: expectDefined(payload.jobs[0], "payload.jobs[0] test invariant")
+              .updatedAtMs,
+            scheduleIdentity: JSON.stringify({
+              version: 1,
+              enabled: true,
+              schedule: { kind: "cron", expr: "0 6 * * *", tz: "UTC" },
+            }),
+            state: { nextRunAtMs: staleNextRunAtMs },
+          },
+        },
+      }),
+      "utf-8",
+    );
 
-    const loaded = await loadCronStore(storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(storePath)).store;
 
     expect(loaded.jobs[0]?.schedule).toEqual({ kind: "cron", expr: "30 6 * * 0,6", tz: "UTC" });
     expect(loaded.jobs[0]?.state.nextRunAtMs).toBeUndefined();
   });
 
-  it("drops stale split runtime nextRunAtMs in sync loads when schedule identity changes", async () => {
+  it("does not synchronously import stale split runtime nextRunAtMs from legacy files", async () => {
     const { storePath } = await makeStorePath();
     const payload = makeStore("job-sync-restart-drift", true);
-    const staleNextRunAtMs = payload.jobs[0].createdAtMs + 3_600_000;
-    payload.jobs[0].schedule = { kind: "every", everyMs: 60_000, anchorMs: 1 };
-    payload.jobs[0].state = { nextRunAtMs: staleNextRunAtMs };
-
-    await saveCronStore(storePath, payload);
-
-    const config = JSON.parse(await fs.readFile(storePath, "utf-8")) as {
-      jobs: Array<Record<string, unknown>>;
+    const staleNextRunAtMs =
+      expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs + 3_600_000;
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").schedule = {
+      kind: "every",
+      everyMs: 60_000,
+      anchorMs: 2,
     };
-    config.jobs[0].schedule = { kind: "every", everyMs: 60_000, anchorMs: 2 };
-    await fs.writeFile(storePath, JSON.stringify(config, null, 2), "utf-8");
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(storePath, JSON.stringify(payload, null, 2), "utf-8");
+    await fs.writeFile(
+      storePath.replace(/\.json$/, "-state.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: {
+          [expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").id]: {
+            updatedAtMs: expectDefined(payload.jobs[0], "payload.jobs[0] test invariant")
+              .updatedAtMs,
+            scheduleIdentity: JSON.stringify({
+              version: 1,
+              enabled: true,
+              schedule: { kind: "every", everyMs: 60_000, anchorMs: 1 },
+            }),
+            state: { nextRunAtMs: staleNextRunAtMs },
+          },
+        },
+      }),
+      "utf-8",
+    );
 
-    const loaded = loadCronStoreSync(storePath);
+    const loaded = loadCronJobsStoreSync(storePath);
 
-    expect(loaded.jobs[0]?.schedule).toEqual({ kind: "every", everyMs: 60_000, anchorMs: 2 });
-    expect(loaded.jobs[0]?.state.nextRunAtMs).toBeUndefined();
+    expect(loaded.jobs).toEqual([]);
   });
 
-  it("keeps state separate for custom store paths without a json suffix", async () => {
+  it("keeps custom store paths separated by SQLite store key", async () => {
     const store = await makeStorePath();
     const storePath = store.storePath.replace(/\.json$/, "");
-    const statePath = `${storePath}-state.json`;
     const first = makeStore("job-1", true);
     const second: CronStoreFile = {
       ...first,
@@ -508,108 +1066,82 @@ describe("cron store", () => {
     await saveCronStore(storePath, first);
     await saveCronStore(storePath, second);
 
-    const config = JSON.parse(await fs.readFile(storePath, "utf-8"));
-    expect(Array.isArray(config.jobs)).toBe(true);
-    expect(config.jobs[0].id).toBe("job-1");
-    expect(config.jobs[0].state).toStrictEqual({});
-
-    const stateFile = JSON.parse(await fs.readFile(statePath, "utf-8"));
-    expect(stateFile.jobs["job-1"].state.nextRunAtMs).toBe(first.jobs[0].createdAtMs + 60_000);
-
     const loaded = await loadCronStore(storePath);
-    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(first.jobs[0].createdAtMs + 60_000);
+    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(first.jobs[0], "first.jobs[0] test invariant").createdAtMs + 60_000,
+    );
+    await expectPathMissing(storePath);
+    await expectPathMissing(`${storePath}-state.json`);
   });
 
-  it("recreates a missing state sidecar without rewriting unchanged config", async () => {
+  it("leaves legacy sidecars absent after idempotent saves", async () => {
     const store = await makeStorePath();
-    const statePath = store.storePath.replace(/\.json$/, "-state.json");
     const payload = makeStore("job-1", true);
-    payload.jobs[0].state = { nextRunAtMs: payload.jobs[0].createdAtMs + 60_000 };
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").state = {
+      nextRunAtMs:
+        expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs + 60_000,
+    };
 
     await saveCronStore(store.storePath, payload);
     await loadCronStore(store.storePath);
-    const configRawBefore = await fs.readFile(store.storePath, "utf-8");
-    await fs.rm(statePath);
-
-    const renamedDestinations = await captureRenameDestinations(() =>
-      saveCronStore(store.storePath, payload),
-    );
-
-    const configRawAfter = await fs.readFile(store.storePath, "utf-8");
-    const stateFile = JSON.parse(await fs.readFile(statePath, "utf-8"));
-
-    expect(configRawAfter).toBe(configRawBefore);
-    expect(renamedDestinations).toContain(statePath);
-    expect(renamedDestinations).not.toContain(store.storePath);
-    expect(stateFile.jobs["job-1"].state.nextRunAtMs).toBe(payload.jobs[0].createdAtMs + 60_000);
-  });
-
-  it("recreates a missing config file without rewriting unchanged state", async () => {
-    const store = await makeStorePath();
-    const statePath = store.storePath.replace(/\.json$/, "-state.json");
-    const payload = makeStore("job-1", true);
-    payload.jobs[0].state = { nextRunAtMs: payload.jobs[0].createdAtMs + 60_000 };
-
     await saveCronStore(store.storePath, payload);
-    await loadCronStore(store.storePath);
-    const stateRawBefore = await fs.readFile(statePath, "utf-8");
-    await fs.rm(store.storePath);
 
-    const renamedDestinations = await captureRenameDestinations(() =>
-      saveCronStore(store.storePath, payload),
+    await expectPathMissing(store.storePath);
+    await expectPathMissing(store.storePath.replace(/\.json$/, "-state.json"));
+    expect((await loadCronStore(store.storePath)).jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs + 60_000,
     );
-
-    const config = JSON.parse(await fs.readFile(store.storePath, "utf-8"));
-    const stateRawAfter = await fs.readFile(statePath, "utf-8");
-
-    expect(config.jobs[0].id).toBe("job-1");
-    expect(config.jobs[0].state).toStrictEqual({});
-    expect(stateRawAfter).toBe(stateRawBefore);
-    expect(renamedDestinations).toContain(store.storePath);
-    expect(renamedDestinations).not.toContain(statePath);
   });
 
-  it("migrates legacy inline state into the state sidecar", async () => {
+  it("lets doctor migrate legacy inline state into SQLite", async () => {
     const store = await makeStorePath();
-    const statePath = store.storePath.replace(/\.json$/, "-state.json");
     const legacy = makeStore("job-1", true);
-    legacy.jobs[0].state = {
-      lastRunAtMs: legacy.jobs[0].createdAtMs + 30_000,
-      nextRunAtMs: legacy.jobs[0].createdAtMs + 60_000,
+    expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").state = {
+      lastRunAtMs:
+        expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 30_000,
+      nextRunAtMs:
+        expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 60_000,
     };
 
     await fs.mkdir(path.dirname(store.storePath), { recursive: true });
     await fs.writeFile(store.storePath, JSON.stringify(legacy, null, 2), "utf-8");
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
     await saveCronStore(store.storePath, loaded);
+    await archiveLegacyCronStoreForMigration(store.storePath);
 
-    const config = JSON.parse(await fs.readFile(store.storePath, "utf-8"));
-    const stateFile = JSON.parse(await fs.readFile(statePath, "utf-8"));
-
-    expect(config.jobs[0]).not.toHaveProperty("updatedAtMs");
-    expect(config.jobs[0].state).toStrictEqual({});
-    expect(stateFile.jobs["job-1"].updatedAtMs).toBe(legacy.jobs[0].updatedAtMs);
-    expect(stateFile.jobs["job-1"].state.nextRunAtMs).toBe(legacy.jobs[0].createdAtMs + 60_000);
+    const roundTrip = await loadCronStore(store.storePath);
+    expect(roundTrip.jobs[0]?.updatedAtMs).toBe(
+      expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").updatedAtMs,
+    );
+    expect(roundTrip.jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 60_000,
+    );
+    await expectPathMissing(store.storePath);
+    expect(await fs.stat(`${store.storePath}.migrated`)).toBeTruthy();
   });
 
-  it("ignores array-shaped state sidecars when migrating legacy inline state", async () => {
+  it("ignores array-shaped state sidecars when doctor migrates legacy inline state", async () => {
     const store = await makeStorePath();
     const statePath = store.storePath.replace(/\.json$/, "-state.json");
     // Numeric-looking IDs catch accidental array indexing in invalid sidecars.
     const legacy = makeStore("0", true);
-    legacy.jobs[0].state = {
-      lastRunAtMs: legacy.jobs[0].createdAtMs + 30_000,
-      nextRunAtMs: legacy.jobs[0].createdAtMs + 60_000,
+    expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").state = {
+      lastRunAtMs:
+        expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 30_000,
+      nextRunAtMs:
+        expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 60_000,
     };
     const staleSidecar = {
       ...legacy,
       jobs: [
         {
           ...legacy.jobs[0],
-          updatedAtMs: legacy.jobs[0].updatedAtMs + 10_000,
+          updatedAtMs:
+            expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").updatedAtMs + 10_000,
           state: {
-            nextRunAtMs: legacy.jobs[0].createdAtMs + 120_000,
+            nextRunAtMs:
+              expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 120_000,
           },
         },
       ],
@@ -619,39 +1151,60 @@ describe("cron store", () => {
     await fs.writeFile(store.storePath, JSON.stringify(legacy, null, 2), "utf-8");
     await fs.writeFile(statePath, JSON.stringify(staleSidecar, null, 2), "utf-8");
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
     await saveCronStore(store.storePath, loaded);
+    await archiveLegacyCronStoreForMigration(store.storePath);
 
-    const stateFile = JSON.parse(await fs.readFile(statePath, "utf-8"));
-
-    expect(loaded.jobs[0]?.updatedAtMs).toBe(legacy.jobs[0].updatedAtMs);
-    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(legacy.jobs[0].createdAtMs + 60_000);
-    expect(Array.isArray(stateFile.jobs)).toBe(false);
-    expect(stateFile.jobs["0"].updatedAtMs).toBe(legacy.jobs[0].updatedAtMs);
-    expect(stateFile.jobs["0"].state.nextRunAtMs).toBe(legacy.jobs[0].createdAtMs + 60_000);
+    expect(loaded.jobs[0]?.updatedAtMs).toBe(
+      expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").updatedAtMs,
+    );
+    expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(
+      expectDefined(legacy.jobs[0], "legacy.jobs[0] test invariant").createdAtMs + 60_000,
+    );
+    await expectPathMissing(statePath);
+    expect(await fs.stat(`${statePath}.migrated`)).toBeTruthy();
   });
 
-  it("treats a corrupt state sidecar as absent", async () => {
+  it("treats a corrupt state sidecar as absent during doctor migration", async () => {
     const store = await makeStorePath();
     const payload = makeStore("job-1", true);
-    payload.jobs[0].state = { nextRunAtMs: payload.jobs[0].createdAtMs + 60_000 };
+    expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").state = {
+      nextRunAtMs:
+        expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs + 60_000,
+    };
     const statePath = store.storePath.replace(/\.json$/, "-state.json");
 
-    await saveCronStore(store.storePath, payload);
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(
+      store.storePath,
+      JSON.stringify(
+        {
+          version: 1,
+          jobs: payload.jobs.map((job) => ({ ...job, state: {}, updatedAtMs: undefined })),
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
     await fs.writeFile(statePath, "{ not json", "utf-8");
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
 
-    expect(loaded.jobs[0]?.updatedAtMs).toBe(payload.jobs[0].createdAtMs);
+    expect(loaded.jobs[0]?.updatedAtMs).toBe(
+      expectDefined(payload.jobs[0], "payload.jobs[0] test invariant").createdAtMs,
+    );
     expect(loaded.jobs[0]?.state).toStrictEqual({});
   });
 
-  it("propagates unreadable state sidecar errors", async () => {
+  it("propagates unreadable state sidecar errors during doctor migration", async () => {
     const store = await makeStorePath();
     const payload = makeStore("job-1", true);
     const statePath = store.storePath.replace(/\.json$/, "-state.json");
 
-    await saveCronStore(store.storePath, payload);
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(store.storePath, JSON.stringify(payload, null, 2), "utf-8");
+    await fs.writeFile(statePath, JSON.stringify({ version: 1, jobs: {} }), "utf-8");
 
     const origReadFile = fs.readFile.bind(fs);
     const spy = vi.spyOn(fs, "readFile").mockImplementation(async (filePath, options) => {
@@ -664,15 +1217,20 @@ describe("cron store", () => {
     });
 
     try {
-      await expect(loadCronStore(store.storePath)).rejects.toThrow(/Failed to read cron state/);
+      await expect(loadLegacyCronStoreForMigration(store.storePath)).rejects.toThrow(
+        /Failed to read cron state/,
+      );
     } finally {
       spy.mockRestore();
     }
   });
 
-  it("sanitizes invalid updatedAtMs values from the state sidecar", async () => {
+  it("sanitizes invalid updatedAtMs values from the state sidecar during doctor migration", async () => {
     const store = await makeStorePath();
-    const job = makeStore("job-1", true).jobs[0];
+    const job = expectDefined(
+      makeStore("job-1", true).jobs[0],
+      'makeStore("job-1", true).jobs[0] test invariant',
+    );
     const config = {
       version: 1,
       jobs: [{ ...job, state: {}, updatedAtMs: undefined }],
@@ -699,16 +1257,22 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
 
     expect(loaded.jobs[0]?.updatedAtMs).toBe(job.createdAtMs);
     expect(loaded.jobs[0]?.state.nextRunAtMs).toBe(job.createdAtMs + 60_000);
   });
 
-  it("drops non-object runtime state from split cron sidecars", async () => {
+  it("drops non-object runtime state from split cron sidecars during doctor migration", async () => {
     const store = await makeStorePath();
-    const first = makeStore("job-array-state", true).jobs[0];
-    const second = makeStore("job-scalar-entry", true).jobs[0];
+    const first = expectDefined(
+      makeStore("job-array-state", true).jobs[0],
+      'makeStore("job-array-state", true).jobs[0] test invariant',
+    );
+    const second = expectDefined(
+      makeStore("job-scalar-entry", true).jobs[0],
+      'makeStore("job-scalar-entry", true).jobs[0] test invariant',
+    );
     const config = {
       version: 1,
       jobs: [
@@ -739,7 +1303,7 @@ describe("cron store", () => {
       "utf-8",
     );
 
-    const loaded = await loadCronStore(store.storePath);
+    const loaded = (await loadLegacyCronStoreForMigration(store.storePath)).store;
 
     expect(loaded.jobs[0]?.updatedAtMs).toBe(first.createdAtMs + 60_000);
     expect(loaded.jobs[0]?.state).toStrictEqual({});
@@ -747,38 +1311,15 @@ describe("cron store", () => {
     expect(loaded.jobs[1]?.state).toStrictEqual({});
   });
 
-  it.skipIf(process.platform === "win32")(
-    "writes store and backup files with secure permissions",
-    async () => {
-      const store = await makeStorePath();
-      const first = makeStore("job-1", true);
-      const second = makeStore("job-2", false);
+  it("does not create legacy store or backup files for new SQLite writes", async () => {
+    const store = await makeStorePath();
+    await saveCronStore(store.storePath, makeStore("job-1", true));
+    await saveCronStore(store.storePath, makeStore("job-2", false));
 
-      await saveCronStore(store.storePath, first);
-      await saveCronStore(store.storePath, second);
-
-      const storeMode = (await fs.stat(store.storePath)).mode & 0o777;
-      const backupMode = (await fs.stat(`${store.storePath}.bak`)).mode & 0o777;
-
-      expect(storeMode).toBe(0o600);
-      expect(backupMode).toBe(0o600);
-    },
-  );
-
-  it.skipIf(process.platform === "win32")(
-    "hardens an existing cron store directory to owner-only permissions",
-    async () => {
-      const store = await makeStorePath();
-      const storeDir = path.dirname(store.storePath);
-      await fs.mkdir(storeDir, { recursive: true, mode: 0o755 });
-      await fs.chmod(storeDir, 0o755);
-
-      await saveCronStore(store.storePath, makeStore("job-1", true));
-
-      const storeDirMode = (await fs.stat(storeDir)).mode & 0o777;
-      expect(storeDirMode).toBe(0o700);
-    },
-  );
+    await expectPathMissing(store.storePath);
+    await expectPathMissing(store.storePath.replace(/\.json$/, "-state.json"));
+    await expectPathMissing(`${store.storePath}.bak`);
+  });
 });
 
 describe("saveCronStore", () => {
@@ -795,49 +1336,11 @@ describe("saveCronStore", () => {
     expect(loaded).toEqual(dummyStore);
   });
 
-  it("retries rename on EBUSY then succeeds", async () => {
+  it("does not use legacy file writes on SQLite saves", async () => {
     const { storePath } = await makeStorePath();
-    const setTimeoutSpy = vi
-      .spyOn(globalThis, "setTimeout")
-      .mockImplementation(((handler: TimerHandler, _timeout?: number, ...args: unknown[]) =>
-        scheduleNativeTimeout(handler, 0, ...args)) as typeof setTimeout);
-    const origRename = fs.rename.bind(fs);
-    let ebusyCount = 0;
-    const spy = vi.spyOn(fs, "rename").mockImplementation(async (src, dest) => {
-      if (ebusyCount < 2) {
-        ebusyCount++;
-        const err = new Error("EBUSY") as NodeJS.ErrnoException;
-        err.code = "EBUSY";
-        throw err;
-      }
-      return origRename(src, dest);
-    });
-
-    try {
-      await saveCronStore(storePath, dummyStore);
-
-      expect(ebusyCount).toBe(2);
-      const loaded = await loadCronStore(storePath);
-      expect(loaded).toEqual(dummyStore);
-    } finally {
-      spy.mockRestore();
-      setTimeoutSpy.mockRestore();
-    }
-  });
-
-  it("falls back to copyFile on EPERM (Windows)", async () => {
-    const { storePath } = await makeStorePath();
-
-    const spy = vi.spyOn(fs, "rename").mockImplementation(async () => {
-      const err = new Error("EPERM") as NodeJS.ErrnoException;
-      err.code = "EPERM";
-      throw err;
-    });
-
     await saveCronStore(storePath, dummyStore);
-    const loaded = await loadCronStore(storePath);
-    expect(loaded).toEqual(dummyStore);
-
-    spy.mockRestore();
+    await expectPathMissing(storePath);
+    await expectPathMissing(`${storePath}.bak`);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -1,4 +1,10 @@
+/** CLI command orchestration for migration list, plan, and apply flows. */
 import { cancel, confirm, isCancel, log } from "@clack/prompts";
+import {
+  stylePromptHint,
+  stylePromptMessage,
+  stylePromptTitle,
+} from "../../packages/terminal-core/src/prompt-style.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { withProgress } from "../cli/progress.js";
 import { promptYesNo } from "../cli/prompt.js";
@@ -11,8 +17,8 @@ import {
 import type { MigrationApplyResult, MigrationPlan } from "../plugins/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
-import { stylePromptHint, stylePromptMessage, stylePromptTitle } from "../terminal/prompt-style.js";
 import { runMigrationApply } from "./migrate/apply.js";
+import { applyMigrationItemSelection } from "./migrate/item-selection.js";
 import { formatMigrationPreview } from "./migrate/output.js";
 import { createMigrationPlan, resolveMigrationProvider } from "./migrate/providers.js";
 import {
@@ -36,19 +42,17 @@ import {
   resolveInteractiveMigrationPluginSelection,
   resolveInteractiveMigrationSkillSelection,
 } from "./migrate/selection.js";
-import { promptMigrationSelectionValues } from "./migrate/skill-selection-prompt.js";
+import { promptMigrationSkillSelectionValues } from "./migrate/skill-selection-prompt.js";
 import type {
   MigrateApplyOptions,
   MigrateCommonOptions,
   MigrateDefaultOptions,
 } from "./migrate/types.js";
 
-export type { MigrateApplyOptions, MigrateCommonOptions, MigrateDefaultOptions };
-
 function selectMigrationItems(plan: MigrationPlan, opts: MigrateCommonOptions): MigrationPlan {
-  return applyMigrationPluginSelection(
-    applyMigrationSkillSelection(plan, opts.skills),
-    opts.plugins,
+  return applyMigrationItemSelection(
+    applyMigrationPluginSelection(applyMigrationSkillSelection(plan, opts.skills), opts.plugins),
+    opts.itemIds,
   );
 }
 
@@ -100,9 +104,9 @@ async function createMigrationPlanWithProgress(
     { label: `Scanning ${opts.provider} migration…`, indeterminate: true },
     async (progress) => {
       progress.setLabel("Reading migration source…");
-      const plan = await createPlan();
+      const planLocal = await createPlan();
       progress.tick();
-      return plan;
+      return planLocal;
     },
   );
   return selectMigrationItems(plan, opts);
@@ -126,6 +130,8 @@ async function createInteractiveMigrationPlanWithAuthPrompt(
     }
     return initialPlan;
   }
+  // Build the first plan without secrets, then only rescan with secrets after
+  // explicit consent so credential handling is opt-in for interactive users.
   const includeSecrets = await confirm({
     message: stylePromptMessage("Do you want to migrate your auth credentials as well?"),
     initialValue: true,
@@ -172,7 +178,7 @@ async function promptCodexMigrationSkillSelection(
   if (skillItems.length === 0) {
     return plan;
   }
-  const selected = await promptMigrationSelectionValues({
+  const selected = await promptMigrationSkillSelectionValues({
     message: stylePromptMessage("Select Codex skills to migrate into this agent"),
     options: [
       {
@@ -198,7 +204,6 @@ async function promptCodexMigrationSkillSelection(
       },
     ],
     initialValues: getDefaultMigrationSkillSelectionValues(skillItems),
-    required: false,
     selectableValues: skillItems.map(getMigrationSkillSelectionValue),
     cursorAt: MIGRATION_SELECTION_ACCEPT,
   });
@@ -233,7 +238,7 @@ async function promptCodexMigrationPluginSelection(
   if (pluginItems.length === 0) {
     return plan;
   }
-  const selected = await promptMigrationSelectionValues({
+  const selected = await promptMigrationSkillSelectionValues({
     message: stylePromptMessage("Select native Codex plugins to activate in this agent"),
     options: [
       {
@@ -259,7 +264,6 @@ async function promptCodexMigrationPluginSelection(
       },
     ],
     initialValues: getDefaultMigrationPluginSelectionValues(pluginItems),
-    required: false,
     selectableValues: pluginItems.map(getMigrationPluginSelectionValue),
     cursorAt: MIGRATION_SELECTION_ACCEPT,
   });
@@ -330,6 +334,7 @@ function logNoCodexSelection(runtime: RuntimeEnv, plan: MigrationPlan): void {
   runtime.log("No Codex skills or native Codex plugins selected for migration.");
 }
 
+/** Lists available migration providers as JSON or terse terminal rows. */
 export async function migrateListCommand(runtime: RuntimeEnv, opts: { json?: boolean } = {}) {
   const cfg = getRuntimeConfig();
   ensureStandaloneMigrationProviderRegistryLoaded({ cfg });
@@ -359,6 +364,7 @@ export async function migrateListCommand(runtime: RuntimeEnv, opts: { json?: boo
   );
 }
 
+/** Creates and prints a migration plan without applying it. */
 export async function migratePlanCommand(
   runtime: RuntimeEnv,
   opts: MigrateCommonOptions,
@@ -383,10 +389,12 @@ export async function migratePlanCommand(
   return plan;
 }
 
+/** Applies a migration non-interactively when `yes` is true. */
 export async function migrateApplyCommand(
   runtime: RuntimeEnv,
   opts: MigrateApplyOptions & { yes: true },
 ): Promise<MigrationApplyResult>;
+/** Plans interactively when needed, prompts, then applies the selected migration. */
 export async function migrateApplyCommand(
   runtime: RuntimeEnv,
   opts: MigrateApplyOptions,
@@ -454,6 +462,7 @@ export async function migrateApplyCommand(
   });
 }
 
+/** Default migrate command: list providers, plan, dry-run, or apply based on flags. */
 export async function migrateDefaultCommand(
   runtime: RuntimeEnv,
   opts: MigrateDefaultOptions,

@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+// Checks core web-fetch surfaces for provider-owned Firecrawl coupling.
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import { collectSourceFileContents } from "./lib/source-file-scan-cache.mjs";
 import { runAsScript } from "./lib/ts-guard-utils.mjs";
-
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = resolveRepoRoot(import.meta.url);
 const scanExtensions = new Set([".ts", ".js", ".mjs", ".cjs"]);
 const ignoredDirNames = new Set([
   ".artifacts",
@@ -34,6 +33,9 @@ const suspiciousPatterns = [
 
 let webFetchProviderViolationsPromise;
 
+/**
+ * Collects web-fetch provider boundary violations in core source files.
+ */
 export async function collectWebFetchProviderBoundaryViolations() {
   if (!webFetchProviderViolationsPromise) {
     webFetchProviderViolationsPromise = (async () => {
@@ -81,6 +83,9 @@ export async function collectWebFetchProviderBoundaryViolations() {
   return await webFetchProviderViolationsPromise;
 }
 
+/**
+ * Runs the web-fetch provider boundary check.
+ */
 export async function main(argv, io) {
   const args = argv ?? process.argv.slice(2);
   const json = args.includes("--json");

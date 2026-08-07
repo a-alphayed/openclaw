@@ -1,12 +1,10 @@
+// Shares plugin config normalization helpers across control-plane paths.
+import { normalizeArrayBackedTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import { normalizeChatChannelId } from "../channels/ids.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { normalizeArrayBackedTrimmedStringList } from "../shared/string-normalization.js";
-import { defaultSlotIdForKey } from "./slots.js";
+import { normalizeSlotValue, resolveSlotSelection } from "./slots.js";
 
+/** Canonical plugin config shape consumed by runtime policy and loaders. */
 export type NormalizedPluginsConfig = {
   enabled: boolean;
   allow: string[];
@@ -35,6 +33,9 @@ export type NormalizedPluginsConfig = {
         allowModelOverride?: boolean;
         allowedModels?: string[];
         hasAllowedModelsConfig?: boolean;
+        allowedCompletionModels?: string[];
+        hasAllowedCompletionModelsConfig?: boolean;
+        allowAuthProfileOverride?: boolean;
         allowAgentIdOverride?: boolean;
       };
       config?: unknown;
@@ -42,8 +43,10 @@ export type NormalizedPluginsConfig = {
   >;
 };
 
+/** Plugin id normalizer used while loading aliases or raw config. */
 export type NormalizePluginId = (id: string) => string;
 
+/** Default plugin id normalizer for already-canonical ids. */
 export const identityNormalizePluginId: NormalizePluginId = (id) => id.trim();
 
 function normalizeList(value: unknown, normalizePluginId: NormalizePluginId): string[] {
@@ -53,17 +56,6 @@ function normalizeList(value: unknown, normalizePluginId: NormalizePluginId): st
   return value
     .map((entry) => (typeof entry === "string" ? normalizePluginId(entry) : ""))
     .filter(Boolean);
-}
-
-function normalizeSlotValue(value: unknown): string | null | undefined {
-  const trimmed = normalizeOptionalString(value);
-  if (!trimmed) {
-    return undefined;
-  }
-  if (normalizeOptionalLowercaseString(trimmed) === "none") {
-    return null;
-  }
-  return trimmed;
 }
 
 function normalizeHookTimeoutMs(value: unknown): number | undefined {
@@ -184,6 +176,18 @@ function normalizePluginEntries(
                   (llmRaw as { allowedModels?: unknown }).allowedModels,
                 )
               : undefined,
+            hasAllowedCompletionModelsConfig: Array.isArray(
+              (llmRaw as { allowedCompletionModels?: unknown }).allowedCompletionModels,
+            ),
+            allowedCompletionModels: Array.isArray(
+              (llmRaw as { allowedCompletionModels?: unknown }).allowedCompletionModels,
+            )
+              ? normalizeArrayBackedTrimmedStringList(
+                  (llmRaw as { allowedCompletionModels?: unknown }).allowedCompletionModels,
+                )
+              : undefined,
+            allowAuthProfileOverride: (llmRaw as { allowAuthProfileOverride?: unknown })
+              .allowAuthProfileOverride,
             allowAgentIdOverride: (llmRaw as { allowAgentIdOverride?: unknown })
               .allowAgentIdOverride,
           }
@@ -193,6 +197,9 @@ function normalizePluginEntries(
       (typeof llm.allowModelOverride === "boolean" ||
         llm.hasAllowedModelsConfig ||
         (Array.isArray(llm.allowedModels) && llm.allowedModels.length > 0) ||
+        llm.hasAllowedCompletionModelsConfig ||
+        (Array.isArray(llm.allowedCompletionModels) && llm.allowedCompletionModels.length > 0) ||
+        typeof llm.allowAuthProfileOverride === "boolean" ||
         typeof llm.allowAgentIdOverride === "boolean")
         ? {
             ...(typeof llm.allowModelOverride === "boolean"
@@ -201,6 +208,15 @@ function normalizePluginEntries(
             ...(llm.hasAllowedModelsConfig ? { hasAllowedModelsConfig: true } : {}),
             ...(Array.isArray(llm.allowedModels) && llm.allowedModels.length > 0
               ? { allowedModels: llm.allowedModels }
+              : {}),
+            ...(llm.hasAllowedCompletionModelsConfig
+              ? { hasAllowedCompletionModelsConfig: true }
+              : {}),
+            ...(Array.isArray(llm.allowedCompletionModels) && llm.allowedCompletionModels.length > 0
+              ? { allowedCompletionModels: llm.allowedCompletionModels }
+              : {}),
+            ...(typeof llm.allowAuthProfileOverride === "boolean"
+              ? { allowAuthProfileOverride: llm.allowAuthProfileOverride }
               : {}),
             ...(typeof llm.allowAgentIdOverride === "boolean"
               ? { allowAgentIdOverride: llm.allowAgentIdOverride }
@@ -220,18 +236,19 @@ function normalizePluginEntries(
   return normalized;
 }
 
+/** Normalizes plugin config while allowing callers to resolve aliases first. */
 export function normalizePluginsConfigWithResolver(
   config?: OpenClawConfig["plugins"],
   normalizePluginId: NormalizePluginId = identityNormalizePluginId,
 ): NormalizedPluginsConfig {
-  const memorySlot = normalizeSlotValue(config?.slots?.memory);
+  const memorySlot = resolveSlotSelection("memory", config?.slots?.memory);
   return {
     enabled: config?.enabled !== false,
     allow: normalizeList(config?.allow, normalizePluginId),
     deny: normalizeList(config?.deny, normalizePluginId),
     loadPaths: normalizeList(config?.load?.paths, identityNormalizePluginId),
     slots: {
-      memory: memorySlot === undefined ? defaultSlotIdForKey("memory") : memorySlot,
+      memory: memorySlot.kind === "off" ? null : memorySlot.pluginId,
       contextEngine: normalizeSlotValue(config?.slots?.contextEngine),
     },
     entries: normalizePluginEntries(config?.entries, normalizePluginId),

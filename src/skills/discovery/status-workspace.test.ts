@@ -1,3 +1,4 @@
+// Workspace status tests cover status output for workspace-local skills.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -39,7 +40,7 @@ function makeEntry(params: {
   const filePath = `/tmp/${params.name}/SKILL.md`;
   const baseDir = `/tmp/${params.name}`;
   return {
-    skill: createFixtureSkill({
+    skill: createCanonicalFixtureSkill({
       name: params.name,
       description: `desc:${params.name}`,
       filePath,
@@ -54,16 +55,6 @@ function makeEntry(params: {
       ...(params.requires?.env?.[0] ? { primaryEnv: params.requires.env[0] } : {}),
     },
   };
-}
-
-function createFixtureSkill(params: {
-  name: string;
-  description: string;
-  filePath: string;
-  baseDir: string;
-  source: string;
-}): SkillEntry["skill"] {
-  return createCanonicalFixtureSkill(params);
 }
 
 type WorkspaceSkillStatus = ReturnType<typeof buildWorkspaceSkillStatus>["skills"][number];
@@ -87,6 +78,25 @@ function requireSkillEntry(entry: SkillEntry | undefined, name: string): SkillEn
 }
 
 describe("buildWorkspaceSkillStatus", () => {
+  it("keeps config-disabled skills visible in status when eligibility is passed", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    await writeSkill({
+      dir: path.join(workspaceDir, "skills"),
+      name: "hot-reload-probe",
+      description: "Lifecycle probe",
+    });
+
+    // Regression: skills.status passes eligibility (node-skill merge); the
+    // loader must stay unfiltered so disabled skills still report with flags.
+    const report = buildWorkspaceSkillStatus(workspaceDir, {
+      config: { skills: { entries: { "hot-reload-probe": { enabled: false } } } },
+      eligibility: { nodeSkills: { canExec: false } },
+    });
+    const skill = requireReportedSkill(report, "hot-reload-probe");
+
+    expect(skill.disabled).toBe(true);
+  });
+
   it("reports missing requirements and install options", () => {
     const entry = makeEntry({
       name: "status-skill",

@@ -1,3 +1,10 @@
+/**
+ * Helpers for capturing the latest subagent completion reply after a run ends.
+ *
+ * Completion output can lag behind lifecycle state, so callers can retry briefly
+ * before sending an empty or stale announcement.
+ */
+/** Reads subagent output repeatedly until non-empty text appears or the bounded wait expires. */
 export async function readLatestSubagentOutputWithRetryUsing<Outcome = unknown>(params: {
   sessionKey: string;
   maxWaitMs: number;
@@ -6,24 +13,28 @@ export async function readLatestSubagentOutputWithRetryUsing<Outcome = unknown>(
   readSubagentOutput: (sessionKey: string, outcome?: Outcome) => Promise<string | undefined>;
 }): Promise<string | undefined> {
   const maxWaitMs = Math.max(0, Math.min(params.maxWaitMs, 15_000));
-  let waitedMs = 0;
-  let result: string | undefined;
-  while (waitedMs < maxWaitMs) {
-    result = await params.readSubagentOutput(params.sessionKey, params.outcome);
+  if (!(maxWaitMs > 0)) {
+    return undefined;
+  }
+  const deadlineAt = performance.now() + maxWaitMs;
+  for (;;) {
+    const result = await params.readSubagentOutput(params.sessionKey, params.outcome);
     if (result?.trim()) {
       return result;
     }
-    const remainingMs = maxWaitMs - waitedMs;
+    const remainingMs = deadlineAt - performance.now();
     if (remainingMs <= 0) {
-      break;
+      return result;
     }
     const sleepMs = Math.min(params.retryIntervalMs, remainingMs);
-    await new Promise((resolve) => setTimeout(resolve, sleepMs));
-    waitedMs += sleepMs;
+    // Use real timers here; tests provide fake timers around this small retry loop.
+    await new Promise((resolve) => {
+      setTimeout(resolve, sleepMs);
+    });
   }
-  return result;
 }
 
+/** Captures immediate output first, then optionally waits for a delayed completion reply. */
 export async function captureSubagentCompletionReplyUsing(params: {
   sessionKey: string;
   waitForReply?: boolean;

@@ -1,3 +1,4 @@
+// Channel setup plugin install/reload helpers used by onboarding and channel commands.
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import type { ChannelPluginCatalogEntry } from "../../channels/plugins/catalog.js";
 import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
@@ -7,7 +8,7 @@ import {
   resolveConfiguredChannelPluginIds,
   resolveDiscoverableScopedChannelPluginIds,
 } from "../../plugins/channel-plugin-ids.js";
-import { loadOpenClawPlugins } from "../../plugins/loader.js";
+import { loadPluginRegistryHandle } from "../../plugins/loader.js";
 import { createPluginLoaderLogger } from "../../plugins/logger.js";
 import type { PluginRegistry } from "../../plugins/registry.js";
 import type { RuntimeEnv } from "../../runtime.js";
@@ -39,6 +40,7 @@ function toOnboardingPluginInstallEntry(
   };
 }
 
+/** Install or reuse the plugin package required by a trusted channel catalog entry. */
 export async function ensureChannelSetupPluginInstalled(params: {
   cfg: OpenClawConfig;
   entry: ChannelPluginCatalogEntry;
@@ -47,6 +49,7 @@ export async function ensureChannelSetupPluginInstalled(params: {
   workspaceDir?: string;
   promptInstall?: boolean;
   autoConfirmSingleSource?: boolean;
+  beforePersistentEffect?: () => Promise<void>;
 }): Promise<InstallResult> {
   const result = await ensureOnboardingPluginInstalled({
     cfg: params.cfg,
@@ -58,6 +61,9 @@ export async function ensureChannelSetupPluginInstalled(params: {
     ...(params.autoConfirmSingleSource !== undefined
       ? { autoConfirmSingleSource: params.autoConfirmSingleSource }
       : {}),
+    ...(params.beforePersistentEffect
+      ? { beforePersistentEffect: params.beforePersistentEffect }
+      : {}),
   });
   return {
     cfg: result.cfg,
@@ -67,20 +73,11 @@ export async function ensureChannelSetupPluginInstalled(params: {
   };
 }
 
-export function reloadChannelSetupPluginRegistry(params: {
-  cfg: OpenClawConfig;
-  runtime: RuntimeEnv;
-  workspaceDir?: string;
-}): void {
-  loadChannelSetupPluginRegistry(params);
-}
-
 function loadChannelSetupPluginRegistry(params: {
   cfg: OpenClawConfig;
   runtime: RuntimeEnv;
   workspaceDir?: string;
   onlyPluginIds?: string[];
-  activate?: boolean;
   forceSetupOnlyChannelPlugins?: boolean;
 }): PluginRegistry {
   const autoEnabled = applyPluginAutoEnable({ config: params.cfg, env: process.env });
@@ -97,7 +94,7 @@ function loadChannelSetupPluginRegistry(params: {
       env: process.env,
     });
   const log = createSubsystemLogger("plugins");
-  return loadOpenClawPlugins({
+  return loadPluginRegistryHandle({
     config: resolvedConfig,
     activationSourceConfig: params.cfg,
     autoEnabledReasons: autoEnabled.autoEnabledReasons,
@@ -107,7 +104,7 @@ function loadChannelSetupPluginRegistry(params: {
     onlyPluginIds,
     includeSetupOnlyChannelPlugins: true,
     forceSetupOnlyChannelPlugins: params.forceSetupOnlyChannelPlugins,
-    activate: params.activate,
+    channelPluginLoadIntent: "setup",
   });
 }
 
@@ -143,25 +140,7 @@ function resolveUniqueManifestScopedChannelPluginId(params: {
   return matches.length === 1 ? matches[0] : undefined;
 }
 
-export function reloadChannelSetupPluginRegistryForChannel(params: {
-  cfg: OpenClawConfig;
-  runtime: RuntimeEnv;
-  channel: string;
-  pluginId?: string;
-  workspaceDir?: string;
-}): void {
-  const scopedPluginId = resolveScopedChannelPluginId({
-    cfg: params.cfg,
-    channel: params.channel,
-    pluginId: params.pluginId,
-    workspaceDir: params.workspaceDir,
-  });
-  loadChannelSetupPluginRegistry({
-    ...params,
-    ...(scopedPluginId ? { onlyPluginIds: [scopedPluginId] } : {}),
-  });
-}
-
+/** Load an inactive setup-plugin registry snapshot for resolving a channel without side effects. */
 export function loadChannelSetupPluginRegistrySnapshotForChannel(params: {
   cfg: OpenClawConfig;
   runtime: RuntimeEnv;
@@ -179,6 +158,5 @@ export function loadChannelSetupPluginRegistrySnapshotForChannel(params: {
   return loadChannelSetupPluginRegistry({
     ...params,
     ...(scopedPluginId ? { onlyPluginIds: [scopedPluginId] } : {}),
-    activate: false,
   });
 }

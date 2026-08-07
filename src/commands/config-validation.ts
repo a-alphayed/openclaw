@@ -1,3 +1,4 @@
+// Config validation helpers shared by commands that need fail-fast config loading.
 import { formatCliCommand } from "../cli/command-format.js";
 import { formatPluginPackagingRuntimeOutputRecoveryHint } from "../cli/config-recovery-hints.js";
 import {
@@ -13,11 +14,14 @@ import {
 } from "../plugins/status.js";
 import type { RuntimeEnv } from "../runtime.js";
 
+/** Read the config file and exit through the runtime when validation fails. */
 export async function requireValidConfigFileSnapshot(
   runtime: RuntimeEnv,
-  opts?: { includeCompatibilityAdvisory?: boolean },
+  opts?: { includeCompatibilityAdvisory?: boolean; skipPluginValidation?: boolean },
 ): Promise<ConfigFileSnapshot | null> {
-  const snapshot = await readConfigFileSnapshot();
+  const snapshot = await readConfigFileSnapshot(
+    opts?.skipPluginValidation ? { skipPluginValidation: true } : undefined,
+  );
   if (snapshot.exists && !snapshot.valid) {
     const issues =
       snapshot.issues.length > 0
@@ -52,9 +56,10 @@ export async function requireValidConfigFileSnapshot(
   return snapshot;
 }
 
+/** Read and return a valid OpenClaw config, or null after reporting validation errors. */
 export async function requireValidConfigSnapshot(
   runtime: RuntimeEnv,
-  opts?: { includeCompatibilityAdvisory?: boolean },
+  opts?: { includeCompatibilityAdvisory?: boolean; skipPluginValidation?: boolean },
 ): Promise<OpenClawConfig | null> {
   return (await requireValidConfigFileSnapshot(runtime, opts))?.config ?? null;
 }

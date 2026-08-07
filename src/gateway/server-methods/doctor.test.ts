@@ -1,10 +1,16 @@
+/**
+ * Tests for doctor gateway methods and repair command dispatch.
+ */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../config/config.js";
 
 const getRuntimeConfig = vi.hoisted(() => vi.fn(() => ({}) as OpenClawConfig));
+const listAgentIds = vi.hoisted(() => vi.fn(() => ["main", "research-analyst", "alpha"]));
 const resolveDefaultAgentId = vi.hoisted(() => vi.fn(() => "main"));
 const resolveAgentWorkspaceDir = vi.hoisted(() =>
   vi.fn((_cfg: OpenClawConfig, _agentId: string) => "/tmp/openclaw"),
@@ -22,12 +28,24 @@ const writeBackfillDiaryEntries = vi.hoisted(() => vi.fn());
 const removeBackfillDiaryEntries = vi.hoisted(() => vi.fn());
 const removeGroundedShortTermCandidates = vi.hoisted(() => vi.fn());
 const repairDreamingArtifacts = vi.hoisted(() => vi.fn());
+const loadShortTermPromotionDreamingStats = vi.hoisted(() => vi.fn());
 
 vi.mock("../../config/config.js", () => ({
   getRuntimeConfig,
 }));
 
 vi.mock("../../agents/agent-scope.js", () => ({
+  listAgentIds,
+  listAgentEntries: (cfg: OpenClawConfig) =>
+    cfg.agents?.entries
+      ? Object.entries(cfg.agents.entries).map(([id, entry]) => {
+          const copy = structuredClone(entry) as Record<string, unknown>;
+          copy.id = id;
+          return copy;
+        })
+      : cfg.agents?.list
+        ? cfg.agents.list
+        : [{ id: "main", default: true }],
   resolveDefaultAgentId,
   resolveAgentWorkspaceDir,
 }));
@@ -42,6 +60,7 @@ vi.mock("../../plugins/memory-runtime.js", () => ({
 
 vi.mock("./doctor.memory-core-runtime.js", () => ({
   dedupeDreamDiaryEntries,
+  loadShortTermPromotionDreamingStats,
   previewGroundedRemMarkdown,
   previewRemHarness,
   writeBackfillDiaryEntries,
@@ -54,105 +73,42 @@ import { doctorHandlers } from "./doctor.js";
 
 const makeRuntimeContext = () => ({ getRuntimeConfig: () => getRuntimeConfig() });
 
-const invokeDoctorMemoryStatus = async (
+const DOCTOR_MEMORY_TARGET_METHODS = [
+  "doctor.memory.status",
+  "doctor.memory.dreamDiary",
+  "doctor.memory.backfillDreamDiary",
+  "doctor.memory.resetDreamDiary",
+  "doctor.memory.resetGroundedShortTerm",
+  "doctor.memory.repairDreamingArtifacts",
+  "doctor.memory.dedupeDreamDiary",
+] as const;
+
+type DoctorMemoryMethod =
+  | (typeof DOCTOR_MEMORY_TARGET_METHODS)[number]
+  | "doctor.memory.remHarness";
+
+const invokeDoctorMemory = async (
+  method: DoctorMemoryMethod,
   respond: ReturnType<typeof vi.fn>,
-  options?: { cron?: { list?: ReturnType<typeof vi.fn> }; params?: unknown },
+  options: {
+    params?: Record<string, unknown>;
+    cronList?: ReturnType<typeof vi.fn>;
+    includeCron?: boolean;
+  } = {},
 ) => {
-  const cronList =
-    options?.cron?.list ??
-    vi.fn(async () => {
-      return [];
-    });
-  await doctorHandlers["doctor.memory.status"]({
+  const cronList = options.cronList ?? vi.fn(async () => []);
+  const context =
+    method === "doctor.memory.status" || options.includeCron
+      ? { ...makeRuntimeContext(), cron: { list: cronList } }
+      : makeRuntimeContext();
+  await expectDefined(
+    doctorHandlers[method],
+    `doctorHandlers["${method}"] test invariant`,
+  )({
     req: {} as never,
-    params: (options?.params ?? {}) as never,
+    params: (options.params ?? {}) as never,
     respond: respond as never,
-    context: {
-      ...makeRuntimeContext(),
-      cron: {
-        list: cronList,
-      },
-    } as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryDreamDiary = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.dreamDiary"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryBackfillDreamDiary = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.backfillDreamDiary"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryResetDreamDiary = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.resetDreamDiary"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryResetGroundedShortTerm = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.resetGroundedShortTerm"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryRepairDreamingArtifacts = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.repairDreamingArtifacts"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryDedupeDreamDiary = async (respond: ReturnType<typeof vi.fn>) => {
-  await doctorHandlers["doctor.memory.dedupeDreamDiary"]({
-    req: {} as never,
-    params: {} as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
-    client: null,
-    isWebchatConnect: () => false,
-  });
-};
-
-const invokeDoctorMemoryRemHarness = async (
-  respond: ReturnType<typeof vi.fn>,
-  params: Record<string, unknown> = {},
-) => {
-  await doctorHandlers["doctor.memory.remHarness"]({
-    req: {} as never,
-    params: params as never,
-    respond: respond as never,
-    context: makeRuntimeContext() as never,
+    context: context as never,
     client: null,
     isWebchatConnect: () => false,
   });
@@ -192,6 +148,88 @@ function findRecordByField(items: unknown, key: string, value: unknown) {
   return (items as Array<Record<string, unknown>>).find((item) => item[key] === value);
 }
 
+function makeDreamingStats(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    shortTermCount: 0,
+    recallSignalCount: 0,
+    dailySignalCount: 0,
+    groundedSignalCount: 0,
+    totalSignalCount: 0,
+    phaseSignalCount: 0,
+    lightPhaseHitCount: 0,
+    remPhaseHitCount: 0,
+    promotedTotal: 0,
+    promotedToday: 0,
+    storePath: "plugin-state:memory-core/short-term-recall/test",
+    phaseSignalPath: "plugin-state:memory-core/short-term-phase-signals/test",
+    shortTermEntries: [],
+    signalEntries: [],
+    promotedEntries: [],
+    ...overrides,
+  };
+}
+
+type DreamingEntryFixture = {
+  key: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+  snippet: string;
+  recallCount: number;
+  dailyCount: number;
+  groundedCount: number;
+  totalSignalCount: number;
+  lightHits: number;
+  remHits: number;
+  phaseHitCount: number;
+  promotedAt?: string;
+  lastRecalledAt?: string;
+};
+
+function makeDreamingEntry(
+  entryPath: string,
+  overrides: Partial<DreamingEntryFixture> = {},
+): DreamingEntryFixture {
+  return {
+    key: `memory:${entryPath}:1:2`,
+    path: entryPath,
+    startLine: 1,
+    endLine: 2,
+    snippet: entryPath,
+    recallCount: 0,
+    dailyCount: 0,
+    groundedCount: 0,
+    totalSignalCount: 0,
+    lightHits: 0,
+    remHits: 0,
+    phaseHitCount: 0,
+    ...overrides,
+  };
+}
+
+type MemoryManagerFixtureOptions = {
+  status: () => Record<string, unknown>;
+  probeEmbeddingAvailability?: ReturnType<typeof vi.fn>;
+  getCachedEmbeddingAvailability?: ReturnType<typeof vi.fn>;
+};
+
+function useMemoryManagerFixture(options: MemoryManagerFixtureOptions) {
+  const close = vi.fn().mockResolvedValue(undefined);
+  const probeEmbeddingAvailability =
+    options.probeEmbeddingAvailability ?? vi.fn().mockResolvedValue({ ok: true });
+  getMemorySearchManager.mockResolvedValue({
+    manager: {
+      status: options.status,
+      probeEmbeddingAvailability,
+      ...(options.getCachedEmbeddingAvailability
+        ? { getCachedEmbeddingAvailability: options.getCachedEmbeddingAvailability }
+        : {}),
+      close,
+    },
+  });
+  return { close, probeEmbeddingAvailability };
+}
+
 const expectEmbeddingErrorResponse = (respond: ReturnType<typeof vi.fn>, error: string) => {
   const payload = respondPayload(respond);
   expectRecordFields(payload, {
@@ -202,6 +240,67 @@ const expectEmbeddingErrorResponse = (respond: ReturnType<typeof vi.fn>, error: 
     },
   });
 };
+
+describe("doctor.memory agent targeting", () => {
+  beforeEach(() => {
+    listAgentIds.mockClear();
+    resolveAgentWorkspaceDir.mockReset().mockReturnValue("/tmp/openclaw");
+    getMemorySearchManager.mockReset().mockResolvedValue({
+      manager: null,
+      error: "memory search unavailable",
+    });
+    removeBackfillDiaryEntries.mockReset().mockResolvedValue({ removed: 0 });
+    removeGroundedShortTermCandidates.mockReset().mockResolvedValue({ removed: 0 });
+    repairDreamingArtifacts.mockReset().mockResolvedValue({
+      changed: false,
+      archivedDreamsDiary: false,
+      archivedSessionCorpus: false,
+      archivedSessionIngestion: false,
+      warnings: [],
+    });
+    dedupeDreamDiaryEntries.mockReset().mockResolvedValue({ removed: 0, kept: 0 });
+  });
+
+  it.each(DOCTOR_MEMORY_TARGET_METHODS)(
+    "%s rejects an unknown agent before resolving agent state",
+    async (method) => {
+      const respond = vi.fn();
+
+      await invokeDoctorMemory(method, respond, {
+        params: { agentId: "invented" },
+        includeCron: true,
+      });
+
+      expect(respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, 'unknown agent id "invented"'),
+      );
+      expect(getMemorySearchManager).not.toHaveBeenCalled();
+      expect(resolveAgentWorkspaceDir).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(DOCTOR_MEMORY_TARGET_METHODS)(
+    "%s rejects a non-string agentId before resolving the default agent",
+    async (method) => {
+      const respond = vi.fn();
+
+      await invokeDoctorMemory(method, respond, {
+        params: { agentId: 42 },
+        includeCron: true,
+      });
+
+      expect(respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "agentId must be a string"),
+      );
+      expect(getMemorySearchManager).not.toHaveBeenCalled();
+      expect(resolveAgentWorkspaceDir).not.toHaveBeenCalled();
+    },
+  );
+});
 
 describe("doctor.memory.status", () => {
   beforeEach(() => {
@@ -216,20 +315,18 @@ describe("doctor.memory.status", () => {
     removeBackfillDiaryEntries.mockReset();
     removeGroundedShortTermCandidates.mockReset();
     repairDreamingArtifacts.mockReset();
+    loadShortTermPromotionDreamingStats
+      .mockReset()
+      .mockImplementation(async () => makeDreamingStats());
   });
 
   it("returns gateway embedding probe status for the default agent", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini" }),
-        probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
-        close,
-      },
+    const { close } = useMemoryManagerFixture({
+      status: () => ({ provider: "gemini" }),
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond, { params: { probe: true } });
+    await invokeDoctorMemory("doctor.memory.status", respond, { params: { probe: true } });
 
     const managerInput = mockCallArg(getMemorySearchManager);
     if (managerInput.cfg === undefined) {
@@ -246,7 +343,7 @@ describe("doctor.memory.status", () => {
       embedding: { ok: true },
     });
     const dreaming = expectRecordFields(payload.dreaming, {
-      enabled: false,
+      enabled: true,
       shortTermCount: 0,
       totalSignalCount: 0,
       phaseSignalCount: 0,
@@ -263,19 +360,86 @@ describe("doctor.memory.status", () => {
     expect(close).toHaveBeenCalled();
   });
 
-  it("does not live-probe embedding readiness by default", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-    const probeEmbeddingAvailability = vi.fn().mockResolvedValue({ ok: true });
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini" }),
-        probeEmbeddingAvailability,
-        close,
-      },
+  it("returns gateway embedding probe status for the requested agent", async () => {
+    useMemoryManagerFixture({
+      status: () => ({ provider: "gemini", workspaceDir: "/tmp/research-workspace" }),
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond);
+    await invokeDoctorMemory("doctor.memory.status", respond, {
+      params: { agentId: "research-analyst", probe: true },
+    });
+
+    expectRecordFields(mockCallArg(getMemorySearchManager), {
+      agentId: "research-analyst",
+      purpose: "status",
+    });
+    const payload = respondPayload(respond);
+    expectRecordFields(payload, {
+      agentId: "research-analyst",
+      provider: "gemini",
+      embedding: { ok: true },
+    });
+  });
+
+  it("returns llama.cpp runtime facts created by the deep embedding probe", async () => {
+    let probed = false;
+    const { close } = useMemoryManagerFixture({
+      status: () => ({
+        provider: "local",
+        ...(probed
+          ? {
+              custom: {
+                llamaCppRuntime: {
+                  engine: "llama.cpp",
+                  state: "ready",
+                  backend: "cuda",
+                  buildType: "prebuilt",
+                  deviceNames: ["NVIDIA Test GPU"],
+                  offload: {
+                    supported: true,
+                    offloadedLayers: 24,
+                    totalLayers: 24,
+                  },
+                  context: {
+                    requestedSize: 4096,
+                  },
+                },
+              },
+            }
+          : {}),
+      }),
+      probeEmbeddingAvailability: vi.fn(async () => {
+        probed = true;
+        return { ok: true };
+      }),
+    });
+    const respond = vi.fn();
+
+    await invokeDoctorMemory("doctor.memory.status", respond, { params: { probe: true } });
+
+    expect(respondPayload(respond).embeddingRuntime).toMatchObject({
+      state: "ready",
+      backend: "cuda",
+      deviceNames: ["NVIDIA Test GPU"],
+      offload: {
+        offloadedLayers: 24,
+        totalLayers: 24,
+      },
+      context: {
+        requestedSize: 4096,
+      },
+    });
+    expect(close).toHaveBeenCalled();
+  });
+
+  it("does not live-probe embedding readiness by default", async () => {
+    const { close, probeEmbeddingAvailability } = useMemoryManagerFixture({
+      status: () => ({ provider: "gemini" }),
+    });
+    const respond = vi.fn();
+
+    await invokeDoctorMemory("doctor.memory.status", respond);
 
     expect(probeEmbeddingAvailability).not.toHaveBeenCalled();
     const payload = respondPayload(respond);
@@ -284,25 +448,20 @@ describe("doctor.memory.status", () => {
   });
 
   it("returns cached embedding readiness without a live probe", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-    const probeEmbeddingAvailability = vi.fn().mockResolvedValue({ ok: false });
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini" }),
-        getCachedEmbeddingAvailability: vi.fn(() => ({
-          ok: true,
-          checked: true,
-          cached: true,
-          checkedAtMs: 123,
-          cacheExpiresAtMs: 456,
-        })),
-        probeEmbeddingAvailability,
-        close,
-      },
+    const { close, probeEmbeddingAvailability } = useMemoryManagerFixture({
+      status: () => ({ provider: "gemini" }),
+      probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: false }),
+      getCachedEmbeddingAvailability: vi.fn(() => ({
+        ok: true,
+        checked: true,
+        cached: true,
+        checkedAtMs: 123,
+        cacheExpiresAtMs: 456,
+      })),
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond);
+    await invokeDoctorMemory("doctor.memory.status", respond);
 
     expect(probeEmbeddingAvailability).not.toHaveBeenCalled();
     const payload = respondPayload(respond);
@@ -317,23 +476,19 @@ describe("doctor.memory.status", () => {
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond, { params: { probe: true } });
+    await invokeDoctorMemory("doctor.memory.status", respond, { params: { probe: true } });
 
     expectEmbeddingErrorResponse(respond, "memory search unavailable");
   });
 
   it("returns probe failure when manager probe throws", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "openai" }),
-        probeEmbeddingAvailability: vi.fn().mockRejectedValue(new Error("timeout")),
-        close,
-      },
+    const { close } = useMemoryManagerFixture({
+      status: () => ({ provider: "openai" }),
+      probeEmbeddingAvailability: vi.fn().mockRejectedValue(new Error("timeout")),
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond, { params: { probe: true } });
+    await invokeDoctorMemory("doctor.memory.status", respond, { params: { probe: true } });
 
     expectEmbeddingErrorResponse(respond, "gateway memory probe failed: timeout");
     expect(close).toHaveBeenCalled();
@@ -381,8 +536,8 @@ describe("doctor.memory.status", () => {
           version: 1,
           updatedAt: recentIso,
           entries: {
-            "memory:memory/2026-04-03.md:1:2": {
-              path: "memory/2026-04-03.md",
+            "memory:memory/2026-04-03-1503.md:1:2": {
+              path: "memory/2026-04-03-1503.md",
               startLine: 1,
               endLine: 2,
               snippet: "Emma prefers shorter, lower-pressure check-ins.",
@@ -392,8 +547,8 @@ describe("doctor.memory.status", () => {
               lastRecalledAt: recentIso,
               promotedAt: undefined,
             },
-            "memory:memory/2026-04-02.md:1:2": {
-              path: "memory/2026-04-02.md",
+            "memory:memory/daily/2026-04-02-1015.md:1:2": {
+              path: "memory/daily/2026-04-02-1015.md",
               startLine: 1,
               endLine: 2,
               snippet: "Use the Happy Together calendar for flights.",
@@ -426,8 +581,8 @@ describe("doctor.memory.status", () => {
               dailyCount: 4,
               promotedAt: olderIso,
             },
-            "memory:memory/2026-04-04.md:1:2": {
-              path: "memory/2026-04-04.md",
+            "memory:memory/notes/2026-04-04-0800.md:1:2": {
+              path: "memory/notes/2026-04-04-0800.md",
               startLine: 1,
               endLine: 2,
               snippet: "Always book the covered valet option at Park & Greet BCN.",
@@ -450,11 +605,11 @@ describe("doctor.memory.status", () => {
           version: 1,
           updatedAt: recentIso,
           entries: {
-            "memory:memory/2026-04-03.md:1:2": {
+            "memory:memory/2026-04-03-1503.md:1:2": {
               lightHits: 2,
               remHits: 3,
             },
-            "memory:memory/2026-04-02.md:1:2": {
+            "memory:memory/daily/2026-04-02-1015.md:1:2": {
               lightHits: 9,
               remHits: 9,
             },
@@ -485,12 +640,15 @@ describe("doctor.memory.status", () => {
     );
 
     getRuntimeConfig.mockReturnValue({
+      memory: {
+        search: {
+          enabled: true,
+        },
+      },
+
       agents: {
         defaults: {
           userTimezone: "America/Los_Angeles",
-          memorySearch: {
-            enabled: true,
-          },
         },
         list: [{ id: "alpha", workspace: alphaWorkspaceDir }],
       },
@@ -519,14 +677,80 @@ describe("doctor.memory.status", () => {
       }
       return mainWorkspaceDir;
     });
+    loadShortTermPromotionDreamingStats.mockImplementation(
+      async ({ workspaceDir }: { workspaceDir: string }) =>
+        workspaceDir === alphaWorkspaceDir
+          ? makeDreamingStats({
+              shortTermCount: 0,
+              promotedTotal: 2,
+              promotedToday: 1,
+              promotedEntries: [
+                makeDreamingEntry("memory/2026-04-01.md", {
+                  snippet: "Bunji lives in London.",
+                  recallCount: 7,
+                  dailyCount: 4,
+                  totalSignalCount: 11,
+                  promotedAt: olderIso,
+                }),
+                makeDreamingEntry("memory/notes/2026-04-04-0800.md", {
+                  snippet: "Always book the covered valet option at Park & Greet BCN.",
+                  recallCount: 8,
+                  dailyCount: 3,
+                  totalSignalCount: 11,
+                  promotedAt: recentIso,
+                }),
+              ],
+              lastPromotedAt: recentIso,
+            })
+          : makeDreamingStats({
+              shortTermCount: 1,
+              recallSignalCount: 2,
+              dailySignalCount: 1,
+              totalSignalCount: 3,
+              phaseSignalCount: 5,
+              lightPhaseHitCount: 2,
+              remPhaseHitCount: 3,
+              promotedTotal: 1,
+              promotedToday: 1,
+              shortTermEntries: [
+                makeDreamingEntry("memory/2026-04-03-1503.md", {
+                  snippet: "Emma prefers shorter, lower-pressure check-ins.",
+                  recallCount: 2,
+                  dailyCount: 1,
+                  totalSignalCount: 3,
+                  lightHits: 2,
+                  remHits: 3,
+                  phaseHitCount: 5,
+                  lastRecalledAt: recentIso,
+                }),
+              ],
+              signalEntries: [
+                makeDreamingEntry("memory/2026-04-03-1503.md", {
+                  snippet: "Emma prefers shorter, lower-pressure check-ins.",
+                  recallCount: 2,
+                  dailyCount: 1,
+                  totalSignalCount: 3,
+                  lightHits: 2,
+                  remHits: 3,
+                  phaseHitCount: 5,
+                  lastRecalledAt: recentIso,
+                }),
+              ],
+              promotedEntries: [
+                makeDreamingEntry("memory/daily/2026-04-02-1015.md", {
+                  snippet: "Use the Happy Together calendar for flights.",
+                  recallCount: 9,
+                  dailyCount: 5,
+                  totalSignalCount: 14,
+                  promotedAt: recentIso,
+                }),
+              ],
+              lastPromotedAt: recentIso,
+            }),
+    );
 
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini", workspaceDir: mainWorkspaceDir }),
-        probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
-        close,
-      },
+    const { close } = useMemoryManagerFixture({
+      status: () => ({ provider: "gemini", workspaceDir: mainWorkspaceDir }),
     });
 
     const cronList = vi.fn(async () => [
@@ -544,7 +768,7 @@ describe("doctor.memory.status", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryStatus(respond, { cron: { list: cronList } });
+      await invokeDoctorMemory("doctor.memory.status", respond, { cronList });
       const payload = respondPayload(respond);
       expectRecordFields(payload, {
         agentId: "main",
@@ -565,7 +789,7 @@ describe("doctor.memory.status", () => {
         promotedToday: 2,
       });
       expectRecordFields((dreaming.shortTermEntries as unknown[])[0], {
-        path: "memory/2026-04-03.md",
+        path: "memory/2026-04-03-1503.md",
         snippet: "Emma prefers shorter, lower-pressure check-ins.",
         totalSignalCount: 3,
         lightHits: 2,
@@ -573,17 +797,17 @@ describe("doctor.memory.status", () => {
         phaseHitCount: 5,
       });
       expectRecordFields((dreaming.signalEntries as unknown[])[0], {
-        path: "memory/2026-04-03.md",
+        path: "memory/2026-04-03-1503.md",
         totalSignalCount: 3,
       });
       expectRecordFields(
-        findRecordByField(dreaming.promotedEntries, "path", "memory/2026-04-04.md"),
+        findRecordByField(dreaming.promotedEntries, "path", "memory/notes/2026-04-04-0800.md"),
         {
           promotedAt: recentIso,
         },
       );
       expectRecordFields(
-        findRecordByField(dreaming.promotedEntries, "path", "memory/2026-04-02.md"),
+        findRecordByField(dreaming.promotedEntries, "path", "memory/daily/2026-04-02-1015.md"),
         {
           promotedAt: recentIso,
         },
@@ -605,6 +829,89 @@ describe("doctor.memory.status", () => {
       expect(close).toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("scopes dreaming status to the requested agent workspace", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "doctor-memory-selected-"));
+    const mainWorkspaceDir = path.join(workspaceRoot, "main");
+    const alphaWorkspaceDir = path.join(workspaceRoot, "alpha");
+    const writeStore = async (workspaceDir: string, snippet: string) => {
+      const storePath = path.join(workspaceDir, "memory", ".dreams", "short-term-recall.json");
+      await fs.mkdir(path.dirname(storePath), { recursive: true });
+      const store = {
+        version: 1,
+        updatedAt: "2026-04-04T00:00:00.000Z",
+        entries: {
+          "memory:memory/2026-04-04.md:1:2": {
+            path: "memory/2026-04-04.md",
+            startLine: 1,
+            endLine: 2,
+            snippet,
+            source: "memory",
+            promotedAt: "2026-04-04T00:00:00.000Z",
+          },
+        },
+      };
+      await fs.writeFile(storePath, JSON.stringify(store, null, 2) + "\n", "utf-8");
+    };
+    await writeStore(mainWorkspaceDir, "main agent memory");
+    await writeStore(alphaWorkspaceDir, "alpha agent memory");
+    loadShortTermPromotionDreamingStats.mockImplementation(
+      async ({ workspaceDir }: { workspaceDir: string }) =>
+        makeDreamingStats({
+          promotedTotal: 1,
+          promotedEntries: [
+            makeDreamingEntry("memory/2026-04-04.md", {
+              snippet:
+                workspaceDir === alphaWorkspaceDir ? "alpha agent memory" : "main agent memory",
+              promotedAt: "2026-04-04T00:00:00.000Z",
+            }),
+          ],
+          lastPromotedAt: "2026-04-04T00:00:00.000Z",
+        }),
+    );
+    getRuntimeConfig.mockReturnValue({
+      agents: {
+        list: [{ id: "alpha", workspace: alphaWorkspaceDir }],
+      },
+      plugins: {
+        entries: {
+          "memory-core": {
+            config: {
+              dreaming: {},
+            },
+          },
+        },
+      },
+    } as OpenClawConfig);
+    resolveAgentWorkspaceDir.mockImplementation((_cfg: OpenClawConfig, agentId: string) => {
+      if (agentId === "alpha") {
+        return alphaWorkspaceDir;
+      }
+      return mainWorkspaceDir;
+    });
+
+    useMemoryManagerFixture({
+      status: () => ({ provider: "gemini", workspaceDir: alphaWorkspaceDir }),
+    });
+    const respond = vi.fn();
+
+    try {
+      await invokeDoctorMemory("doctor.memory.status", respond, { params: { agentId: "alpha" } });
+      const payload = respondPayload(respond);
+      expectRecordFields(payload, {
+        agentId: "alpha",
+      });
+      const dreaming = expectRecordFields(payload.dreaming, {
+        shortTermCount: 0,
+        promotedTotal: 1,
+      });
+      expectRecordFields((dreaming.promotedEntries as unknown[])[0], {
+        snippet: "alpha agent memory",
+      });
+    } finally {
       await fs.rm(workspaceRoot, { recursive: true, force: true });
     }
   });
@@ -633,6 +940,18 @@ describe("doctor.memory.status", () => {
       "utf-8",
     );
     resolveMemorySearchConfig.mockReturnValue(null);
+    loadShortTermPromotionDreamingStats.mockResolvedValueOnce(
+      makeDreamingStats({
+        promotedTotal: 1,
+        promotedEntries: [
+          makeDreamingEntry("memory/2026-04-03.md", {
+            endLine: 1,
+            promotedAt: "2026-04-04T00:00:00.000Z",
+          }),
+        ],
+        lastPromotedAt: "2026-04-04T00:00:00.000Z",
+      }),
+    );
     getRuntimeConfig.mockReturnValue({
       plugins: {
         entries: {
@@ -645,18 +964,13 @@ describe("doctor.memory.status", () => {
       },
     } as OpenClawConfig);
 
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini", workspaceDir }),
-        probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
-        close,
-      },
+    useMemoryManagerFixture({
+      status: () => ({ provider: "gemini", workspaceDir }),
     });
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryStatus(respond);
+      await invokeDoctorMemory("doctor.memory.status", respond);
       const payload = respondPayload(respond);
       const dreaming = expectRecordFields(payload.dreaming, {
         shortTermCount: 0,
@@ -697,17 +1011,12 @@ describe("doctor.memory.status", () => {
       },
     } as OpenClawConfig);
 
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini" }),
-        probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
-        close,
-      },
+    const { close } = useMemoryManagerFixture({
+      status: () => ({ provider: "gemini" }),
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryStatus(respond);
+    await invokeDoctorMemory("doctor.memory.status", respond);
 
     const payload = respondPayload(respond);
     const dreaming = expectRecordFields(payload.dreaming, {
@@ -747,12 +1056,14 @@ describe("doctor.memory.status", () => {
     await fs.mkdir(path.join(mainWorkspaceDir, "memory", ".dreams"), { recursive: true });
 
     getRuntimeConfig.mockReturnValue({
-      agents: {
-        defaults: {
-          memorySearch: {
-            enabled: true,
-          },
+      memory: {
+        search: {
+          enabled: true,
         },
+      },
+
+      agents: {
+        defaults: {},
         list: [
           { id: "main", workspace: mainWorkspaceDir },
           { id: "alpha", workspace: alphaWorkspaceDir },
@@ -772,39 +1083,15 @@ describe("doctor.memory.status", () => {
       agentId === "alpha" ? alphaWorkspaceDir : mainWorkspaceDir,
     );
 
-    const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation(async (target, options) => {
-      const targetPath =
-        typeof target === "string"
-          ? target
-          : Buffer.isBuffer(target)
-            ? target.toString("utf-8")
-            : target instanceof URL
-              ? target.pathname
-              : "";
-      if (
-        targetPath === path.join(mainWorkspaceDir, "memory", ".dreams", "short-term-recall.json") ||
-        targetPath === alphaStorePath
-      ) {
-        const error = Object.assign(new Error("denied"), { code: "EACCES" });
-        throw error;
-      }
-      return await vi
-        .importActual<typeof import("node:fs/promises")>("node:fs/promises")
-        .then((actual) => actual.readFile(target, options as never));
-    });
+    loadShortTermPromotionDreamingStats.mockRejectedValue(new Error("denied"));
 
-    const close = vi.fn().mockResolvedValue(undefined);
-    getMemorySearchManager.mockResolvedValue({
-      manager: {
-        status: () => ({ provider: "gemini", workspaceDir: mainWorkspaceDir }),
-        probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
-        close,
-      },
+    useMemoryManagerFixture({
+      status: () => ({ provider: "gemini", workspaceDir: mainWorkspaceDir }),
     });
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryStatus(respond);
+      await invokeDoctorMemory("doctor.memory.status", respond);
       const payload = respondPayload(respond);
       expectRecordFields(payload.dreaming, {
         shortTermCount: 0,
@@ -812,7 +1099,6 @@ describe("doctor.memory.status", () => {
         storeError: "2 dreaming stores had read errors.",
       });
     } finally {
-      readFileSpy.mockRestore();
       await fs.rm(workspaceRoot, { recursive: true, force: true });
     }
   });
@@ -827,7 +1113,7 @@ describe("doctor.memory dream actions", () => {
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryResetGroundedShortTerm(respond);
+    await invokeDoctorMemory("doctor.memory.resetGroundedShortTerm", respond);
 
     expect(removeGroundedShortTermCandidates).toHaveBeenCalledWith({
       workspaceDir: "/tmp/openclaw",
@@ -856,7 +1142,7 @@ describe("doctor.memory dream actions", () => {
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRepairDreamingArtifacts(respond);
+    await invokeDoctorMemory("doctor.memory.repairDreamingArtifacts", respond);
 
     expect(repairDreamingArtifacts).toHaveBeenCalledWith({
       workspaceDir: "/tmp/openclaw",
@@ -886,7 +1172,7 @@ describe("doctor.memory dream actions", () => {
     });
     const respond = vi.fn();
 
-    await invokeDoctorMemoryDedupeDreamDiary(respond);
+    await invokeDoctorMemory("doctor.memory.dedupeDreamDiary", respond);
 
     expect(dedupeDreamDiaryEntries).toHaveBeenCalledWith({
       workspaceDir: "/tmp/openclaw",
@@ -925,7 +1211,7 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.dreamDiary", respond);
       const payload = respondPayload(respond);
       expectRecordFields(payload, {
         agentId: "main",
@@ -939,6 +1225,31 @@ describe("doctor.memory.dreamDiary", () => {
     }
   });
 
+  it("reads DREAMS.md for the requested agent", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "doctor-dream-diary-agent-"));
+    await fs.writeFile(path.join(workspaceDir, "DREAMS.md"), "## Research Dreams\n", "utf-8");
+    resolveAgentWorkspaceDir.mockImplementation((_cfg, agentId) =>
+      agentId === "research-analyst" ? workspaceDir : "/tmp/openclaw",
+    );
+    const respond = vi.fn();
+
+    try {
+      await invokeDoctorMemory("doctor.memory.dreamDiary", respond, {
+        params: { agentId: "research-analyst" },
+      });
+      expect(resolveAgentWorkspaceDir).toHaveBeenCalledWith(expect.anything(), "research-analyst");
+      const payload = respondPayload(respond);
+      expectRecordFields(payload, {
+        agentId: "research-analyst",
+        found: true,
+        path: "DREAMS.md",
+        content: "## Research Dreams\n",
+      });
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("reads lowercase dreams.md when present", async () => {
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "doctor-dream-diary-lower-"));
     await fs.writeFile(path.join(workspaceDir, "dreams.md"), "lowercase diary\n", "utf-8");
@@ -946,7 +1257,7 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.dreamDiary", respond);
       const payload = respondPayload(respond);
       expectRecordFields(payload, {
         agentId: "main",
@@ -966,7 +1277,7 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.dreamDiary", respond);
       expectRecordFields(respondPayload(respond), {
         agentId: "main",
         found: false,
@@ -1000,13 +1311,16 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryBackfillDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.backfillDreamDiary", respond);
       expect(previewGroundedRemMarkdown).toHaveBeenCalledWith({
         workspaceDir,
         inputPaths: [path.join(workspaceDir, "memory", "2026-02-19.md")],
       });
       const writeInput = mockCallArg(writeBackfillDiaryEntries);
-      const entry = (writeInput.entries as Array<Record<string, unknown>>)[0];
+      const entry = expectDefined(
+        (writeInput.entries as Array<Record<string, unknown>>)[0],
+        "(writeInput.entries as Array<Record<string, unknown>>)[0] test invariant",
+      );
       expect(entry.bodyLines).toContain("What Happened");
       expect(entry.bodyLines).toContain("1. Bunji — partner");
       expectRecordFields(respondPayload(respond), {
@@ -1047,14 +1361,17 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryBackfillDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.backfillDreamDiary", respond);
       expect(previewGroundedRemMarkdown).toHaveBeenCalledWith({
         workspaceDir,
         inputPaths: [sourcePath],
       });
       const writeInput = mockCallArg(writeBackfillDiaryEntries);
       expect(writeInput.workspaceDir).toBe(workspaceDir);
-      const entry = (writeInput.entries as Array<Record<string, unknown>>)[0];
+      const entry = expectDefined(
+        (writeInput.entries as Array<Record<string, unknown>>)[0],
+        "(writeInput.entries as Array<Record<string, unknown>>)[0] test invariant",
+      );
       expectRecordFields(entry, {
         isoDay: "2026-02-19",
         sourcePath,
@@ -1079,7 +1396,7 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryBackfillDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.backfillDreamDiary", respond);
       expect(previewGroundedRemMarkdown).not.toHaveBeenCalled();
       expect(writeBackfillDiaryEntries).not.toHaveBeenCalled();
       expectRecordFields(respondPayload(respond), {
@@ -1105,7 +1422,7 @@ describe("doctor.memory.dreamDiary", () => {
     const respond = vi.fn();
 
     try {
-      await invokeDoctorMemoryResetDreamDiary(respond);
+      await invokeDoctorMemory("doctor.memory.resetDreamDiary", respond);
       expect(removeBackfillDiaryEntries).toHaveBeenCalledWith({ workspaceDir });
       expectRecordFields(respondPayload(respond), {
         agentId: "main",
@@ -1178,7 +1495,7 @@ describe("doctor.memory.remHarness", () => {
   it("returns an empty preview payload for an empty workspace", async () => {
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond);
+    await invokeDoctorMemory("doctor.memory.remHarness", respond);
 
     expectRecordFields(mockCallArg(previewRemHarness), {
       workspaceDir: "/tmp/openclaw",
@@ -1243,7 +1560,7 @@ describe("doctor.memory.remHarness", () => {
     );
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond);
+    await invokeDoctorMemory("doctor.memory.remHarness", respond);
 
     const payload = respondPayload(respond);
     expectRecordFields(payload, { ok: true });
@@ -1281,7 +1598,9 @@ describe("doctor.memory.remHarness", () => {
     );
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond, { grounded: true });
+    await invokeDoctorMemory("doctor.memory.remHarness", respond, {
+      params: { grounded: true },
+    });
 
     expectRecordFields(mockCallArg(previewRemHarness), { grounded: true });
     const payload = respondPayload(respond);
@@ -1297,7 +1616,9 @@ describe("doctor.memory.remHarness", () => {
   it("passes bounded grounded and REM preview limits to the shared harness", async () => {
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond, { grounded: true });
+    await invokeDoctorMemory("doctor.memory.remHarness", respond, {
+      params: { grounded: true },
+    });
 
     expectRecordFields(mockCallArg(previewRemHarness), {
       grounded: true,
@@ -1309,7 +1630,9 @@ describe("doctor.memory.remHarness", () => {
   it("maps requested empty grounded preview into an empty payload", async () => {
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond, { grounded: true });
+    await invokeDoctorMemory("doctor.memory.remHarness", respond, {
+      params: { grounded: true },
+    });
 
     expectRecordFields(respondPayload(respond), {
       grounded: { scannedFiles: 0, files: [] },
@@ -1320,7 +1643,7 @@ describe("doctor.memory.remHarness", () => {
     previewRemHarness.mockRejectedValue(new Error("disk boom"));
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond);
+    await invokeDoctorMemory("doctor.memory.remHarness", respond);
 
     const payload = respondPayload(respond);
     expectRecordFields(payload, {
@@ -1360,7 +1683,7 @@ describe("doctor.memory.remHarness", () => {
     );
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond);
+    await invokeDoctorMemory("doctor.memory.remHarness", respond);
 
     expectRecordFields(mockCallArg(previewRemHarness), { candidateLimit: 25 });
     const payload = respondPayload(respond) as {
@@ -1376,7 +1699,7 @@ describe("doctor.memory.remHarness", () => {
   it("clamps caller-supplied limit within [1, REM_HARNESS_MAX_CANDIDATE_LIMIT]", async () => {
     const respond = vi.fn();
 
-    await invokeDoctorMemoryRemHarness(respond, { limit: 500 });
+    await invokeDoctorMemory("doctor.memory.remHarness", respond, { params: { limit: 500 } });
 
     expectRecordFields(mockCallArg(previewRemHarness), { candidateLimit: 100 });
     const payload = respondPayload(respond) as {
@@ -1385,3 +1708,4 @@ describe("doctor.memory.remHarness", () => {
     expect(payload.deep.candidateLimit).toBe(100);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

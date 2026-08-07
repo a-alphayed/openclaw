@@ -1,3 +1,4 @@
+// Vydra plugin entrypoint registers its OpenClaw integration.
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth-api-key";
 import { buildVydraImageGenerationProvider } from "./image-generation-provider.js";
@@ -10,7 +11,7 @@ const PROVIDER_ID = "vydra";
 export default definePluginEntry({
   id: PROVIDER_ID,
   name: "Vydra Provider",
-  description: "Bundled Vydra image, video, and speech provider",
+  description: "Vydra image, video, and speech provider",
   register(api) {
     api.registerProvider({
       id: PROVIDER_ID,

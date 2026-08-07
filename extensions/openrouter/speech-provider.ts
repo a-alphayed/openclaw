@@ -1,3 +1,4 @@
+// Openrouter provider module implements model/runtime integration.
 import {
   asObject,
   createOpenAiCompatibleSpeechProvider,
@@ -9,9 +10,9 @@ const DEFAULT_OPENROUTER_TTS_MODEL = "hexgrad/kokoro-82m";
 const DEFAULT_OPENROUTER_TTS_VOICE = "af_alloy";
 const OPENROUTER_TTS_MODELS = [
   DEFAULT_OPENROUTER_TTS_MODEL,
+  "elevenlabs/eleven-turbo-v2",
   "google/gemini-3.1-flash-tts-preview",
   "mistralai/voxtral-mini-tts-2603",
-  "elevenlabs/eleven-turbo-v2",
 ] as const;
 const OPENROUTER_TTS_RESPONSE_FORMATS = ["mp3", "pcm"] as const;
 
@@ -33,7 +34,7 @@ export function buildOpenRouterSpeechProvider(): SpeechProviderPlugin {
     responseFormats: OPENROUTER_TTS_RESPONSE_FORMATS,
     defaultResponseFormat: "mp3",
     voiceCompatibleResponseFormats: ["mp3"],
-    baseUrlPolicy: { kind: "canonical", aliases: ["https://openrouter.ai/v1"] },
+    baseUrlPolicy: { kind: "canonical", aliases: ["https://openrouter.ai/v1"], allowCustom: true },
     extraHeaders: {
       "HTTP-Referer": "https://openclaw.ai",
       "X-OpenRouter-Title": "OpenClaw",

@@ -1,3 +1,4 @@
+// Defines hook configuration matching and command types.
 export type HookMappingMatch = {
   path?: string;
   source?: string;
@@ -8,6 +9,8 @@ export type HookMappingTransform = {
   export?: string;
 };
 
+export type HookSessionMode = "isolated" | "persistent";
+
 export type HookMappingConfig = {
   id?: string;
   match?: HookMappingMatch;
@@ -17,6 +20,8 @@ export type HookMappingConfig = {
   /** Route this hook to a specific agent (unknown ids fall back to the default agent). */
   agentId?: string;
   sessionKey?: string;
+  /** Reuse the resolved session key across runs instead of creating a fresh run session. */
+  sessionMode?: HookSessionMode;
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
@@ -86,8 +91,6 @@ export type InternalHooksConfig = {
     /** Additional hook directories to scan */
     extraDirs?: string[];
   };
-  /** Install records for hook packs or hooks */
-  installs?: Record<string, HookInstallRecord>;
 };
 
 export type HooksConfig = {
@@ -115,7 +118,6 @@ export type HooksConfig = {
    * allow any agent. Set `[]` to deny all agent routing.
    */
   allowedAgentIds?: string[];
-  maxBodyBytes?: number;
   presets?: string[];
   transformsDir?: string;
   mappings?: HookMappingConfig[];

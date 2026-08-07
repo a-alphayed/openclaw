@@ -1,12 +1,22 @@
-import { resolveNonNegativeIntegerOption } from "../shared/number-coercion.js";
+import { stableStringify } from "@openclaw/normalization-core";
+/**
+ * Shared media generation task status and duplicate-guard helpers.
+ *
+ * Image/video task modules use this to track recent starts, find active
+ * background tasks, and build consistent user/prompt status messages.
+ */
+import { resolveNonNegativeIntegerOption } from "@openclaw/normalization-core/number-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
 import { listFreshTasksForOwnerKey } from "../tasks/runtime-internal.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 import { buildSessionAsyncTaskStatusDetails } from "./session-async-task-status.js";
-import { stableStringify } from "./stable-stringify.js";
+
+/** Marks media as ready while requester delivery is still being confirmed. */
+export const MEDIA_GENERATION_DELIVERING_COMPLETION_PROGRESS =
+  "Generated media; delivering completion";
 
 type RecentMediaGenerationTaskStart = {
   task: TaskRecord;
@@ -16,6 +26,7 @@ type RecentMediaGenerationTaskStart = {
 const recentMediaGenerationTaskStarts = new Map<string, RecentMediaGenerationTaskStart[]>();
 const RECENT_MEDIA_GENERATION_TASK_START_CACHE_MS = 2 * 60_000;
 
+/** Builds a stable request key for media generation duplicate detection. */
 export function buildMediaGenerationRequestKey(value: Record<string, unknown>): string {
   return stableStringify(value);
 }
@@ -89,6 +100,7 @@ function isTaskRecentSuccessfulDuplicate(params: {
 }): boolean {
   return (
     params.task.status === "succeeded" &&
+    params.task.terminalOutcome !== "blocked" &&
     Boolean(params.requestKey && params.cachedRequestKey === params.requestKey) &&
     isRecentMediaGenerationTaskRecord({
       task: params.task,
@@ -133,18 +145,7 @@ function findPersistedTaskForRecentMediaGenerationStart(params: {
   });
 }
 
-export function isActiveMediaGenerationTask(params: {
-  task: TaskRecord;
-  taskKind: string;
-}): boolean {
-  return (
-    params.task.runtime === "cli" &&
-    params.task.scopeKind === "session" &&
-    params.task.taskKind === params.taskKind &&
-    (params.task.status === "queued" || params.task.status === "running")
-  );
-}
-
+/** Records a just-started media task so duplicate guards work before persistence. */
 export function recordRecentMediaGenerationTaskStartForSession(params: {
   sessionKey?: string;
   taskKind: string;
@@ -191,9 +192,9 @@ export function recordRecentMediaGenerationTaskStartForSession(params: {
       progressSummary: params.progressSummary,
     },
   };
-  const previousEntries = (recentMediaGenerationTaskStarts.get(key) ?? []).filter((entry) =>
+  const previousEntries = (recentMediaGenerationTaskStarts.get(key) ?? []).filter((entryLocal) =>
     isRecentMediaGenerationTaskRecord({
-      task: entry.task,
+      task: entryLocal.task,
       maxAgeMs: RECENT_MEDIA_GENERATION_TASK_START_CACHE_MS,
       nowMs,
     }),
@@ -206,7 +207,8 @@ export function recordRecentMediaGenerationTaskStartForSession(params: {
   ]);
 }
 
-export function findRecentStartedMediaGenerationTaskForSession(params: {
+/** Finds a recent started media task from memory or persisted task state. */
+function findRecentStartedMediaGenerationTaskForSession(params: {
   sessionKey?: string;
   taskKind: string;
   sourcePrefix: string;
@@ -223,6 +225,8 @@ export function findRecentStartedMediaGenerationTaskForSession(params: {
   const nowMs = params.nowMs ?? Date.now();
   const maxAgeMs = resolveNonNegativeIntegerOption(params.maxAgeMs, 0);
   const taskLabel = normalizeOptionalString(params.taskLabel);
+  // Prefer persisted tasks when available; the in-memory start cache bridges
+  // the short gap before async task persistence catches up.
   pruneRecentMediaGenerationTaskStarts({ maxAgeMs, nowMs, preserveKey: key });
   const entries = recentMediaGenerationTaskStarts.get(key);
   if (!entries?.length) {
@@ -275,11 +279,19 @@ export function findRecentStartedMediaGenerationTaskForSession(params: {
   return undefined;
 }
 
-export function resetRecentMediaGenerationDuplicateGuardsForTests() {
+/** Clears in-memory duplicate guards between tests. */
+function resetRecentMediaGenerationDuplicateGuardsForTests() {
   recentMediaGenerationTaskStarts.clear();
 }
 
-export function getMediaGenerationTaskProviderId(
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for("openclaw.mediaGenerationDuplicateGuardTestApi")
+  ] = { resetRecentMediaGenerationDuplicateGuardsForTests };
+}
+
+/** Extracts a provider id from a media task source id with the given prefix. */
+function getMediaGenerationTaskProviderId(
   task: TaskRecord,
   sourcePrefix: string,
 ): string | undefined {
@@ -291,20 +303,24 @@ export function getMediaGenerationTaskProviderId(
   return providerId || undefined;
 }
 
-export function findActiveMediaGenerationTaskForSession(params: {
+/** Finds the highest-priority active media generation task for a session. */
+function findActiveMediaGenerationTaskForSession(params: {
   sessionKey?: string;
   taskKind: string;
   sourcePrefix: string;
   taskLabel?: string;
+  excludeDeliveringCompletion?: boolean;
 }): TaskRecord | undefined {
   return listActiveMediaGenerationTasksForSession(params)[0];
 }
 
-export function listActiveMediaGenerationTasksForSession(params: {
+/** Lists active media generation tasks for a session, preferring running tasks. */
+function listActiveMediaGenerationTasksForSession(params: {
   sessionKey?: string;
   taskKind: string;
   sourcePrefix: string;
   taskLabel?: string;
+  excludeDeliveringCompletion?: boolean;
 }): TaskRecord[] {
   const sessionKey = normalizeOptionalString(params.sessionKey);
   if (!sessionKey) {
@@ -327,6 +343,12 @@ export function listActiveMediaGenerationTasksForSession(params: {
     if (taskLabel && !mediaGenerationTaskLabelMatches(task, taskLabel)) {
       return false;
     }
+    if (
+      params.excludeDeliveringCompletion &&
+      task.progressSummary === MEDIA_GENERATION_DELIVERING_COMPLETION_PROGRESS
+    ) {
+      return false;
+    }
     return true;
   });
   return [
@@ -335,7 +357,8 @@ export function listActiveMediaGenerationTasksForSession(params: {
   ];
 }
 
-export function findDuplicateGuardMediaGenerationTaskForSession(params: {
+/** Finds a task that should block duplicate media generation for a session. */
+function findDuplicateGuardMediaGenerationTaskForSession(params: {
   sessionKey?: string;
   taskKind: string;
   sourcePrefix: string;
@@ -355,7 +378,8 @@ export function findDuplicateGuardMediaGenerationTaskForSession(params: {
   );
 }
 
-export function buildMediaGenerationTaskStatusDetails(params: {
+/** Builds structured status details for one media generation task. */
+function buildMediaGenerationTaskStatusDetails(params: {
   task: TaskRecord;
   sourcePrefix: string;
 }): Record<string, unknown> {
@@ -367,7 +391,8 @@ export function buildMediaGenerationTaskStatusDetails(params: {
   };
 }
 
-export function buildMediaGenerationTaskStatusListDetails(params: {
+/** Builds structured status details for a list of media generation tasks. */
+function buildMediaGenerationTaskStatusListDetails(params: {
   tasks: TaskRecord[];
   sourcePrefix: string;
 }): Record<string, unknown> {
@@ -385,7 +410,8 @@ export function buildMediaGenerationTaskStatusListDetails(params: {
   };
 }
 
-export function buildMediaGenerationTaskStatusText(params: {
+/** Builds user-facing status text for one media generation task. */
+function buildMediaGenerationTaskStatusText(params: {
   task: TaskRecord;
   sourcePrefix: string;
   nounLabel: string;
@@ -412,7 +438,8 @@ export function buildMediaGenerationTaskStatusText(params: {
   return lines.join("\n");
 }
 
-export function buildMediaGenerationTaskStatusListText(params: {
+/** Builds user-facing status text for multiple active media generation tasks. */
+function buildMediaGenerationTaskStatusListText(params: {
   tasks: TaskRecord[];
   sourcePrefix: string;
   nounLabel: string;
@@ -434,7 +461,8 @@ export function buildMediaGenerationTaskStatusListText(params: {
   return lines.join("\n");
 }
 
-export function buildActiveMediaGenerationTaskPromptContextForSession(params: {
+/** Builds prompt context warning an agent about an active media generation task. */
+function buildActiveMediaGenerationTaskPromptContextForSession(params: {
   sessionKey?: string;
   taskKind: string;
   sourcePrefix: string;
@@ -446,6 +474,7 @@ export function buildActiveMediaGenerationTaskPromptContextForSession(params: {
     sessionKey: params.sessionKey,
     taskKind: params.taskKind,
     sourcePrefix: params.sourcePrefix,
+    excludeDeliveringCompletion: true,
   });
   if (!task) {
     return undefined;
@@ -460,4 +489,74 @@ export function buildActiveMediaGenerationTaskPromptContextForSession(params: {
     `Only start a new \`${params.toolName}\` call if the user clearly asks for different/new ${params.completionLabel}.`,
   ].filter((entry): entry is string => Boolean(entry));
   return lines.join("\n");
+}
+
+/** Specializes shared task lookup, duplicate guards, and status text for one media tool. */
+export function createMediaGenerationTaskStatusOwner(params: {
+  taskKind: string;
+  toolName: string;
+  nounLabel: string;
+  completionLabel: string;
+  promptCompletionLabel: string;
+}) {
+  const taskIdentity = { taskKind: params.taskKind, sourcePrefix: params.toolName };
+  const taskPresentation = {
+    sourcePrefix: params.toolName,
+    nounLabel: params.nounLabel,
+    toolName: params.toolName,
+  };
+  return {
+    findActiveTaskForSession(this: void, sessionKey?: string, request?: { prompt?: string }) {
+      return findActiveMediaGenerationTaskForSession({
+        ...taskIdentity,
+        sessionKey,
+        taskLabel: request?.prompt,
+      });
+    },
+    listActiveTasksForSession(this: void, sessionKey?: string) {
+      return listActiveMediaGenerationTasksForSession({ ...taskIdentity, sessionKey });
+    },
+    findDuplicateGuardTaskForSession(
+      this: void,
+      sessionKey?: string,
+      request?: { prompt?: string; requestKey?: string },
+    ) {
+      return findDuplicateGuardMediaGenerationTaskForSession({
+        ...taskIdentity,
+        sessionKey,
+        taskLabel: request?.prompt,
+        requestKey: request?.requestKey,
+        maxAgeMs: RECENT_MEDIA_GENERATION_TASK_START_CACHE_MS,
+      });
+    },
+    buildTaskStatusDetails(this: void, task: TaskRecord) {
+      return buildMediaGenerationTaskStatusDetails({ task, sourcePrefix: params.toolName });
+    },
+    buildTaskStatusListDetails(this: void, tasks: TaskRecord[]) {
+      return buildMediaGenerationTaskStatusListDetails({ tasks, sourcePrefix: params.toolName });
+    },
+    buildTaskStatusText(this: void, task: TaskRecord, options?: { duplicateGuard?: boolean }) {
+      return buildMediaGenerationTaskStatusText({
+        ...taskPresentation,
+        task,
+        completionLabel: params.completionLabel,
+        duplicateGuard: options?.duplicateGuard,
+      });
+    },
+    buildTaskStatusListText(this: void, tasks: TaskRecord[]) {
+      return buildMediaGenerationTaskStatusListText({
+        ...taskPresentation,
+        tasks,
+        completionLabel: params.promptCompletionLabel,
+      });
+    },
+    buildActiveTaskPromptContextForSession(this: void, sessionKey?: string) {
+      return buildActiveMediaGenerationTaskPromptContextForSession({
+        ...taskIdentity,
+        ...taskPresentation,
+        sessionKey,
+        completionLabel: params.promptCompletionLabel,
+      });
+    },
+  };
 }

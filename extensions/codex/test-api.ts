@@ -1,3 +1,7 @@
+/**
+ * Test-only helpers for producing Codex app-server prompt snapshots and dynamic
+ * tool specs without starting a live app-server.
+ */
 import type {
   AnyAgentTool,
   EmbeddedRunAttemptParams,
@@ -17,6 +21,8 @@ import {
   buildTurnStartParams,
 } from "./src/app-server/thread-lifecycle.js";
 
+export { CODEX_APP_SERVER_VERSION } from "./src/app-server/version.js";
+
 type CodexHarnessPromptSnapshot = {
   developerInstructions: string;
   threadStartParams: ReturnType<typeof buildThreadStartParams>;
@@ -24,6 +30,7 @@ type CodexHarnessPromptSnapshot = {
   turnStartParams: ReturnType<typeof buildTurnStartParams>;
 };
 
+/** Resolves deterministic app-server options for prompt snapshot tests. */
 export function resolveCodexPromptSnapshotAppServerOptions(
   pluginConfig?: unknown,
 ): CodexAppServerRuntimeOptions {
@@ -34,6 +41,7 @@ export function resolveCodexPromptSnapshotAppServerOptions(
   });
 }
 
+/** Builds thread/resume/turn prompt payload snapshots for a Codex harness attempt. */
 export function buildCodexHarnessPromptSnapshot(params: {
   attempt: EmbeddedRunAttemptParams;
   cwd: string;
@@ -44,7 +52,6 @@ export function buildCodexHarnessPromptSnapshot(params: {
   promptText?: string;
   developerInstructionAdditions?: string;
   turnScopedDeveloperInstructions?: string;
-  heartbeatCollaborationInstructions?: string;
 }): CodexHarnessPromptSnapshot {
   const developerInstructions = joinPresentSections(
     buildDeveloperInstructions(params.attempt, {
@@ -73,7 +80,6 @@ export function buildCodexHarnessPromptSnapshot(params: {
       appServer: params.appServer,
       promptText: params.promptText,
       turnScopedDeveloperInstructions: params.turnScopedDeveloperInstructions,
-      heartbeatCollaborationInstructions: params.heartbeatCollaborationInstructions,
     }),
   };
 }
@@ -82,6 +88,7 @@ function joinPresentSections(...sections: Array<string | undefined>): string {
   return sections.filter((section): section is string => Boolean(section?.trim())).join("\n\n");
 }
 
+/** Converts harness tools into Codex dynamic-tool specs for prompt snapshot tests. */
 export function createCodexDynamicToolSpecsForPromptSnapshot(params: {
   tools: AnyAgentTool[];
   pluginConfig?: Pick<CodexPluginConfig, "codexDynamicToolsLoading" | "codexDynamicToolsExclude">;

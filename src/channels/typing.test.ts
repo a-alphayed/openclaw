@@ -1,7 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+// Typing tests cover typing indicator start, update, and cleanup behavior.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_TIMER_TIMEOUT_MS } from "../shared/number-coercion.js";
 import { createTypingCallbacks } from "./typing.js";
 
 type TypingCallbackOverrides = Partial<Parameters<typeof createTypingCallbacks>[0]>;
+type TypingHarnessOptions = TypingCallbackOverrides & { useDefaultMaxDuration?: boolean };
 type TypingHarnessStart = ReturnType<typeof vi.fn<() => Promise<void>>>;
 type TypingHarnessError = ReturnType<typeof vi.fn<(err: unknown) => void>>;
 
@@ -10,16 +13,30 @@ const flushMicrotasks = async () => {
   await Promise.resolve();
 };
 
+const activeCallbacks = new Set<ReturnType<typeof createTypingCallbacks>>();
+
+afterEach(async () => {
+  for (const callbacks of activeCallbacks) {
+    callbacks.onCleanup?.();
+  }
+  activeCallbacks.clear();
+  await flushMicrotasks();
+  vi.useRealTimers();
+});
+
 async function withFakeTimers(run: () => Promise<void>) {
   vi.useFakeTimers();
   try {
     await run();
   } finally {
+    await flushMicrotasks();
+    vi.clearAllTimers();
     vi.useRealTimers();
+    vi.restoreAllMocks();
   }
 }
 
-function createTypingHarness(overrides: TypingCallbackOverrides = {}) {
+function createTypingHarness(overrides: TypingHarnessOptions = {}) {
   const start: TypingHarnessStart = vi.fn<() => Promise<void>>(async () => {});
   const stop: TypingHarnessStart = vi.fn<() => Promise<void>>(async () => {});
   const onStartError: TypingHarnessError = vi.fn<(err: unknown) => void>();
@@ -49,19 +66,32 @@ function createTypingHarness(overrides: TypingCallbackOverrides = {}) {
     ...(overrides.keepaliveIntervalMs !== undefined
       ? { keepaliveIntervalMs: overrides.keepaliveIntervalMs }
       : {}),
-    ...(overrides.maxDurationMs !== undefined ? { maxDurationMs: overrides.maxDurationMs } : {}),
+    ...(overrides.maxDurationMs !== undefined
+      ? { maxDurationMs: overrides.maxDurationMs }
+      : overrides.useDefaultMaxDuration
+        ? {}
+        : { maxDurationMs: 0 }),
   });
+  activeCallbacks.add(callbacks);
   return { start, stop, onStartError, onStopError, callbacks };
 }
 
 describe("createTypingCallbacks", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
   it("invokes start on reply start", async () => {
     const { start, onStartError, callbacks } = createTypingHarness();
 
-    await callbacks.onReplyStart();
+    try {
+      await callbacks.onReplyStart();
 
-    expect(start).toHaveBeenCalledTimes(1);
-    expect(onStartError).not.toHaveBeenCalled();
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(onStartError).not.toHaveBeenCalled();
+    } finally {
+      callbacks.onCleanup?.();
+    }
   });
 
   it("reports start errors", async () => {
@@ -69,10 +99,14 @@ describe("createTypingCallbacks", () => {
       start: vi.fn().mockRejectedValue(new Error("fail")),
     });
 
-    await callbacks.onReplyStart();
-    await flushMicrotasks();
+    try {
+      await callbacks.onReplyStart();
+      await flushMicrotasks();
 
-    expect(onStartError).toHaveBeenCalledTimes(1);
+      expect(onStartError).toHaveBeenCalledTimes(1);
+    } finally {
+      callbacks.onCleanup?.();
+    }
   });
 
   it("does not block reply start on a pending typing request", async () => {
@@ -86,13 +120,17 @@ describe("createTypingCallbacks", () => {
       ),
     });
 
-    await callbacks.onReplyStart();
+    try {
+      await callbacks.onReplyStart();
 
-    expect(start).toHaveBeenCalledTimes(1);
-    if (!resolveStart) {
-      throw new Error("Expected typing start resolver to be initialized");
+      expect(start).toHaveBeenCalledTimes(1);
+      if (!resolveStart) {
+        throw new Error("Expected typing start resolver to be initialized");
+      }
+      resolveStart();
+    } finally {
+      callbacks.onCleanup?.();
     }
-    resolveStart();
   });
 
   it("invokes stop on idle and reports stop errors", async () => {
@@ -131,6 +169,56 @@ describe("createTypingCallbacks", () => {
     });
   });
 
+  it("preserves the existing keepalive cadence when an active reply starts again", async () => {
+    await withFakeTimers(async () => {
+      const { start, callbacks } = createTypingHarness({ keepaliveIntervalMs: 4_000 });
+
+      await callbacks.onReplyStart();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await callbacks.onReplyStart();
+      expect(start).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(start).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  it("keeps coalesced typing alive beyond 60 seconds while the same task refreshes it", async () => {
+    await withFakeTimers(async () => {
+      vi.setSystemTime(0);
+      const acceptedStarts: number[] = [];
+      const { callbacks } = createTypingHarness({
+        keepaliveIntervalMs: 4_000,
+        maxDurationMs: 0,
+        start: async () => {
+          const now = Date.now();
+          const previous = acceptedStarts.at(-1);
+          if (previous !== undefined && now - previous < 4_000) {
+            return;
+          }
+          acceptedStarts.push(now);
+        },
+      });
+
+      await callbacks.onReplyStart();
+      for (let elapsedMs = 6_000; elapsedMs <= 132_000; elapsedMs += 6_000) {
+        await vi.advanceTimersByTimeAsync(6_000);
+        await callbacks.onReplyStart();
+      }
+
+      expect(acceptedStarts.at(-1)).toBeGreaterThan(120_000);
+      for (let index = 1; index < acceptedStarts.length; index += 1) {
+        expect(acceptedStarts[index]! - acceptedStarts[index - 1]!).toBeLessThanOrEqual(4_000);
+      }
+
+      callbacks.onIdle?.();
+      const countAtTaskCompletion = acceptedStarts.length;
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(acceptedStarts).toHaveLength(countAtTaskCompletion);
+    });
+  });
+
   it("stops keepalive after consecutive start failures", async () => {
     await withFakeTimers(async () => {
       const { start, onStartError, callbacks } = createTypingHarness({
@@ -147,6 +235,38 @@ describe("createTypingCallbacks", () => {
 
       await vi.advanceTimersByTimeAsync(9_000);
       expect(start).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("honors an explicit higher consecutive failure breaker", async () => {
+    await withFakeTimers(async () => {
+      const { start, onStartError, callbacks } = createTypingHarness({
+        start: vi.fn().mockRejectedValue(new Error("gone")),
+        maxConsecutiveFailures: 5,
+      });
+      await callbacks.onReplyStart();
+      await flushMicrotasks();
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(onStartError).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(onStartError).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(start).toHaveBeenCalledTimes(3);
+      expect(onStartError).toHaveBeenCalledTimes(3);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(start).toHaveBeenCalledTimes(4);
+      expect(onStartError).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(start).toHaveBeenCalledTimes(5);
+      expect(onStartError).toHaveBeenCalledTimes(5);
+
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(start).toHaveBeenCalledTimes(5);
     });
   });
 
@@ -169,6 +289,10 @@ describe("createTypingCallbacks", () => {
       expect(start).toHaveBeenCalledTimes(2);
       expect(onStartError).toHaveBeenCalledTimes(2);
 
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(onStartError).toHaveBeenCalledTimes(2);
+
       await vi.advanceTimersByTimeAsync(9_000);
       expect(start).toHaveBeenCalledTimes(2);
     });
@@ -183,6 +307,25 @@ describe("createTypingCallbacks", () => {
 
       await vi.advanceTimersByTimeAsync(9_000);
       expect(start).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("clamps oversized keepalive intervals before arming timers", async () => {
+    await withFakeTimers(async () => {
+      const { start, callbacks } = createTypingHarness({
+        keepaliveIntervalMs: Number.MAX_SAFE_INTEGER,
+        maxDurationMs: 0,
+      });
+
+      await callbacks.onReplyStart();
+      await flushMicrotasks();
+
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(MAX_TIMER_TIMEOUT_MS - 1);
+      expect(start).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(start).toHaveBeenCalledTimes(2);
+      callbacks.onCleanup?.();
     });
   });
 
@@ -307,7 +450,7 @@ describe("createTypingCallbacks", () => {
 
     it("uses default 60s TTL when not specified", async () => {
       await withFakeTimers(async () => {
-        const { stop, callbacks } = createTypingHarness();
+        const { stop, callbacks } = createTypingHarness({ useDefaultMaxDuration: true });
 
         await callbacks.onReplyStart();
 
@@ -344,6 +487,29 @@ describe("createTypingCallbacks", () => {
         // Should not auto-stop even after long time
         await vi.advanceTimersByTimeAsync(300_000);
         expect(stop).not.toHaveBeenCalled();
+      });
+    });
+
+    it("clamps oversized TTLs before arming timers", async () => {
+      await withFakeTimers(async () => {
+        const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const { stop, callbacks } = createTypingHarness({
+          keepaliveIntervalMs: 0,
+          maxDurationMs: Number.MAX_SAFE_INTEGER,
+        });
+
+        await callbacks.onReplyStart();
+        await flushMicrotasks();
+
+        expect(vi.getTimerCount()).toBe(1);
+        await vi.advanceTimersByTimeAsync(MAX_TIMER_TIMEOUT_MS - 1);
+        expect(stop).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(stop).toHaveBeenCalledTimes(1);
+        expect(consoleWarn).toHaveBeenCalledWith(
+          `[typing] TTL exceeded (${MAX_TIMER_TIMEOUT_MS}ms), auto-stopping typing indicator`,
+        );
+        callbacks.onCleanup?.();
       });
     });
 

@@ -1,12 +1,15 @@
+/**
+ * Agent-facing Canvas tool schema and allowed action/format enums.
+ */
 import {
   optionalFiniteNumberSchema,
-  optionalNonNegativeIntegerSchema,
   optionalPositiveIntegerSchema,
   stringEnum,
 } from "openclaw/plugin-sdk/channel-actions";
 import { Type } from "typebox";
 
-export const CANVAS_ACTIONS = [
+/** Agent tool actions supported by the Canvas plugin. */
+const CANVAS_ACTIONS = [
   "present",
   "hide",
   "navigate",
@@ -16,8 +19,10 @@ export const CANVAS_ACTIONS = [
   "a2ui_reset",
 ] as const;
 
-export const CANVAS_SNAPSHOT_FORMATS = ["png", "jpg", "jpeg"] as const;
+/** Snapshot formats accepted by the Canvas tool. */
+const CANVAS_SNAPSHOT_FORMATS = ["png", "jpg", "jpeg"] as const;
 
+/** TypeBox schema for the model-facing Canvas tool arguments. */
 export const CanvasToolSchema = Type.Object({
   action: stringEnum(CANVAS_ACTIONS),
   gatewayUrl: Type.Optional(Type.String()),
@@ -34,7 +39,6 @@ export const CanvasToolSchema = Type.Object({
   outputFormat: Type.Optional(stringEnum(CANVAS_SNAPSHOT_FORMATS)),
   maxWidth: optionalPositiveIntegerSchema(),
   quality: optionalFiniteNumberSchema({ minimum: 0, maximum: 1 }),
-  delayMs: optionalNonNegativeIntegerSchema(),
   jsonl: Type.Optional(Type.String()),
   jsonlPath: Type.Optional(Type.String()),
 });

@@ -4,7 +4,11 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { getShellConfig } from "../utils/shell.js";
+import {
+  buildShellCommandInvocation,
+  getBashShellConfig,
+  getBashShellEnv,
+} from "../shell-utils.js";
 
 // Cache for shell command results (persists for process lifetime)
 const commandResultCache = new Map<string, string | undefined>();
@@ -27,13 +31,17 @@ function executeWithConfiguredShell(command: string): {
   value: string | undefined;
 } {
   try {
-    const { shell, args } = getShellConfig();
-    const result = spawnSync(shell, [...args, command], {
+    const shellConfig = getBashShellConfig();
+    const invocation = buildShellCommandInvocation(command, shellConfig);
+    const [shell, ...args] = invocation.argv;
+    const result = spawnSync(shell, args, {
       encoding: "utf-8",
+      ...(invocation.input === undefined ? {} : { input: invocation.input }),
       timeout: 10000,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: [invocation.stdin, "pipe", "ignore"],
       shell: false,
       windowsHide: true,
+      env: getBashShellEnv(shellConfig.shell),
     });
 
     if (result.error) {
@@ -112,25 +120,6 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
   }
 
   throw new Error(`Failed to resolve ${description}`);
-}
-
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
-export function resolveHeaders(
-  headers: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  if (!headers) {
-    return undefined;
-  }
-  const resolved: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers)) {
-    const resolvedValue = resolveConfigValue(value);
-    if (resolvedValue) {
-      resolved[key] = resolvedValue;
-    }
-  }
-  return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
 
 export function resolveHeadersOrThrow(

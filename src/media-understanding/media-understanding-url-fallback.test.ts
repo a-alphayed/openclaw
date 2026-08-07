@@ -1,3 +1,5 @@
+// Attachment URL fallback tests cover blocked local paths falling back to
+// remote media fetches and temp-file materialization.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -118,6 +120,37 @@ describe("media understanding attachment URL fallback", () => {
           ssrfPolicy: undefined,
           retry: expect.objectContaining({ attempts: 3 }),
         });
+      },
+    );
+  });
+
+  it("keeps HTTP fallback when the supplied local path is missing", async () => {
+    await withTempDir(
+      { prefix: "openclaw-media-cache-missing-path-url-fallback-" },
+      async (base) => {
+        const fallbackUrl = "https://example.com/fallback.jpg";
+        readRemoteMediaBufferMock.mockResolvedValue({
+          buffer: Buffer.from("fallback-buffer"),
+          contentType: "image/jpeg",
+          fileName: "fallback.jpg",
+        });
+        const cache = new MediaAttachmentCache([
+          {
+            index: 0,
+            path: path.join(base, "missing.jpg"),
+            url: fallbackUrl,
+            mime: "image/jpeg",
+          },
+        ]);
+
+        const result = await cache.getBuffer({
+          attachmentIndex: 0,
+          maxBytes: 1024,
+          timeoutMs: 1000,
+        });
+
+        expect(result.buffer.toString()).toBe("fallback-buffer");
+        expect(requireReadRemoteMediaBufferInput()).toMatchObject({ url: fallbackUrl });
       },
     );
   });

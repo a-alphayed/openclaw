@@ -1,3 +1,4 @@
+/** Tests synthetic auth fallback during agent model discovery. */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,12 +31,11 @@ vi.mock("../plugins/provider-runtime.js", () => ({
 
 vi.mock("./auth-profiles/store.js", () => ({
   ensureAuthProfileStore: () => ({ version: 1, profiles: {} }),
-  loadAuthProfileStoreForSecretsRuntime: () => ({ version: 1, profiles: {} }),
+  ensureAuthProfileStoreWithoutExternalProfiles: () => ({ version: 1, profiles: {} }),
 }));
 
 vi.mock("./agent-auth-discovery-core.js", () => ({
   addEnvBackedAgentCredentials: (credentials: Record<string, unknown>) => ({ ...credentials }),
-  scrubLegacyStaticAuthJsonEntriesForDiscovery: vi.fn(),
 }));
 
 let resolveAgentCredentialsForDiscovery: typeof import("./agent-auth-discovery.js").resolveAgentCredentialsForDiscovery;
@@ -74,6 +74,9 @@ describe("agent model discovery synthetic auth", () => {
       expect(resolveProviderSyntheticAuthWithPlugin).toHaveBeenCalledTimes(1);
       expect(resolveProviderSyntheticAuthWithPlugin).toHaveBeenCalledWith({
         provider: "claude-cli",
+        config: undefined,
+        workspaceDir: undefined,
+        env: undefined,
         context: {
           config: undefined,
           provider: "claude-cli",

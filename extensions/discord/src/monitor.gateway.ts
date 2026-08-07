@@ -1,3 +1,5 @@
+// Discord plugin module implements monitor.gateway behavior.
+import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import type { DiscordGatewayHandle } from "./monitor/gateway-handle.js";
 import { DiscordGatewayLifecycleError } from "./monitor/gateway-supervisor.js";
 import type {
@@ -7,7 +9,7 @@ import type {
 
 export { getDiscordGatewayEmitter } from "./monitor/gateway-supervisor.js";
 
-export type WaitForDiscordGatewayStopParams = {
+type WaitForDiscordGatewayStopParams = {
   gateway?: DiscordGatewayHandle;
   abortSignal?: AbortSignal;
   gatewaySupervisor?: Pick<DiscordGatewaySupervisor, "attachLifecycle" | "detachLifecycle">;
@@ -48,7 +50,7 @@ export async function waitForDiscordGatewayStop(
         gateway?.disconnect?.();
       } finally {
         cleanup();
-        reject(err);
+        reject(toErrorObject(err, "Non-Error rejection"));
       }
     };
     const onAbort = () => {

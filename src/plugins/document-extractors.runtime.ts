@@ -1,8 +1,13 @@
+/** Resolves bundled document extractor providers from enabled manifest contracts. */
+import {
+  normalizeStringEntries,
+  sortUniqueStrings,
+} from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeStringEntries, sortUniqueStrings } from "../shared/string-normalization.js";
 import { resolveEnabledBundledManifestContractPlugins } from "./bundled-manifest-contract-plugins.js";
 import { loadBundledDocumentExtractorEntriesFromDir } from "./document-extractor-public-artifacts.js";
 import type { PluginDocumentExtractorEntry } from "./document-extractor-types.js";
+import { createPluginIdScopeSet } from "./plugin-scope.js";
 
 function compareExtractors(
   left: PluginDocumentExtractorEntry,
@@ -24,8 +29,7 @@ function resolveExplicitAllowedDocumentExtractorPluginIds(params: {
   if (!Array.isArray(allow) || allow.length === 0) {
     return null;
   }
-  const onlyPluginIdSet =
-    params.onlyPluginIds && params.onlyPluginIds.length > 0 ? new Set(params.onlyPluginIds) : null;
+  const onlyPluginIdSet = createPluginIdScopeSet(params.onlyPluginIds);
   const deniedPluginIds = new Set(params.config?.plugins?.deny ?? []);
   const entries = params.config?.plugins?.entries ?? {};
   return sortUniqueStrings(
@@ -36,6 +40,7 @@ function resolveExplicitAllowedDocumentExtractorPluginIds(params: {
   );
 }
 
+/** Returns enabled document extractors in deterministic auto-detect order. */
 export function resolvePluginDocumentExtractors(params?: {
   config?: OpenClawConfig;
   workspaceDir?: string;

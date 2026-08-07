@@ -1,3 +1,4 @@
+// Msteams tests cover media helpers plugin behavior.
 import { describe, expect, it } from "vitest";
 import { extractFilename, extractMessageId, getMimeType, isLocalPath } from "./media-helpers.js";
 
@@ -99,6 +100,17 @@ describe("msteams media-helpers", () => {
 
     it("extracts filename from URL with path", async () => {
       expect(await extractFilename("https://example.com/images/2024/photo.png")).toBe("photo.png");
+    });
+
+    it.each([
+      ["https://example.com/files/My%20report.pdf", "My report.pdf"],
+      ["https://example.com/files/r%C3%A9sum%C3%A9.pdf", "résumé.pdf"],
+      ["https://example.com/files/100%25.png", "100%.png"],
+      ["https://example.com/files/bad%ZZ.pdf", "bad%ZZ.pdf"],
+      ["https://example.com/files/folder%2Fsecret.png", "folder%2Fsecret.png"],
+      ["https://example.com/files/folder%5Csecret.png", "folder%5Csecret.png"],
+    ])("preserves the safe display filename from %s", async (url, expected) => {
+      expect(await extractFilename(url)).toBe(expected);
     });
 
     it("handles URLs without extension by deriving from MIME", async () => {

@@ -1,3 +1,5 @@
+// Verifies outbound text/media send-unit planning, chunking, captions, and
+// single-use implicit reply consumption.
 import { describe, expect, it } from "vitest";
 import { planOutboundMediaMessageUnits, planOutboundTextMessageUnits } from "./message-plan.js";
 import { createReplyToDeliveryPolicy } from "./reply-policy.js";
@@ -28,6 +30,7 @@ describe("outbound message planning", () => {
       ["text", "ab", "reply-1"],
       ["text", "cd", undefined],
     ]);
+    expect(units.map((unit) => unit.overrides.deliveryPartCount)).toEqual([2, 2]);
   });
 
   it("keeps explicit text replies from consuming the implicit slot", () => {
@@ -77,12 +80,19 @@ describe("outbound message planning", () => {
     expect(
       units.map((unit) =>
         unit.kind === "media"
-          ? [unit.kind, unit.caption, unit.mediaUrl, unit.overrides.replyToId]
+          ? [
+              unit.kind,
+              unit.caption,
+              unit.mediaUrl,
+              unit.overrides.replyToId,
+              unit.overrides.deliveryPartIndex,
+              unit.overrides.deliveryPartCount,
+            ]
           : [unit.kind],
       ),
     ).toEqual([
-      ["media", "caption", "https://example.com/1.png", "reply-1"],
-      ["media", undefined, "https://example.com/2.png", undefined],
+      ["media", "caption", "https://example.com/1.png", "reply-1", 0, 2],
+      ["media", undefined, "https://example.com/2.png", undefined, 1, 2],
     ]);
   });
 
@@ -99,7 +109,11 @@ describe("outbound message planning", () => {
       {
         kind: "text",
         text: "<b>bold</b>",
-        overrides: { formatting: { parseMode: "HTML" } },
+        overrides: {
+          formatting: { parseMode: "HTML" },
+          deliveryPartIndex: 0,
+          deliveryPartCount: 1,
+        },
       },
     ]);
   });

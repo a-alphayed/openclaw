@@ -1,5 +1,11 @@
+/**
+ * Fixtures for embedded agent tool-handler state tests.
+ * Keeps large mutable handler state construction centralized so assertions can
+ * focus on the field under test.
+ */
 import { createEmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
 
+/** Build the minimal mutable state object expected by tool handler tests. */
 export function createBaseToolHandlerState() {
   return {
     replayState: createEmbeddedRunReplayState(),
@@ -15,14 +21,17 @@ export function createBaseToolHandlerState() {
     pendingMessagingTargets: new Map<string, unknown>(),
     pendingMessagingMediaUrls: new Map<string, string[]>(),
     pendingToolMediaUrls: [] as string[],
+    pendingToolMediaTrustByUrl: new Map<string, boolean>(),
     pendingToolAudioAsVoice: false,
-    pendingToolTrustedLocalMedia: false,
     deterministicApprovalPromptPending: false,
     toolExecutionSinceLastBlockReply: false,
+    assistantMessageIndex: 0,
     messagingToolSentTexts: [] as string[],
     messagingToolSentTextsNormalized: [] as string[],
+    currentSourceMessagingToolSentTextsNormalized: [] as string[],
     messagingToolSentMediaUrls: [] as string[],
     messagingToolSourceReplyPayloads: [],
+    messageToolOnlySourceReplyDelivered: false,
     messagingToolSentTargets: [] as unknown[],
     deterministicApprovalPromptSent: false,
     blockBuffer: "",

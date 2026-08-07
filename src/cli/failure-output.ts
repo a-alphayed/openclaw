@@ -1,3 +1,4 @@
+// Shared root CLI failure formatting with debug stack gating and recovery hints.
 import { isTruthyEnvValue } from "../infra/env.js";
 import { formatErrorMessage, formatUncaughtError } from "../infra/errors.js";
 import { formatCliCommand } from "./command-format.js";
@@ -11,7 +12,16 @@ type FormatCliFailureOptions = {
 };
 
 function hasDebugArg(argv: string[] | undefined): boolean {
-  return Boolean(argv?.some((arg) => arg === "--debug" || arg === "--verbose"));
+  for (const arg of argv ?? []) {
+    // Arguments after the terminator belong to the child, not root stack-trace policy.
+    if (arg === "--") {
+      return false;
+    }
+    if (arg === "--debug" || arg === "--verbose") {
+      return true;
+    }
+  }
+  return false;
 }
 
 function shouldShowStack(argv: string[] | undefined, env: NodeJS.ProcessEnv): boolean {
@@ -27,6 +37,7 @@ function pushPrefixed(out: string[], value: string): void {
 }
 
 export function formatCliFailureLines(options: FormatCliFailureOptions): string[] {
+  // Default output stays terse; stack traces require explicit debug intent.
   const env = options.env ?? process.env;
   const lines = [
     `[openclaw] ${options.title}`,

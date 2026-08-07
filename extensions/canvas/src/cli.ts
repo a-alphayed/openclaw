@@ -1,3 +1,6 @@
+/**
+ * Canvas node CLI command registration and runtime dependency wiring.
+ */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import type { Command } from "commander";
@@ -9,6 +12,8 @@ import {
   type NodeMatchCandidate,
 } from "openclaw/plugin-sdk/gateway-runtime";
 import {
+  addTimerTimeoutGraceMs,
+  clampPositiveTimerTimeoutMs,
   parseStrictFiniteNumber,
   parseStrictPositiveInteger,
 } from "openclaw/plugin-sdk/number-runtime";
@@ -18,16 +23,18 @@ import {
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { shortenHomePath } from "openclaw/plugin-sdk/text-utility-runtime";
-import { buildA2UITextJsonl, validateA2UIJsonl } from "./a2ui-jsonl.js";
+import { buildA2UITextJsonl, validateSupportedA2UIJsonl } from "./a2ui-jsonl.js";
 import { canvasSnapshotTempPath, parseCanvasSnapshotPayload } from "./cli-helpers.js";
 
-export type CanvasCliRuntime = {
+/** Runtime output surface used by Canvas CLI commands. */
+type CanvasCliRuntime = {
   log: (message: string) => void;
   error: (message: string) => void;
   exit: (code: number) => void;
   writeJson: (value: unknown) => void;
 };
 
+/** Parent node/gateway options consumed by Canvas CLI commands. */
 export type CanvasNodesRpcOpts = {
   url?: string;
   token?: string;
@@ -48,6 +55,7 @@ export type CanvasNodesRpcOpts = {
   quality?: string;
 };
 
+/** Dependency bundle used to keep Canvas CLI commands testable. */
 export type CanvasCliDependencies = {
   defaultRuntime: CanvasCliRuntime;
   nodesCallOpts: (cmd: Command, defaults?: { timeoutMs?: number }) => Command;
@@ -74,6 +82,9 @@ export type CanvasCliDependencies = {
 type CanvasNodeCandidate = NodeMatchCandidate;
 type CanvasSnapshotRequestFormat = "png" | "jpeg";
 
+const DEFAULT_CANVAS_NODE_INVOKE_TIMEOUT_MS = 30_000;
+const CANVAS_NODE_INVOKE_TRANSPORT_GRACE_MS = 10_000;
+
 function parseCanvasSnapshotRequestFormat(raw: unknown): CanvasSnapshotRequestFormat {
   const format = normalizeLowercaseStringOrEmpty(normalizeOptionalString(raw) ?? "jpg");
   switch (format) {
@@ -91,7 +102,11 @@ function parseTimeoutMs(raw: unknown): number | undefined {
   if (raw === undefined || raw === null) {
     return undefined;
   }
-  return parseStrictPositiveInteger(raw);
+  const parsed = parseStrictPositiveInteger(raw);
+  if (parsed === undefined) {
+    throw new Error("--invoke-timeout must be a positive integer.");
+  }
+  return parsed;
 }
 
 function parseCanvasPositiveIntOption(raw: string | undefined, flag: string): number | undefined {
@@ -112,6 +127,14 @@ function parseCanvasFiniteNumberOption(raw: string | undefined, flag: string): n
   const parsed = parseStrictFiniteNumber(raw);
   if (parsed === undefined) {
     throw new Error(`${flag} must be a number.`);
+  }
+  return parsed;
+}
+
+function parseCanvasSnapshotQualityOption(raw: string | undefined): number | undefined {
+  const parsed = parseCanvasFiniteNumberOption(raw, "--quality");
+  if (parsed !== undefined && (parsed < 0 || parsed > 1)) {
+    throw new Error("--quality must be between 0 and 1.");
   }
   return parsed;
 }
@@ -173,6 +196,7 @@ function unauthorizedHintForMessage(message: string): string | null {
   return null;
 }
 
+/** Creates the default Canvas CLI dependency bundle backed by the OpenClaw gateway CLI. */
 export function createDefaultCanvasCliDependencies(): CanvasCliDependencies {
   const nodesCallOpts = (cmd: Command, defaults?: { timeoutMs?: number }) =>
     cmd
@@ -238,20 +262,42 @@ async function invokeCanvas(
   command: string,
   params?: Record<string, unknown>,
 ) {
+  const timeoutMs =
+    clampPositiveTimerTimeoutMs(
+      deps.parseTimeoutMs(opts.invokeTimeout) ?? DEFAULT_CANVAS_NODE_INVOKE_TIMEOUT_MS,
+    ) ?? DEFAULT_CANVAS_NODE_INVOKE_TIMEOUT_MS;
   const nodeId = await deps.resolveNodeId(opts, normalizeOptionalString(opts.node) ?? "");
-  const timeoutMs = deps.parseTimeoutMs(opts.invokeTimeout);
-  return await deps.callGatewayCli(
-    "node.invoke",
-    opts,
-    deps.buildNodeInvokeParams({
-      nodeId,
-      command,
-      params,
-      timeoutMs: typeof timeoutMs === "number" ? timeoutMs : undefined,
-    }),
+  const invokeParams = deps.buildNodeInvokeParams({ nodeId, command, params, timeoutMs });
+  const configuredGatewayTimeoutMs = parseStrictPositiveInteger(opts.timeout ?? 10_000);
+  if (configuredGatewayTimeoutMs === undefined) {
+    // Preserve the existing Gateway parser's actionable invalid --timeout error.
+    return await deps.callGatewayCli("node.invoke", opts, invokeParams);
+  }
+  // Node work owns its deadline; Gateway transport needs extra time to deliver that result.
+  const transportTimeoutMs = Math.max(
+    clampPositiveTimerTimeoutMs(configuredGatewayTimeoutMs) ??
+      DEFAULT_CANVAS_NODE_INVOKE_TIMEOUT_MS,
+    addTimerTimeoutGraceMs(timeoutMs, CANVAS_NODE_INVOKE_TRANSPORT_GRACE_MS) ?? timeoutMs,
   );
+  return await deps.callGatewayCli("node.invoke", opts, invokeParams, { transportTimeoutMs });
 }
 
+/** Prints the complete invocation response for machines or the existing human acknowledgement. */
+function writeCanvasInvokeResult(
+  deps: CanvasCliDependencies,
+  opts: CanvasNodesRpcOpts,
+  result: unknown,
+  message: string,
+): void {
+  if (opts.json) {
+    deps.defaultRuntime.writeJson(result);
+    return;
+  }
+  const { ok } = deps.getNodesTheme();
+  deps.defaultRuntime.log(ok(message));
+}
+
+/** Registers Canvas subcommands under the nodes CLI command group. */
 export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDependencies) {
   const canvas = nodes
     .command("canvas")
@@ -260,7 +306,7 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
   deps.nodesCallOpts(
     canvas
       .command("snapshot")
-      .description("Capture a canvas snapshot (prints MEDIA:<path>)")
+      .description("Capture a canvas snapshot (prints the saved path)")
       .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
       .option("--format <png|jpg|jpeg>", "Image format", "jpg")
       .option("--max-width <px>", "Max width in px (optional)")
@@ -270,7 +316,7 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
         await deps.runNodesCommand("canvas snapshot", async () => {
           const format = parseCanvasSnapshotRequestFormat(opts.format);
           const maxWidth = parseCanvasPositiveIntOption(opts.maxWidth, "--max-width");
-          const quality = parseCanvasFiniteNumberOption(opts.quality, "--quality");
+          const quality = parseCanvasSnapshotQualityOption(opts.quality);
           const raw = await invokeCanvas(deps, opts, "canvas.snapshot", {
             format,
             maxWidth: Number.isFinite(maxWidth) ? maxWidth : undefined,
@@ -287,7 +333,7 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
             deps.defaultRuntime.writeJson({ file: { path: filePath, format: payload.format } });
             return;
           }
-          deps.defaultRuntime.log(`MEDIA:${deps.shortenHomePath(filePath)}`);
+          deps.defaultRuntime.log(deps.shortenHomePath(filePath));
         });
       }),
     { timeoutMs: 60_000 },
@@ -324,11 +370,8 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
           ) {
             params.placement = placement;
           }
-          await invokeCanvas(deps, opts, "canvas.present", params);
-          if (!opts.json) {
-            const { ok } = deps.getNodesTheme();
-            deps.defaultRuntime.log(ok("canvas present ok"));
-          }
+          const result = await invokeCanvas(deps, opts, "canvas.present", params);
+          writeCanvasInvokeResult(deps, opts, result, "canvas present ok");
         });
       }),
   );
@@ -341,11 +384,8 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
       .action(async (opts: CanvasNodesRpcOpts) => {
         await deps.runNodesCommand("canvas hide", async () => {
-          await invokeCanvas(deps, opts, "canvas.hide", undefined);
-          if (!opts.json) {
-            const { ok } = deps.getNodesTheme();
-            deps.defaultRuntime.log(ok("canvas hide ok"));
-          }
+          const result = await invokeCanvas(deps, opts, "canvas.hide", undefined);
+          writeCanvasInvokeResult(deps, opts, result, "canvas hide ok");
         });
       }),
   );
@@ -359,11 +399,8 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
       .action(async (url: string, opts: CanvasNodesRpcOpts) => {
         await deps.runNodesCommand("canvas navigate", async () => {
-          await invokeCanvas(deps, opts, "canvas.navigate", { url });
-          if (!opts.json) {
-            const { ok } = deps.getNodesTheme();
-            deps.defaultRuntime.log(ok("canvas navigate ok"));
-          }
+          const result = await invokeCanvas(deps, opts, "canvas.navigate", { url });
+          writeCanvasInvokeResult(deps, opts, result, "canvas navigate ok");
         });
       }),
   );
@@ -393,7 +430,7 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
             typeof raw === "object" && raw !== null
               ? (raw as { payload?: { result?: string } }).payload
               : undefined;
-          if (payload?.result) {
+          if (typeof payload?.result === "string") {
             deps.defaultRuntime.log(payload.result);
           } else {
             const { ok } = deps.getNodesTheme();
@@ -424,21 +461,14 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
           const jsonl = hasText
             ? buildA2UITextJsonl(opts.text ?? "")
             : await fs.readFile(String(opts.jsonl), "utf8");
-          const { version, messageCount } = validateA2UIJsonl(jsonl);
-          if (version === "v0.9") {
-            throw new Error(
-              "Detected A2UI v0.9 JSONL (createSurface). OpenClaw currently supports v0.8 only.",
-            );
-          }
-          await invokeCanvas(deps, opts, "canvas.a2ui.pushJSONL", { jsonl });
-          if (!opts.json) {
-            const { ok } = deps.getNodesTheme();
-            deps.defaultRuntime.log(
-              ok(
-                `canvas a2ui push ok (v0.8, ${messageCount} message${messageCount === 1 ? "" : "s"})`,
-              ),
-            );
-          }
+          const { messageCount } = validateSupportedA2UIJsonl(jsonl);
+          const result = await invokeCanvas(deps, opts, "canvas.a2ui.pushJSONL", { jsonl });
+          writeCanvasInvokeResult(
+            deps,
+            opts,
+            result,
+            `canvas a2ui push ok (v0.8, ${messageCount} message${messageCount === 1 ? "" : "s"})`,
+          );
         });
       }),
   );
@@ -451,11 +481,8 @@ export function registerNodesCanvasCommands(nodes: Command, deps: CanvasCliDepen
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
       .action(async (opts: CanvasNodesRpcOpts) => {
         await deps.runNodesCommand("canvas a2ui reset", async () => {
-          await invokeCanvas(deps, opts, "canvas.a2ui.reset", undefined);
-          if (!opts.json) {
-            const { ok } = deps.getNodesTheme();
-            deps.defaultRuntime.log(ok("canvas a2ui reset ok"));
-          }
+          const result = await invokeCanvas(deps, opts, "canvas.a2ui.reset", undefined);
+          writeCanvasInvokeResult(deps, opts, result, "canvas a2ui reset ok");
         });
       }),
   );

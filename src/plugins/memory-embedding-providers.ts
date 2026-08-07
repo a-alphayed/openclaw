@@ -1,157 +1,77 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { SecretInput } from "../config/types.secrets.js";
-import type { EmbeddingInput } from "../memory-host-sdk/host/embedding-inputs.js";
+import type {
+  MemoryEmbeddingProviderAdapter,
+  RegisteredMemoryEmbeddingProvider,
+} from "./registry-contribution-types.js";
+import {
+  assertDirectPluginRegistrationReplacement,
+  requireActivePluginRegistry,
+  resolveDirectPluginRegistrationOwner,
+} from "./runtime.js";
 
-export type MemoryEmbeddingBatchChunk = {
-  text: string;
-  embeddingInput?: EmbeddingInput;
-};
+export type {
+  MemoryEmbeddingBatchChunk,
+  MemoryEmbeddingBatchOptions,
+  MemoryEmbeddingProvider,
+  MemoryEmbeddingProviderAdapter,
+  MemoryEmbeddingProviderCallOptions,
+  MemoryEmbeddingProviderCreateOptions,
+  MemoryEmbeddingProviderCreateResult,
+  MemoryEmbeddingProviderIndexIdentity,
+  MemoryEmbeddingProviderRuntime,
+  RegisteredMemoryEmbeddingProvider,
+} from "./registry-contribution-types.js";
 
-export type MemoryEmbeddingBatchOptions = {
-  agentId: string;
-  chunks: MemoryEmbeddingBatchChunk[];
-  wait: boolean;
-  concurrency: number;
-  pollIntervalMs: number;
-  timeoutMs: number;
-  debug: (message: string, data?: Record<string, unknown>) => void;
-};
-
-export type MemoryEmbeddingProviderCallOptions = {
-  signal?: AbortSignal;
-};
-
-export type MemoryEmbeddingProviderRuntime = {
-  id: string;
-  cacheKeyData?: Record<string, unknown>;
-  inlineQueryTimeoutMs?: number;
-  inlineBatchTimeoutMs?: number;
-  batchEmbed?: (options: MemoryEmbeddingBatchOptions) => Promise<number[][] | null>;
-};
-
-export type MemoryEmbeddingProvider = {
-  id: string;
-  model: string;
-  maxInputTokens?: number;
-  embedQuery: (text: string, options?: MemoryEmbeddingProviderCallOptions) => Promise<number[]>;
-  embedBatch: (
-    texts: string[],
-    options?: MemoryEmbeddingProviderCallOptions,
-  ) => Promise<number[][]>;
-  embedBatchInputs?: (
-    inputs: EmbeddingInput[],
-    options?: MemoryEmbeddingProviderCallOptions,
-  ) => Promise<number[][]>;
-  close?: () => Promise<void> | void;
-};
-
-export type MemoryEmbeddingProviderCreateOptions = {
-  config: OpenClawConfig;
-  agentDir?: string;
-  provider?: string;
-  fallback?: string;
-  remote?: {
-    baseUrl?: string;
-    apiKey?: SecretInput;
-    headers?: Record<string, string>;
-  };
-  model: string;
-  inputType?: string;
-  queryInputType?: string;
-  documentInputType?: string;
-  local?: {
-    modelPath?: string;
-    modelCacheDir?: string;
-    contextSize?: number | "auto";
-  };
-  outputDimensionality?: number;
-  taskType?:
-    | "RETRIEVAL_QUERY"
-    | "RETRIEVAL_DOCUMENT"
-    | "SEMANTIC_SIMILARITY"
-    | "CLASSIFICATION"
-    | "CLUSTERING"
-    | "QUESTION_ANSWERING"
-    | "FACT_VERIFICATION";
-};
-
-export type MemoryEmbeddingProviderCreateResult = {
-  provider: MemoryEmbeddingProvider | null;
-  runtime?: MemoryEmbeddingProviderRuntime;
-};
-
-export type MemoryEmbeddingProviderAdapter = {
-  id: string;
-  defaultModel?: string;
-  transport?: "local" | "remote";
-  authProviderId?: string;
-  autoSelectPriority?: number;
-  allowExplicitWhenConfiguredAuto?: boolean;
-  supportsMultimodalEmbeddings?: (params: { model: string }) => boolean;
-  create: (
-    options: MemoryEmbeddingProviderCreateOptions,
-  ) => Promise<MemoryEmbeddingProviderCreateResult>;
-  formatSetupError?: (err: unknown) => string;
-  shouldContinueAutoSelection?: (err: unknown) => boolean;
-};
-
-export type RegisteredMemoryEmbeddingProvider = {
-  adapter: MemoryEmbeddingProviderAdapter;
-  ownerPluginId?: string;
-};
-
-const MEMORY_EMBEDDING_PROVIDERS_KEY = Symbol.for("openclaw.memoryEmbeddingProviders");
-
-function getMemoryEmbeddingProviders(): Map<string, RegisteredMemoryEmbeddingProvider> {
-  const globalStore = globalThis as Record<PropertyKey, unknown>;
-  const existing = globalStore[MEMORY_EMBEDDING_PROVIDERS_KEY];
-  if (existing instanceof Map) {
-    return existing as Map<string, RegisteredMemoryEmbeddingProvider>;
-  }
-  const created = new Map<string, RegisteredMemoryEmbeddingProvider>();
-  globalStore[MEMORY_EMBEDDING_PROVIDERS_KEY] = created;
-  return created;
+function getMemoryEmbeddingProviders(): RegisteredMemoryEmbeddingProvider[] {
+  return requireActivePluginRegistry().memoryEmbeddingProviders.map((entry) => ({
+    adapter: entry.provider,
+    ownerPluginId: entry.pluginId || undefined,
+  }));
 }
 
 export function registerMemoryEmbeddingProvider(
   adapter: MemoryEmbeddingProviderAdapter,
   options?: { ownerPluginId?: string },
 ): void {
-  getMemoryEmbeddingProviders().set(adapter.id, {
-    adapter,
-    ownerPluginId: options?.ownerPluginId,
-  });
+  const registry = requireActivePluginRegistry();
+  const pluginId = resolveDirectPluginRegistrationOwner(options?.ownerPluginId) ?? "";
+  const entry = {
+    pluginId,
+    provider: adapter,
+    source: "runtime",
+  };
+  const index = registry.memoryEmbeddingProviders.findIndex(
+    (registration) => registration.provider.id === adapter.id,
+  );
+  if (index !== -1) {
+    assertDirectPluginRegistrationReplacement(
+      registry.memoryEmbeddingProviders[index]?.pluginId || undefined,
+      `memory embedding provider ${adapter.id}`,
+    );
+  }
+  if (index === -1) {
+    registry.memoryEmbeddingProviders.push(entry);
+  } else {
+    registry.memoryEmbeddingProviders.splice(index, 1, entry);
+  }
 }
 
 export function getRegisteredMemoryEmbeddingProvider(
   id: string,
 ): RegisteredMemoryEmbeddingProvider | undefined {
-  return getMemoryEmbeddingProviders().get(id);
-}
-
-export function getMemoryEmbeddingProvider(id: string): MemoryEmbeddingProviderAdapter | undefined {
-  return getMemoryEmbeddingProviders().get(id)?.adapter;
+  return getMemoryEmbeddingProviders().find((entry) => entry.adapter.id === id);
 }
 
 export function listRegisteredMemoryEmbeddingProviders(): RegisteredMemoryEmbeddingProvider[] {
-  return Array.from(getMemoryEmbeddingProviders().values());
+  return getMemoryEmbeddingProviders();
 }
 
 export function listMemoryEmbeddingProviders(): MemoryEmbeddingProviderAdapter[] {
   return listRegisteredMemoryEmbeddingProviders().map((entry) => entry.adapter);
 }
-
-export function restoreMemoryEmbeddingProviders(adapters: MemoryEmbeddingProviderAdapter[]): void {
-  getMemoryEmbeddingProviders().clear();
-  for (const adapter of adapters) {
-    registerMemoryEmbeddingProvider(adapter);
-  }
-}
-
 export function restoreRegisteredMemoryEmbeddingProviders(
   entries: RegisteredMemoryEmbeddingProvider[],
 ): void {
-  getMemoryEmbeddingProviders().clear();
+  clearMemoryEmbeddingProviders();
   for (const entry of entries) {
     registerMemoryEmbeddingProvider(entry.adapter, {
       ownerPluginId: entry.ownerPluginId,
@@ -160,7 +80,5 @@ export function restoreRegisteredMemoryEmbeddingProviders(
 }
 
 export function clearMemoryEmbeddingProviders(): void {
-  getMemoryEmbeddingProviders().clear();
+  requireActivePluginRegistry().memoryEmbeddingProviders.length = 0;
 }
-
-export const resetMemoryEmbeddingProviders = clearMemoryEmbeddingProviders;

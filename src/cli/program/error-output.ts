@@ -1,10 +1,13 @@
-import { formatDocsLink } from "../../terminal/links.js";
-import { theme } from "../../terminal/theme.js";
+// Friendly parse-error formatter for Commander errors and root CLI recovery hints.
+import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
+import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { getCommandPathWithRootOptions } from "../argv.js";
 import { formatCliCommand } from "../command-format.js";
+import { formatCliCommandSuggestions } from "./command-suggestions.js";
 
 type FormatCliParseErrorOptions = {
   argv?: string[];
+  commandPath?: string[];
 };
 
 function stripCommanderErrorPrefix(raw: string): string {
@@ -18,11 +21,14 @@ function quote(value: string): string {
   return `"${value}"`;
 }
 
-function resolveHelpCommand(argv: string[] | undefined, options?: { root?: boolean }): string {
-  if (options?.root || !argv) {
+function resolveHelpCommand(
+  argv: string[] | undefined,
+  options?: { commandPath?: string[]; root?: boolean },
+): string {
+  if (options?.root) {
     return formatCliCommand("openclaw --help");
   }
-  const commandPath = getCommandPathWithRootOptions(argv, 2);
+  const commandPath = options?.commandPath ?? (argv ? getCommandPathWithRootOptions(argv, 2) : []);
   if (commandPath.length === 0) {
     return formatCliCommand("openclaw --help");
   }
@@ -33,7 +39,10 @@ function lines(...items: Array<string | undefined>): string {
   return `${items.filter((item): item is string => Boolean(item)).join("\n")}\n`;
 }
 
-function formatHelpHint(argv: string[] | undefined, options?: { root?: boolean }): string {
+function formatHelpHint(
+  argv: string[] | undefined,
+  options?: { commandPath?: string[]; root?: boolean },
+): string {
   return `${theme.muted("Try:")} ${theme.command(resolveHelpCommand(argv, options))}`;
 }
 
@@ -41,6 +50,7 @@ function formatDocsHint(): string {
   return `${theme.muted("Docs:")} ${formatDocsLink("/cli", "docs.openclaw.ai/cli")}`;
 }
 
+/** Convert Commander parse errors into OpenClaw-specific help and docs guidance. */
 export function formatCliParseErrorOutput(
   raw: string,
   options: FormatCliParseErrorOptions = {},
@@ -51,6 +61,7 @@ export function formatCliParseErrorOutput(
     const command = unknownCommand[1] ?? "";
     return lines(
       theme.error(`OpenClaw does not know the command ${quote(command)}.`),
+      formatCliCommandSuggestions(command),
       formatHelpHint(options.argv, { root: true }),
       `${theme.muted("Plugin command?")} ${theme.command(formatCliCommand("openclaw plugins list"))}`,
       formatDocsHint(),
@@ -62,7 +73,7 @@ export function formatCliParseErrorOutput(
     const option = unknownOption[1] ?? "";
     return lines(
       theme.error(`OpenClaw does not recognize option ${quote(option)}.`),
-      formatHelpHint(options.argv),
+      formatHelpHint(options.argv, { commandPath: options.commandPath }),
     );
   }
 
@@ -71,7 +82,7 @@ export function formatCliParseErrorOutput(
     const argument = missingArgument[1] ?? "";
     return lines(
       theme.error(`Missing required argument ${quote(argument)}.`),
-      formatHelpHint(options.argv),
+      formatHelpHint(options.argv, { commandPath: options.commandPath }),
     );
   }
 
@@ -80,16 +91,19 @@ export function formatCliParseErrorOutput(
     const option = missingOption[1] ?? "";
     return lines(
       theme.error(`Missing required option ${quote(option)}.`),
-      formatHelpHint(options.argv),
+      formatHelpHint(options.argv, { commandPath: options.commandPath }),
     );
   }
 
   if (/^too many arguments\b/i.test(message)) {
-    return lines(theme.error("Too many arguments for this command."), formatHelpHint(options.argv));
+    return lines(
+      theme.error("Too many arguments for this command."),
+      formatHelpHint(options.argv, { commandPath: options.commandPath }),
+    );
   }
 
   return lines(
     theme.error(`OpenClaw could not parse this command: ${message}`),
-    formatHelpHint(options.argv),
+    formatHelpHint(options.argv, { commandPath: options.commandPath }),
   );
 }

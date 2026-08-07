@@ -1,4 +1,5 @@
-import { type MemorySourceFileStateRow } from "./manager-source-state.js";
+// Memory Core plugin module implements manager session sync state behavior.
+import type { MemorySourceFileStateRow } from "./manager-source-state.js";
 
 export type MemorySessionStartupFileState = {
   absPath: string;
@@ -15,7 +16,7 @@ export function resolveMemorySessionStartupDirtyFiles(params: {
   const dirtyFiles: string[] = [];
   for (const file of params.files) {
     const existing = indexedRows.get(file.path);
-    if (!existing) {
+    if (!existing || existing.hash === "") {
       dirtyFiles.push(file.absPath);
       continue;
     }
@@ -25,7 +26,9 @@ export function resolveMemorySessionStartupDirtyFiles(params: {
       dirtyFiles.push(file.absPath);
       continue;
     }
-    if (file.size !== indexedSize || file.mtimeMs > indexedMtimeMs) {
+    // File mtimes and SQLite session updatedAt values can move backward after
+    // restore/reset. The downstream content-hash gate suppresses unchanged rewrites.
+    if (file.size !== indexedSize || file.mtimeMs !== indexedMtimeMs) {
       dirtyFiles.push(file.absPath);
     }
   }

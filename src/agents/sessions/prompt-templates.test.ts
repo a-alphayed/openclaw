@@ -1,20 +1,49 @@
-import { describe, expect, it } from "vitest";
-import { substituteArgs } from "./prompt-templates.js";
+// Prompt template tests cover markdown discovery and fallback metadata.
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { loadPromptTemplates } from "./prompt-templates.js";
 
-describe("prompt template argument substitution", () => {
-  it("rejects unsafe positional placeholders", () => {
-    expect(substituteArgs("$9007199254740992", ["first", "second"])).toBe("");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+describe("loadPromptTemplates", () => {
+  it("keeps fallback descriptions on a UTF-16 boundary", async () => {
+    const root = tempDirs.make("openclaw-prompt-templates-");
+    const promptsDir = join(root, "prompts");
+    await mkdir(promptsDir, { recursive: true });
+    await writeFile(join(promptsDir, "emoji.md"), `${"a".repeat(59)}🚀tail\n`, "utf-8");
+
+    const templates = loadPromptTemplates({
+      cwd: root,
+      agentDir: join(root, "agent"),
+      promptPaths: [promptsDir],
+      includeDefaults: false,
+    });
+
+    expect(templates).toHaveLength(1);
+    expect(templates[0]?.description).toBe(`${"a".repeat(59)}...`);
   });
 
-  it("rejects unsafe slice starts and lengths", () => {
-    const args = ["alpha", "beta", "gamma"];
+  it("preserves dash-prefixed Markdown as prompt content", async () => {
+    const root = tempDirs.make("openclaw-prompt-templates-");
+    const promptsDir = join(root, "prompts");
+    await mkdir(promptsDir, { recursive: true });
+    const content = "----\nname: bogus\ndescription: must remain Markdown\n---\n# Body\n";
+    await writeFile(join(promptsDir, "dash-prefix.md"), content, "utf-8");
 
-    expect(substituteArgs("${@:9007199254740992}", args)).toBe("");
-    expect(substituteArgs("${@:1:9007199254740992}", args)).toBe("");
-  });
+    const templates = loadPromptTemplates({
+      cwd: root,
+      agentDir: join(root, "agent"),
+      promptPaths: [promptsDir],
+      includeDefaults: false,
+    });
 
-  it("preserves zero slice compatibility", () => {
-    expect(substituteArgs("${@:0:0}", ["alpha", "beta"])).toBe("");
-    expect(substituteArgs("${@:0:1}", ["alpha", "beta"])).toBe("alpha");
+    expect(templates).toHaveLength(1);
+    expect(templates[0]).toMatchObject({
+      name: "dash-prefix",
+      description: "----",
+      content,
+    });
   });
 });

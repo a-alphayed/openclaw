@@ -1,13 +1,17 @@
+// Auth-choice option tests cover provider wizard options, grouping, and onboarding scope filters.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthProfileStore } from "../agents/auth-profiles.js";
 import type { ProviderAuthChoiceMetadata } from "../plugins/provider-auth-choices.js";
-import type { ProviderWizardOption } from "../plugins/provider-wizard.js";
 import {
   buildAuthChoiceGroups,
-  buildAuthChoiceOptions,
   formatAuthChoiceChoicesForCli,
+  isFeaturedAuthChoiceGroup,
 } from "./auth-choice-options.js";
 import { formatStaticAuthChoiceChoicesForCli } from "./auth-choice-options.static.js";
+
+type ProviderWizardOption = ReturnType<
+  (typeof import("../plugins/provider-wizard.js"))["resolveProviderWizardOptions"]
+>[number];
 
 const resolveManifestProviderAuthChoices = vi.hoisted(() =>
   vi.fn<() => ProviderAuthChoiceMetadata[]>(() => []),
@@ -36,6 +40,7 @@ vi.mock("../flows/provider-flow.js", () => ({
         ...resolveManifestProviderAuthChoices()
           .filter((choice) => includesOnboardingScope(choice.onboardingScopes, scope))
           .map((choice) => ({
+            providerId: choice.providerId,
             option: {
               value: choice.choiceId,
               label: choice.choiceLabel,
@@ -61,6 +66,7 @@ vi.mock("../flows/provider-flow.js", () => ({
         ...resolveProviderWizardOptions()
           .filter((option) => includesOnboardingScope(option.onboardingScopes, scope))
           .map((option) => ({
+            providerId: option.groupId,
             option: {
               value: option.value,
               label: option.label,
@@ -87,10 +93,12 @@ vi.mock("../flows/provider-flow.js", () => ({
 const EMPTY_STORE: AuthProfileStore = { version: 1, profiles: {} };
 
 function getOptions(includeSkip = false) {
-  return buildAuthChoiceOptions({
+  const { groups, skipOption } = buildAuthChoiceGroups({
     store: EMPTY_STORE,
     includeSkip,
+    assistantVisibleOnly: false,
   });
+  return [...groups.flatMap((group) => group.options), ...(skipOption ? [skipOption] : [])];
 }
 
 function requireChoiceGroup(
@@ -181,7 +189,34 @@ describe("buildAuthChoiceOptions", () => {
         providerId: "xiaomi",
         methodId: "api-key",
         choiceId: "xiaomi-api-key",
-        choiceLabel: "Xiaomi API key",
+        choiceLabel: "Xiaomi API key (Pay-as-you-go)",
+        groupId: "xiaomi",
+        groupLabel: "Xiaomi",
+      },
+      {
+        pluginId: "xiaomi",
+        providerId: "xiaomi-token-plan",
+        methodId: "token-plan-ams",
+        choiceId: "xiaomi-token-plan-ams",
+        choiceLabel: "Xiaomi Token Plan (Europe)",
+        groupId: "xiaomi",
+        groupLabel: "Xiaomi",
+      },
+      {
+        pluginId: "xiaomi",
+        providerId: "xiaomi-token-plan",
+        methodId: "token-plan-cn",
+        choiceId: "xiaomi-token-plan-cn",
+        choiceLabel: "Xiaomi Token Plan (China)",
+        groupId: "xiaomi",
+        groupLabel: "Xiaomi",
+      },
+      {
+        pluginId: "xiaomi",
+        providerId: "xiaomi-token-plan",
+        methodId: "token-plan-sgp",
+        choiceId: "xiaomi-token-plan-sgp",
+        choiceLabel: "Xiaomi Token Plan (Singapore)",
         groupId: "xiaomi",
         groupLabel: "Xiaomi",
       },
@@ -270,6 +305,9 @@ describe("buildAuthChoiceOptions", () => {
       "github-copilot",
       "zai-api-key",
       "xiaomi-api-key",
+      "xiaomi-token-plan-ams",
+      "xiaomi-token-plan-cn",
+      "xiaomi-token-plan-sgp",
       "minimax-global-api",
       "moonshot-api-key",
       "together-api-key",
@@ -479,6 +517,25 @@ describe("buildAuthChoiceOptions", () => {
         groupId: "byteplus",
         groupLabel: "BytePlus",
       },
+      {
+        pluginId: "openrouter",
+        providerId: "openrouter",
+        methodId: "oauth",
+        choiceId: "openrouter-oauth",
+        choiceLabel: "OpenRouter OAuth",
+        groupId: "openrouter",
+        groupLabel: "OpenRouter",
+      },
+      {
+        pluginId: "meta",
+        providerId: "meta",
+        methodId: "api-key",
+        choiceId: "meta-api-key",
+        choiceLabel: "Meta API key",
+        groupId: "meta",
+        groupLabel: "Meta",
+        onboardingFeatured: true,
+      },
     ]);
 
     const { groups } = buildAuthChoiceGroups({
@@ -488,12 +545,21 @@ describe("buildAuthChoiceOptions", () => {
 
     expect(groups.map((group) => group.label)).toEqual([
       "OpenAI",
-      "Anthropic",
+      "OpenRouter",
       "xAI (Grok)",
       "Google",
+      "Anthropic",
       "BytePlus",
       "Custom Provider",
       "LiteLLM",
+      "Meta",
+    ]);
+    expect(groups.filter(isFeaturedAuthChoiceGroup).map((group) => group.label)).toEqual([
+      "OpenAI",
+      "OpenRouter",
+      "xAI (Grok)",
+      "Google",
+      "Anthropic",
     ]);
   });
 
@@ -557,7 +623,7 @@ describe("buildAuthChoiceOptions", () => {
         assistantPriority: 5,
       },
       {
-        value: "openai-codex",
+        value: "openai",
         label: "ChatGPT/Codex Browser Login",
         groupId: "openai",
         groupLabel: "OpenAI",
@@ -565,7 +631,7 @@ describe("buildAuthChoiceOptions", () => {
         onboardingFeatured: true,
       },
       {
-        value: "openai-codex-device-code",
+        value: "openai-chatgpt-device-code",
         label: "ChatGPT/Codex Device Pairing",
         groupId: "openai",
         groupLabel: "OpenAI",
@@ -580,11 +646,43 @@ describe("buildAuthChoiceOptions", () => {
     const openAIGroup = requireChoiceGroup(groups, "openai");
 
     expect(openAIGroup.options.map((option) => option.value)).toEqual([
-      "openai-codex",
-      "openai-codex-device-code",
+      "openai",
+      "openai-chatgpt-device-code",
       "openai-api-key",
     ]);
+    expect(openAIGroup.providerIds).toEqual(["openai"]);
     expect(openAIGroup.options[0]?.onboardingFeatured).toBe(true);
+  });
+
+  it("includes manual-only methods when the grouped CLI picker requests them", () => {
+    resolveProviderWizardOptions.mockReturnValue([
+      {
+        value: "openai-device-code",
+        label: "ChatGPT Device Pairing",
+        groupId: "openai",
+        groupLabel: "OpenAI",
+        assistantPriority: -10,
+        assistantVisibility: "manual-only",
+      },
+      {
+        value: "openai-api-key",
+        label: "OpenAI API Key",
+        groupId: "openai",
+        groupLabel: "OpenAI",
+        assistantPriority: 5,
+      },
+    ]);
+
+    const { groups } = buildAuthChoiceGroups({
+      store: EMPTY_STORE,
+      includeSkip: false,
+      assistantVisibleOnly: false,
+    });
+
+    expect(requireChoiceGroup(groups, "openai").options.map((option) => option.value)).toEqual([
+      "openai-device-code",
+      "openai-api-key",
+    ]);
   });
 
   it("groups OpenCode Zen and Go under one OpenCode entry", () => {

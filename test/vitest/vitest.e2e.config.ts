@@ -1,3 +1,4 @@
+// Vitest e2e config wires the e2e test shard.
 import os from "node:os";
 import { defineConfig } from "vitest/config";
 import { BUNDLED_PLUGIN_E2E_TEST_GLOB } from "./vitest.bundled-plugin-paths.ts";
@@ -24,7 +25,13 @@ const { projects: _projects, ...baseTest } = baseTestWithProjects as {
   projects?: string[];
   setupFiles?: string[];
 };
-const exclude = (baseTest.exclude ?? []).filter((p) => p !== "**/*.e2e.test.ts");
+// The dedicated TUI PTY config owns both terminal suites and emits per-test progress.
+// The local real-backend file can exceed the generic E2E silent-process watchdog.
+const tuiPtyExcludes = ["src/tui/tui-pty-harness.e2e.test.ts", "src/tui/tui-pty-local.e2e.test.ts"];
+const exclude = [
+  ...(baseTest.exclude ?? []).filter((p) => p !== "**/*.e2e.test.ts"),
+  ...tuiPtyExcludes,
+];
 
 export default defineConfig({
   ...base,

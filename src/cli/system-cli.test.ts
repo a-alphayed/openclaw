@@ -1,3 +1,4 @@
+// System CLI tests cover system command registration and status output.
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createCliRuntimeCapture } from "./test-runtime-capture.js";
@@ -68,6 +69,15 @@ describe("system-cli", () => {
     expect(runtimeLogs).toEqual([JSON.stringify({ id: "wake-1" }, null, 2)]);
   });
 
+  it("reports a rejected system event instead of claiming it was enqueued", async () => {
+    callGatewayFromCli.mockResolvedValueOnce({ ok: false, reason: "unwakeable-session-key" });
+
+    await runCli(["system", "event", "--text", "hello"]);
+
+    expect(runtimeLogs).toEqual([]);
+    expect(runtimeErrors[0]).toContain("unwakeable-session-key");
+  });
+
   it("handles invalid wake mode as runtime error", async () => {
     await runCli(["system", "event", "--text", "hello", "--mode", "later"]);
 
@@ -101,7 +111,7 @@ describe("system-cli", () => {
     await runCli(["system", "event", "--text", "ping"]);
 
     expect(callGatewayFromCli).toHaveBeenCalledTimes(1);
-    const [, , params] = gatewayCall();
+    const params = gatewayCall()[2];
     expect(params).not.toHaveProperty("sessionKey");
   });
 
@@ -109,7 +119,7 @@ describe("system-cli", () => {
     await runCli(["system", "event", "--text", "ping", "--session-key", "  "]);
 
     expect(callGatewayFromCli).toHaveBeenCalledTimes(1);
-    const [, , params] = gatewayCall();
+    const params = gatewayCall()[2];
     expect(params).not.toHaveProperty("sessionKey");
   });
 

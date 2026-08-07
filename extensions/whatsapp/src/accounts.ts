@@ -1,3 +1,4 @@
+// Whatsapp plugin module implements accounts behavior.
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -33,17 +34,16 @@ export type ResolvedWhatsAppAccount = {
   allowFrom?: string[];
   groupAllowFrom?: string[];
   groupPolicy?: GroupPolicy;
+  mentionPatterns?: WhatsAppAccountConfig["mentionPatterns"];
   dmPolicy?: DmPolicy;
   historyLimit?: number;
   textChunkLimit?: number;
-  chunkMode?: "length" | "newline";
+  streaming?: WhatsAppAccountConfig["streaming"];
   mediaMaxMb?: number;
-  blockStreaming?: boolean;
   ackReaction?: WhatsAppAccountConfig["ackReaction"];
   reactionLevel?: WhatsAppAccountConfig["reactionLevel"];
   groups?: WhatsAppAccountConfig["groups"];
   direct?: WhatsAppAccountConfig["direct"];
-  debounceMs?: number;
   replyToMode?: ReplyToMode;
 };
 
@@ -132,7 +132,7 @@ export function resolveWhatsAppAccount(params: {
     name: normalizeOptionalString(merged.name),
     enabled,
     sendReadReceipts: merged.sendReadReceipts ?? true,
-    messagePrefix: merged.messagePrefix ?? params.cfg.messages?.messagePrefix,
+    messagePrefix: merged.responsePrefix,
     defaultTo: merged.defaultTo,
     authDir,
     isLegacyAuthDir: isLegacy,
@@ -141,16 +141,15 @@ export function resolveWhatsAppAccount(params: {
     allowFrom: merged.allowFrom,
     groupAllowFrom: merged.groupAllowFrom,
     groupPolicy: merged.groupPolicy,
+    mentionPatterns: merged.mentionPatterns,
     historyLimit: merged.historyLimit,
     textChunkLimit: merged.textChunkLimit,
-    chunkMode: merged.chunkMode,
+    streaming: merged.streaming,
     mediaMaxMb: merged.mediaMaxMb,
-    blockStreaming: merged.blockStreaming,
     ackReaction: merged.ackReaction,
     reactionLevel: merged.reactionLevel,
     groups: merged.groups,
     direct: merged.direct,
-    debounceMs: merged.debounceMs,
     replyToMode: merged.replyToMode,
   };
 }

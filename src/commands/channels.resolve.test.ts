@@ -1,3 +1,5 @@
+// Channels resolve tests cover channel/account selection and command output for message routing.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { channelsResolveCommand } from "./channels/resolve.js";
 
@@ -22,14 +24,18 @@ vi.mock("../cli/command-secret-targets.js", () => ({
   getChannelsCommandSecretTargetIds: mocks.getChannelsCommandSecretTargetIds,
 }));
 
-vi.mock("../config/config.js", () => ({
-  getRuntimeConfig: mocks.loadConfig,
-  loadConfig: mocks.loadConfig,
-  readConfigFileSnapshot: mocks.readConfigFileSnapshot,
-  replaceConfigFile: mocks.replaceConfigFile,
-}));
+vi.mock("../config/config.js", async () => {
+  const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
+  return {
+    ...actual,
+    getRuntimeConfig: mocks.loadConfig,
+    loadConfig: mocks.loadConfig,
+    readConfigFileSnapshot: mocks.readConfigFileSnapshot,
+    replaceConfigFile: mocks.replaceConfigFile,
+  };
+});
 
-vi.mock("../cli/plugins-registry-refresh.js", () => ({
+vi.mock("../plugins/registry-refresh.js", () => ({
   refreshPluginRegistryAfterConfigMutation: mocks.refreshPluginRegistryAfterConfigMutation,
 }));
 
@@ -49,12 +55,7 @@ vi.mock("../channels/plugins/index.js", () => ({
   getChannelPlugin: mocks.getChannelPlugin,
 }));
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`expected ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label");
 
 function requireFirstMockArg(
   mock: { mock: { calls: unknown[][] } },

@@ -1,3 +1,4 @@
+// Discord tests cover channel actions plugin behavior.
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { withEnv } from "openclaw/plugin-sdk/test-env";
@@ -139,19 +140,26 @@ describe("discordMessageActions", () => {
     ]);
   });
 
-  it("requires trusted requester sender for privileged guild admin actions only from Discord turns", () => {
-    expect(
-      discordMessageActions.requiresTrustedRequesterSender?.({
-        action: "channel-delete",
-        toolContext: { currentChannelProvider: "discord" },
-      }),
-    ).toBe(true);
+  it("requires trusted requester sender for privileged guild admin actions from tool contexts", () => {
+    for (const action of ["channel-delete", "timeout", "kick", "ban"] as const) {
+      expect(
+        discordMessageActions.requiresTrustedRequesterSender?.({
+          action,
+          toolContext: { currentChannelProvider: "discord" },
+        }),
+      ).toBe(true);
+      expect(
+        discordMessageActions.requiresTrustedRequesterSender?.({
+          action,
+        }),
+      ).toBe(false);
+    }
     expect(
       discordMessageActions.requiresTrustedRequesterSender?.({
         action: "channel-delete",
         toolContext: { currentChannelProvider: "telegram" },
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       discordMessageActions.requiresTrustedRequesterSender?.({
         action: "read",
@@ -356,20 +364,26 @@ describe("discordMessageActions", () => {
     expect(discovery?.schema).toBeUndefined();
   });
 
-  it.each(["read", "search"])("routes %s actions through gateway execution mode", (action) => {
-    expect(discordMessageActions.resolveExecutionMode?.({ action: action as never })).toBe(
-      "gateway",
-    );
-  });
-
-  it.each(["send", "upload-file", "edit", "delete", "react", "pin", "poll"])(
-    "routes %s actions through local execution mode",
+  it.each(["read", "search", "edit", "delete", "react", "pin", "poll", "channel-info"])(
+    "routes %s actions through gateway execution mode",
     (action) => {
       expect(discordMessageActions.resolveExecutionMode?.({ action: action as never })).toBe(
-        "local",
+        "gateway",
       );
     },
   );
+
+  it.each([
+    "send",
+    "upload-file",
+    "thread-reply",
+    "sticker",
+    "emoji-upload",
+    "sticker-upload",
+    "event-create",
+  ])("keeps %s on local execution mode", (action) => {
+    expect(discordMessageActions.resolveExecutionMode?.({ action: action as never })).toBe("local");
+  });
 
   it("extracts send targets for message and thread reply actions", () => {
     expect(
@@ -503,11 +517,14 @@ describe("discordMessageActions", () => {
       params: { to: "channel:123", message: "hello" },
       cfg,
       accountId: "ops",
+      requesterAccountId: "ops",
       requesterSenderId: "user-1",
+      senderIsOwner: true,
       toolContext,
       mediaAccess,
       mediaLocalRoots,
       mediaReadFile,
+      conversationReadOrigin: "delegated",
     });
 
     expect(handleDiscordMessageActionMock).toHaveBeenCalledWith({
@@ -515,11 +532,14 @@ describe("discordMessageActions", () => {
       params: { to: "channel:123", message: "hello" },
       cfg,
       accountId: "ops",
+      requesterAccountId: "ops",
       requesterSenderId: "user-1",
+      senderIsOwner: true,
       toolContext,
       mediaAccess,
       mediaLocalRoots,
       mediaReadFile,
+      conversationReadOrigin: "delegated",
     });
   });
 });

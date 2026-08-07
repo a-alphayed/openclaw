@@ -1,15 +1,26 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { ChannelType } from "discord-api-types/v10";
 import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-runtime";
+import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import {
+  createPluginStateSyncKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/runtime-config-snapshot";
+// Discord tests cover thread bindings.lifecycle plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { setDiscordRuntime } from "../runtime.js";
 import { EMPTY_DISCORD_TEST_CONFIG } from "../test-support/config.js";
+
+type DiscordRuntime = Parameters<typeof setDiscordRuntime>[0];
 
 const hoisted = vi.hoisted(() => {
   const sendMessageDiscord = vi.fn(async (_to: string, _text: string, _opts?: unknown) => ({}));
@@ -82,12 +93,7 @@ function createTestThreadBindingManager(
   });
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Expected ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-capitalized");
 
 function expectFields(
   value: unknown,
@@ -99,6 +105,12 @@ function expectFields(
     expect(record[key]).toEqual(expected);
   }
   return record;
+}
+
+function expectThreadCreateOptionsWithoutArchiveOverride(value: unknown): void {
+  const options = requireRecord(value, "thread options");
+  expect(options.name).toBeTypeOf("string");
+  expect(options).not.toHaveProperty("autoArchiveMinutes");
 }
 
 function mockCallArg(mock: unknown, callIndex: number, argIndex: number, label: string) {
@@ -115,7 +127,14 @@ function mockCallArg(mock: unknown, callIndex: number, argIndex: number, label: 
 
 describe("thread binding lifecycle", () => {
   beforeEach(() => {
+    resetPluginStateStoreForTests();
     testing.resetThreadBindingsForTests();
+    setDiscordRuntime({
+      state: {
+        openSyncKeyedStore: (options: OpenKeyedStoreOptions) =>
+          createPluginStateSyncKeyedStoreForTests("discord", options),
+      },
+    } as unknown as DiscordRuntime);
     clearRuntimeConfigSnapshot();
     vi.restoreAllMocks();
     hoisted.sendMessageDiscord.mockReset().mockResolvedValue({});
@@ -205,7 +224,6 @@ describe("thread binding lifecycle", () => {
           params.channelId,
           {
             name: params.threadName,
-            autoArchiveMinutes: 60,
           },
           {
             accountId: params.accountId,
@@ -459,11 +477,12 @@ describe("thread binding lifecycle", () => {
       });
 
       expect(updated).toHaveLength(1);
+      const updatedBinding = expectDefined(updated[0], "idle-timeout thread binding");
       expect(updated[0]?.lastActivityAt).toBe(new Date("2026-02-20T23:15:00.000Z").getTime());
       expect(updated[0]?.boundAt).toBe(boundAt);
       expect(
         resolveThreadBindingInactivityExpiresAt({
-          record: updated[0],
+          record: updatedBinding,
           defaultIdleTimeoutMs: manager.getIdleTimeoutMs(),
         }),
       ).toBe(new Date("2026-02-21T01:15:00.000Z").getTime());
@@ -500,11 +519,12 @@ describe("thread binding lifecycle", () => {
       });
 
       expect(updated).toHaveLength(1);
+      const updatedBinding = expectDefined(updated[0], "max-age thread binding");
       expect(updated[0]?.boundAt).toBe(new Date("2026-02-20T10:30:00.000Z").getTime());
       expect(updated[0]?.lastActivityAt).toBe(new Date("2026-02-20T10:30:00.000Z").getTime());
       expect(
         resolveThreadBindingMaxAgeExpiresAt({
-          record: updated[0],
+          record: updatedBinding,
           defaultMaxAgeMs: manager.getMaxAgeMs(),
         }),
       ).toBe(new Date("2026-02-20T13:30:00.000Z").getTime());
@@ -774,6 +794,34 @@ describe("thread binding lifecycle", () => {
     }
   });
 
+  it("keeps thread binding startup in memory when SQLite persistence is unavailable", async () => {
+    setDiscordRuntime({
+      state: {
+        openSyncKeyedStore: () => {
+          throw new Error("sqlite unavailable");
+        },
+      },
+    } as unknown as DiscordRuntime);
+
+    const manager = createTestThreadBindingManager({
+      accountId: "default",
+      persist: true,
+      enableSweeper: false,
+    });
+
+    await manager.bindTarget({
+      threadId: "thread-sqlite-down",
+      channelId: "parent-1",
+      targetKind: "subagent",
+      targetSessionKey: "agent:main:subagent:sqlite-down",
+      agentId: "main",
+    });
+
+    expect(manager.getByThreadId("thread-sqlite-down")).toMatchObject({
+      targetSessionKey: "agent:main:subagent:sqlite-down",
+    });
+  });
+
   it("reuses webhook credentials after unbind when rebinding in the same channel", async () => {
     const manager = createTestThreadBindingManager({
       accountId: "default",
@@ -850,12 +898,8 @@ describe("thread binding lifecycle", () => {
     });
     expect(hoisted.createThreadDiscord).toHaveBeenCalledTimes(1);
     expect(mockCallArg(hoisted.createThreadDiscord, 0, 0, "createThreadDiscord")).toBe("parent-1");
-    expectFields(
+    expectThreadCreateOptionsWithoutArchiveOverride(
       mockCallArg(hoisted.createThreadDiscord, 0, 1, "createThreadDiscord"),
-      "thread options",
-      {
-        autoArchiveMinutes: 60,
-      },
     );
     expectFields(
       mockCallArg(hoisted.createThreadDiscord, 0, 2, "createThreadDiscord"),
@@ -900,12 +944,8 @@ describe("thread binding lifecycle", () => {
     expectFields(childBinding, "child binding", { channelId: "parent-1" });
     expect(hoisted.restGet).toHaveBeenCalledTimes(1);
     expect(mockCallArg(hoisted.createThreadDiscord, 0, 0, "createThreadDiscord")).toBe("parent-1");
-    expectFields(
+    expectThreadCreateOptionsWithoutArchiveOverride(
       mockCallArg(hoisted.createThreadDiscord, 0, 1, "createThreadDiscord"),
-      "thread options",
-      {
-        autoArchiveMinutes: 60,
-      },
     );
     expectFields(
       mockCallArg(hoisted.createThreadDiscord, 0, 2, "createThreadDiscord"),
@@ -1072,12 +1112,8 @@ describe("thread binding lifecycle", () => {
     expect(mockCallArg(hoisted.createThreadDiscord, 0, 0, "createThreadDiscord")).toBe(
       "parent-runtime",
     );
-    expectFields(
+    expectThreadCreateOptionsWithoutArchiveOverride(
       mockCallArg(hoisted.createThreadDiscord, 0, 1, "createThreadDiscord"),
-      "thread options",
-      {
-        autoArchiveMinutes: 60,
-      },
     );
     expectFields(
       mockCallArg(hoisted.createThreadDiscord, 0, 2, "createThreadDiscord"),
@@ -1135,12 +1171,8 @@ describe("thread binding lifecycle", () => {
     expect(mockCallArg(hoisted.createThreadDiscord, 0, 0, "createThreadDiscord")).toBe(
       "1491611525914558667",
     );
-    expectFields(
+    expectThreadCreateOptionsWithoutArchiveOverride(
       mockCallArg(hoisted.createThreadDiscord, 0, 1, "createThreadDiscord"),
-      "thread options",
-      {
-        autoArchiveMinutes: 60,
-      },
     );
     expectFields(
       mockCallArg(hoisted.createThreadDiscord, 0, 2, "createThreadDiscord"),
@@ -1213,6 +1245,9 @@ describe("thread binding lifecycle", () => {
   it("binds current Discord DMs as direct conversation bindings", async () => {
     createTestThreadBindingManager({
       accountId: "default",
+      cfg: {
+        agents: { list: [{ id: "codex", default: true }] },
+      },
       persist: false,
       enableSweeper: false,
       idleTimeoutMs: 24 * 60 * 60 * 1000,
@@ -1247,6 +1282,9 @@ describe("thread binding lifecycle", () => {
       accountId: "default",
       conversationId: "user:1177378744822943744",
       parentConversationId: "user:1177378744822943744",
+    });
+    expectFields(requireRecord(bound, "bound session").metadata, "bound metadata", {
+      agentId: "codex",
     });
     const resolved = requireRecord(
       getSessionBindingService().resolveByConversation({
@@ -1748,8 +1786,9 @@ describe("thread binding lifecycle", () => {
       },
     });
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => {
+      expect(probeCallCount).toBe(2);
+    });
     const observedParallelStart = secondProbeStartedBeforeFirstResolved;
 
     resolveFirstProbe?.({ status: "healthy" });
@@ -1834,153 +1873,36 @@ describe("thread binding lifecycle", () => {
     expect(maxInFlight).toBeLessThanOrEqual(PROBE_LIMIT);
   });
 
-  it("migrates legacy expiresAt bindings to idle/max-age semantics", () => {
-    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-thread-bindings-"));
-    process.env.OPENCLAW_STATE_DIR = stateDir;
-    try {
-      testing.resetThreadBindingsForTests();
-      const bindingsPath = testing.resolveThreadBindingsPath();
-      fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
-      const boundAt = Date.now() - 10_000;
-      const expiresAt = boundAt + 60_000;
-      fs.writeFileSync(
-        bindingsPath,
-        JSON.stringify(
-          {
-            version: 1,
-            bindings: {
-              "thread-legacy-active": {
-                accountId: "default",
-                channelId: "parent-1",
-                threadId: "thread-legacy-active",
-                targetKind: "subagent",
-                targetSessionKey: "agent:main:subagent:legacy-active",
-                agentId: "main",
-                boundBy: "system",
-                boundAt,
-                expiresAt,
-              },
-              "thread-legacy-disabled": {
-                accountId: "default",
-                channelId: "parent-1",
-                threadId: "thread-legacy-disabled",
-                targetKind: "subagent",
-                targetSessionKey: "agent:main:subagent:legacy-disabled",
-                agentId: "main",
-                boundBy: "system",
-                boundAt,
-                expiresAt: 0,
-              },
-            },
-          },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
-
-      const manager = createTestThreadBindingManager({
-        accountId: "default",
-        persist: false,
-        enableSweeper: false,
-        idleTimeoutMs: 24 * 60 * 60 * 1000,
-        maxAgeMs: 0,
-      });
-
-      const active = manager.getByThreadId("thread-legacy-active");
-      if (!active) {
-        throw new Error("missing migrated legacy active thread binding");
-      }
-      expect(active.idleTimeoutMs).toBe(0);
-      expect(active.maxAgeMs).toBe(expiresAt - boundAt);
-      expect(
-        resolveThreadBindingMaxAgeExpiresAt({
-          record: active,
-          defaultMaxAgeMs: manager.getMaxAgeMs(),
-        }),
-      ).toBe(expiresAt);
-      expect(
-        resolveThreadBindingInactivityExpiresAt({
-          record: active,
-          defaultIdleTimeoutMs: manager.getIdleTimeoutMs(),
-        }),
-      ).toBeUndefined();
-
-      const disabled = manager.getByThreadId("thread-legacy-disabled");
-      if (!disabled) {
-        throw new Error("missing migrated legacy disabled thread binding");
-      }
-      expect(disabled.idleTimeoutMs).toBe(0);
-      expect(disabled.maxAgeMs).toBe(0);
-      expect(
-        resolveThreadBindingMaxAgeExpiresAt({
-          record: disabled,
-          defaultMaxAgeMs: manager.getMaxAgeMs(),
-        }),
-      ).toBeUndefined();
-      expect(
-        resolveThreadBindingInactivityExpiresAt({
-          record: disabled,
-          defaultIdleTimeoutMs: manager.getIdleTimeoutMs(),
-        }),
-      ).toBeUndefined();
-    } finally {
-      testing.resetThreadBindingsForTests();
-      if (previousStateDir === undefined) {
-        delete process.env.OPENCLAW_STATE_DIR;
-      } else {
-        process.env.OPENCLAW_STATE_DIR = previousStateDir;
-      }
-      fs.rmSync(stateDir, { recursive: true, force: true });
-    }
-  });
-
   it("persists unbinds even when no manager is active", () => {
     const previousStateDir = process.env.OPENCLAW_STATE_DIR;
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-thread-bindings-"));
     process.env.OPENCLAW_STATE_DIR = stateDir;
     try {
       testing.resetThreadBindingsForTests();
-      const bindingsPath = testing.resolveThreadBindingsPath();
-      fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
       const now = Date.now();
-      fs.writeFileSync(
-        bindingsPath,
-        JSON.stringify(
-          {
-            version: 1,
-            bindings: {
-              "thread-1": {
-                accountId: "default",
-                channelId: "parent-1",
-                threadId: "thread-1",
-                targetKind: "subagent",
-                targetSessionKey: "agent:main:subagent:child",
-                agentId: "main",
-                boundBy: "system",
-                boundAt: now,
-                lastActivityAt: now,
-                idleTimeoutMs: 60_000,
-                maxAgeMs: 0,
-              },
-            },
-          },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
+      const store = createPluginStateSyncKeyedStoreForTests("discord", {
+        namespace: "thread-bindings",
+        maxEntries: 10_000,
+      });
+      store.register("default:thread-1", {
+        accountId: "default",
+        channelId: "parent-1",
+        threadId: "thread-1",
+        targetKind: "subagent",
+        targetSessionKey: "agent:main:subagent:child",
+        agentId: "main",
+        boundBy: "system",
+        boundAt: now,
+        lastActivityAt: now,
+        idleTimeoutMs: 60_000,
+        maxAgeMs: 0,
+      });
 
       const removed = unbindThreadBindingsBySessionKey({
         targetSessionKey: "agent:main:subagent:child",
       });
       expect(removed).toHaveLength(1);
-
-      const payload = JSON.parse(fs.readFileSync(bindingsPath, "utf-8")) as {
-        bindings?: Record<string, unknown>;
-      };
-      expect(Object.keys(payload.bindings ?? {})).toStrictEqual([]);
+      expect(store.entries()).toStrictEqual([]);
     } finally {
       testing.resetThreadBindingsForTests();
       if (previousStateDir === undefined) {
@@ -1992,3 +1914,4 @@ describe("thread binding lifecycle", () => {
     }
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

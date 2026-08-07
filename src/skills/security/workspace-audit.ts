@@ -1,6 +1,10 @@
+// Workspace audit helpers inspect local skill folders for security and trust issues.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { listAgentWorkspaceDirs } from "../../agents/workspace-dirs.js";
+import {
+  listAgentWorkspaceDirs,
+  listExplicitAgentWorkspaceDirs,
+} from "../../agents/workspace-dirs.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SecurityAuditFinding } from "../../security/audit.types.js";
 import { isPathInside } from "../../security/scan-paths.js";
@@ -65,9 +69,11 @@ async function listWorkspaceSkillMarkdownFiles(
   const skillFiles: string[] = [];
   const queue: string[] = [skillsRoot];
   const visitedDirs = new Set<string>();
-  let totalDirVisits = 0;
 
-  while (queue.length > 0 && skillFiles.length < maxFiles && totalDirVisits++ < maxTotalDirVisits) {
+  for (const _ of Array.from({ length: maxTotalDirVisits })) {
+    if (queue.length === 0 || skillFiles.length >= maxFiles) {
+      break;
+    }
     const dir = queue.shift()!;
     const dirRealPath = (await realpathWithTimeout(dir)) ?? path.resolve(dir);
     if (visitedDirs.has(dirRealPath)) {
@@ -110,11 +116,23 @@ async function listWorkspaceSkillMarkdownFiles(
 
 export async function collectWorkspaceSkillSymlinkEscapeFindings(params: {
   cfg: OpenClawConfig;
+  workspaceDir?: string;
   skillScanLimits?: WorkspaceSkillScanLimits;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
-  const workspaceDirs = listAgentWorkspaceDirs(params.cfg);
-  if (workspaceDirs.length === 0) {
+  const workspaceDirs = new Set(params.workspaceDir ? [params.workspaceDir] : []);
+  try {
+    for (const workspaceDir of listAgentWorkspaceDirs(params.cfg)) {
+      workspaceDirs.add(workspaceDir);
+    }
+  } catch {
+    // Raw audit input can precede roster migration or be malformed. Keep the
+    // entry-authored workspaces scannable even when default resolution is unavailable.
+    for (const workspaceDir of listExplicitAgentWorkspaceDirs(params.cfg)) {
+      workspaceDirs.add(workspaceDir);
+    }
+  }
+  if (workspaceDirs.size === 0) {
     return findings;
   }
 

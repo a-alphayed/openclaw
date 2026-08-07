@@ -1,3 +1,4 @@
+// Copies bundled plugin metadata into generated runtime locations.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,6 +7,7 @@ import {
   NON_PACKAGED_BUNDLED_PLUGIN_DIRS,
 } from "./lib/bundled-plugin-build-entries.mjs";
 import { shouldBuildBundledCluster } from "./lib/optional-bundled-clusters.mjs";
+import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
 import {
   mergeGeneratedChannelConfigs,
   readGeneratedBundledChannelConfigs,
@@ -30,7 +32,7 @@ function shouldCopyBundledPluginMetadata(id, env, buildablePluginDirs) {
   return env.OPENCLAW_BUILD_PRIVATE_QA === "1";
 }
 
-export function rewritePackageExtensions(entries) {
+function rewritePackageExtensions(entries) {
   if (!Array.isArray(entries)) {
     return undefined;
   }
@@ -145,7 +147,7 @@ function resolveBundledSkillTarget(rawPath) {
 
 function isTransientCopyError(error) {
   return (
-    !!error &&
+    Boolean(error) &&
     typeof error === "object" &&
     typeof error.code === "string" &&
     TRANSIENT_COPY_ERROR_CODES.has(error.code)
@@ -234,6 +236,9 @@ function copyDeclaredPluginSkillPaths(params) {
  *   env?: NodeJS.ProcessEnv;
  * }} [params]
  */
+/**
+ * Copies bundled plugin metadata and package extension files.
+ */
 export function copyBundledPluginMetadata(params = {}) {
   const repoRoot = params.cwd ?? params.repoRoot ?? process.cwd();
   const env = params.env ?? process.env;
@@ -242,6 +247,9 @@ export function copyBundledPluginMetadata(params = {}) {
   if (!fs.existsSync(extensionsRoot)) {
     return;
   }
+  // Fail closed before any dist/extensions removal: a symlinked dist root
+  // would redirect recursive deletes into the link target.
+  assertRealOutputRoot(path.join(repoRoot, "dist"));
 
   const buildablePluginDirs = new Set(
     collectBundledPluginBuildEntries({ cwd: repoRoot, env }).map((entry) => entry.id),

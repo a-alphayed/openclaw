@@ -1,3 +1,6 @@
+/**
+ * Lazy import boundary for effective-tool inventory helpers used by gateway RPCs.
+ */
 export {
   listAgentIds,
   resolveAgentDir,
@@ -6,8 +9,9 @@ export {
 } from "../../agents/agent-scope.js";
 export {
   resolveEffectiveToolInventory,
-  resolveEffectiveToolInventoryRuntimeModelContext,
+  resolveEffectiveToolInventoryRuntimeModelContextAsync,
 } from "../../agents/tools-effective-inventory.js";
+export { getRegisteredAgentHarness } from "../../agents/harness/registry.js";
 export {
   buildBundleMcpToolsFromCatalog,
   peekSessionMcpRuntime,
@@ -21,4 +25,4 @@ export {
   getActivePluginRegistryVersion,
 } from "../../plugins/runtime.js";
 export { deliveryContextFromSession } from "../../utils/delivery-context.shared.js";
-export { loadSessionEntry, resolveSessionModelRef } from "../session-utils.js";
+export { loadSessionEntryReadOnly, resolveSessionModelRef } from "../session-utils.js";

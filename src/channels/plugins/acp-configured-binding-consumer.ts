@@ -1,3 +1,9 @@
+/**
+ * ACP configured binding consumer.
+ *
+ * Converts channel configured-binding rules into persistent ACP binding records.
+ */
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
   buildConfiguredAcpSessionKey,
   normalizeBindingConfig,
@@ -9,14 +15,11 @@ import {
 } from "../../acp/persistent-bindings.types.js";
 import {
   resolveAgentConfig,
+  resolveAgentExplicitModelPrimary,
   resolveAgentWorkspaceDir,
   resolveDefaultAgentId,
 } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "../../shared/string-coerce.js";
 import type {
   ConfiguredBindingRuleConfig,
   ConfiguredBindingTargetFactory,
@@ -30,10 +33,9 @@ function resolveAgentRuntimeAcpDefaults(params: { cfg: OpenClawConfig; ownerAgen
   cwd?: string;
   backend?: string;
 } {
+  // ACP bindings inherit runtime defaults from the owning agent when that agent already runs ACP.
   const ownerAgentId = normalizeLowercaseStringOrEmpty(params.ownerAgentId);
-  const agent = params.cfg.agents?.list?.find(
-    (entry) => normalizeOptionalLowercaseString(entry.id) === ownerAgentId,
-  );
+  const agent = resolveAgentConfig(params.cfg, ownerAgentId);
   if (!agent || agent.runtime?.type !== "acp") {
     return {};
   }
@@ -49,6 +51,8 @@ function resolveConfiguredBindingWorkspaceCwd(params: {
   cfg: OpenClawConfig;
   agentId: string;
 }): string | undefined {
+  // Only bind cwd when the agent has an explicit workspace contract; otherwise let ACP choose
+  // its normal default instead of freezing an incidental process cwd.
   const explicitAgentWorkspace = normalizeText(
     resolveAgentConfig(params.cfg, params.agentId)?.workspace,
   );
@@ -71,6 +75,7 @@ function buildConfiguredAcpSpec(params: {
   agentId: string;
   acpAgentId?: string;
   mode: "persistent" | "oneshot";
+  model?: string;
   cwd?: string;
   backend?: string;
   label?: string;
@@ -83,6 +88,7 @@ function buildConfiguredAcpSpec(params: {
     agentId: params.agentId,
     acpAgentId: params.acpAgentId,
     mode: params.mode,
+    model: params.model,
     cwd: params.cwd,
     backend: params.backend,
     label: params.label,
@@ -98,12 +104,16 @@ function buildAcpTargetFactory(params: {
   if (params.binding.type !== "acp") {
     return null;
   }
+  // Binding config overrides agent runtime defaults; unresolved fields remain undefined so ACP
+  // session creation can apply backend-specific defaults.
   const runtimeDefaults = resolveAgentRuntimeAcpDefaults({
     cfg: params.cfg,
     ownerAgentId: params.agentId,
   });
   const bindingOverrides = normalizeBindingConfig(params.binding.acp);
   const mode = normalizeMode(bindingOverrides.mode ?? runtimeDefaults.mode);
+  // Every ACP binding uses its owner's explicit model, regardless of the owner's runtime type.
+  const model = resolveAgentExplicitModelPrimary(params.cfg, params.agentId);
   const cwd =
     bindingOverrides.cwd ??
     runtimeDefaults.cwd ??
@@ -118,6 +128,8 @@ function buildAcpTargetFactory(params: {
   return {
     driverId: "acp",
     materialize: ({ accountId, conversation }) => {
+      // Materialization is account/conversation-specific because wildcard bindings resolve to
+      // stable ACP session keys only after the matched conversation is known.
       const spec = buildConfiguredAcpSpec({
         channel: params.channel,
         accountId,
@@ -125,6 +137,7 @@ function buildAcpTargetFactory(params: {
         agentId: params.agentId,
         acpAgentId,
         mode,
+        model,
         cwd,
         backend,
         label,
@@ -144,6 +157,9 @@ function buildAcpTargetFactory(params: {
   };
 }
 
+/**
+ * Configured binding consumer that materializes ACP persistent or oneshot targets.
+ */
 export const acpConfiguredBindingConsumer: ConfiguredBindingConsumer = {
   id: "acp",
   supports: (binding) => binding.type === "acp",

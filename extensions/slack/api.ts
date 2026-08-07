@@ -1,3 +1,4 @@
+// Slack API module exposes the plugin public contract.
 export { slackPlugin } from "./src/channel.js";
 export { slackSetupPlugin } from "./src/channel.setup.js";
 export {
@@ -75,11 +76,6 @@ export type {
   SlackInteractiveHandlerContext,
   SlackInteractiveHandlerRegistration,
 } from "./src/interactive-dispatch.js";
-export {
-  compileSlackInteractiveReplies,
-  isSlackInteractiveRepliesEnabled,
-  parseSlackOptionsLine,
-} from "./src/interactive-replies.js";
 export { extractSlackToolSend, listSlackMessageActions } from "./src/message-actions.js";
 export {
   resolveSlackGroupRequireMention,

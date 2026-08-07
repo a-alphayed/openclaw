@@ -1,8 +1,10 @@
-import { listProfilesForProvider } from "../agents/auth-profiles.js";
-import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
+// Shares media-generation runtime polling and response helpers across providers.
+import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { resolveCapabilityModelRefForProviders } from "../../packages/media-generation-core/src/capability-model-ref.js";
+import type { MediaGenerationNormalizationMetadataInput } from "../../packages/media-generation-core/src/normalization.js";
 import { DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { describeFailoverError, isFailoverError } from "../agents/failover-error.js";
-import { resolveEnvApiKey } from "../agents/model-auth-env.js";
 import type { FallbackAttempt } from "../agents/model-fallback.types.js";
 import {
   resolveAgentModelFallbackValues,
@@ -10,27 +12,20 @@ import {
 } from "../config/model-input.js";
 import type { AgentModelConfig } from "../config/types.agents-shared.js";
 import type { OpenClawConfig } from "../config/types.js";
-import { formatErrorMessage } from "../infra/errors.js";
+import { formatErrorMessage, toErrorObject } from "../infra/errors.js";
+import { isProviderApiKeyConfigured } from "../plugin-sdk/provider-auth.js";
 import { getProviderEnvVars as getDefaultProviderEnvVars } from "../secrets/provider-env-vars.js";
-import { clampTimerTimeoutMs } from "../shared/number-coercion.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
-import { resolveCapabilityModelRefForProviders } from "./capability-model-ref.js";
-import type {
-  MediaGenerationNormalizationMetadataInput,
-  MediaNormalizationEntry,
-  MediaNormalizationValue,
-} from "./normalization.types.js";
 
-export type ParsedProviderModelRef = {
+// Shared media-generation runtime helpers for provider fallback, request
+// timeout normalization, model selection, and capability value normalization.
+export { hasMediaNormalizationEntry } from "../../packages/media-generation-core/src/normalization.js";
+
+type ParsedProviderModelRef = {
   provider: string;
   model: string;
 };
-export type {
-  MediaGenerationNormalizationMetadataInput,
-  MediaNormalizationEntry,
-  MediaNormalizationValue,
-} from "./normalization.types.js";
 
+/** Records one provider/model failure in the common fallback-attempt shape. */
 export function recordCapabilityCandidateFailure(params: {
   attempts: FallbackAttempt[];
   provider: string;
@@ -48,28 +43,15 @@ export function recordCapabilityCandidateFailure(params: {
   });
 }
 
-export function hasMediaNormalizationEntry<TValue extends MediaNormalizationValue>(
-  entry: MediaNormalizationEntry<TValue> | undefined,
-): entry is MediaNormalizationEntry<TValue> {
-  return Boolean(
-    entry &&
-    (entry.requested !== undefined ||
-      entry.applied !== undefined ||
-      entry.derivedFrom !== undefined ||
-      (entry.supportedValues?.length ?? 0) > 0),
-  );
-}
-
 const IMAGE_RESOLUTION_ORDER = ["1K", "2K", "4K"] as const;
 
-export function resolveMediaProviderDefaultTimeoutMs(
-  timeoutMs: number | undefined,
-): number | undefined {
+function resolveMediaProviderDefaultTimeoutMs(timeoutMs: number | undefined): number | undefined {
   return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
     ? clampTimerTimeoutMs(timeoutMs)
     : undefined;
 }
 
+/** Resolves a request timeout, preferring per-request over provider defaults. */
 export function resolveMediaProviderRequestTimeoutMs(params: {
   timeoutMs?: number;
   providerDefaultTimeoutMs?: number;
@@ -126,17 +108,11 @@ function isCapabilityProviderConfigured(params: {
       agentDir: params.agentDir,
     });
   }
-  if (resolveEnvApiKey(params.provider.id)?.apiKey) {
-    return true;
-  }
-  const agentDir = normalizeOptionalString(params.agentDir);
-  if (!agentDir) {
-    return false;
-  }
-  const store = ensureAuthProfileStore(agentDir, {
-    allowKeychainPrompt: false,
+  return isProviderApiKeyConfigured({
+    provider: params.provider.id,
+    cfg: params.cfg,
+    agentDir: params.agentDir,
   });
-  return listProfilesForProvider(store, params.provider.id).length > 0;
 }
 
 function resolveAutoCapabilityFallbackRefs(params: {
@@ -177,12 +153,15 @@ function resolveAutoCapabilityFallbackRefs(params: {
     ...providerIds.filter(matchesDefaultProvider),
     ...providerIds.filter((providerId) => !matchesDefaultProvider(providerId)),
   ];
+  // Keep the user's default text provider first when it also has media support;
+  // then add the remaining configured media providers deterministically.
   return orderedProviders.flatMap((providerId) => {
     const entry = providerDefaults.get(providerId);
     return entry ? [entry.ref] : [];
   });
 }
 
+/** Builds ordered provider/model candidates for one media capability request. */
 export function resolveCapabilityModelCandidates(params: {
   cfg: OpenClawConfig;
   modelConfig: AgentModelConfig | undefined;
@@ -230,12 +209,13 @@ export function resolveCapabilityModelCandidates(params: {
     return resolveCandidate(params.modelOverride, { useProviderMetadata: true });
   })();
   if (override) {
+    // Explicit model overrides are authoritative and should not be expanded into
+    // auto provider fallback candidates.
     return [override];
   }
 
-  const autoProviderFallbackEnabled =
-    params.autoProviderFallback ??
-    params.cfg.agents?.defaults?.mediaGenerationAutoProviderFallback !== false;
+  // Cross-provider fallback is a fixed product policy; Doctor removes the retired opt-out.
+  const autoProviderFallbackEnabled = params.autoProviderFallback ?? true;
   add(params.modelOverride, { useProviderMetadata: true });
   add(resolveAgentModelPrimaryValue(params.modelConfig), {
     useProviderMetadata: autoProviderFallbackEnabled,
@@ -337,7 +317,8 @@ function greatestCommonDivisor(a: number, b: number): number {
   return left || 1;
 }
 
-export function deriveAspectRatioFromSize(size?: string): string | undefined {
+/** Derives a reduced aspect ratio string from a WIDTHxHEIGHT size. */
+function deriveAspectRatioFromSize(size?: string): string | undefined {
   const parsed = parseSizeValue(size);
   if (!parsed) {
     return undefined;
@@ -346,6 +327,7 @@ export function deriveAspectRatioFromSize(size?: string): string | undefined {
   return `${parsed.width / divisor}:${parsed.height / divisor}`;
 }
 
+/** Chooses the closest supported aspect ratio for a request. */
 export function resolveClosestAspectRatio(params: {
   requestedAspectRatio?: string;
   requestedSize?: string;
@@ -385,6 +367,7 @@ export function resolveClosestAspectRatio(params: {
   return bestValue;
 }
 
+/** Chooses the closest supported size by aspect ratio and area. */
 export function resolveClosestSize(params: {
   requestedSize?: string;
   requestedAspectRatio?: string;
@@ -425,6 +408,7 @@ export function resolveClosestSize(params: {
   return bestValue;
 }
 
+/** Chooses the closest supported resolution by numeric rank or custom order. */
 export function resolveClosestResolution<TResolution extends string>(params: {
   requestedResolution?: TResolution;
   supportedResolutions?: readonly TResolution[];
@@ -506,6 +490,7 @@ function parseResolutionRank(
   };
 }
 
+/** Rounds duration and clamps it to a provider maximum when supplied. */
 export function normalizeDurationToClosestMax(
   durationSeconds?: number,
   maxDurationSeconds?: number,
@@ -524,6 +509,7 @@ export function normalizeDurationToClosestMax(
   return Math.min(rounded, Math.max(1, Math.round(maxDurationSeconds)));
 }
 
+/** Builds user-visible metadata describing provider normalization decisions. */
 export function buildMediaGenerationNormalizationMetadata(params: {
   normalization?: MediaGenerationNormalizationMetadataInput;
   requestedSizeForDerivedAspectRatio?: string;
@@ -573,13 +559,14 @@ export function buildMediaGenerationNormalizationMetadata(params: {
   return metadata;
 }
 
+/** Throws a summarized error after all provider/model candidates fail. */
 export function throwCapabilityGenerationFailure(params: {
   capabilityLabel: string;
   attempts: FallbackAttempt[];
   lastError: unknown;
 }): never {
   if (params.attempts.length <= 1 && params.lastError) {
-    throw params.lastError;
+    throw toErrorObject(params.lastError, "Non-Error thrown");
   }
   const summary = formatCapabilityFailureAttempts(params.attempts);
   throw new Error(
@@ -628,6 +615,7 @@ function isAbortLikeFallbackAttempt(attempt: FallbackAttempt): boolean {
   );
 }
 
+/** Formats setup guidance when no model is configured for a media capability. */
 export function buildNoCapabilityModelConfiguredMessage(params: {
   capabilityLabel: string;
   modelConfigKey: string;

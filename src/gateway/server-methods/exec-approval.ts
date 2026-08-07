@@ -1,8 +1,9 @@
-import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
+// Exec approval gateway methods create, list, inspect, and resolve command
+// approval requests, including iOS push delivery and requester visibility.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   ErrorCodes,
   errorShape,
-  formatValidationErrors,
   validateExecApprovalGetParams,
   validateExecApprovalRequestParams,
   validateExecApprovalResolveParams,
@@ -18,9 +19,8 @@ import {
 import type { ExecApprovalForwarder } from "../../infra/exec-approval-forwarder.js";
 import {
   DEFAULT_EXEC_APPROVAL_TIMEOUT_MS,
-  resolveExecApprovalAllowedDecisions,
+  normalizeExecApprovalUnavailableDecisions,
   resolveExecApprovalRequestAllowedDecisions,
-  type ExecApprovalDecision,
   type ExecApprovalRequest,
   type ExecApprovalResolved,
 } from "../../infra/exec-approvals.js";
@@ -29,18 +29,24 @@ import {
   buildSystemRunApprovalEnvBinding,
 } from "../../infra/system-run-approval-binding.js";
 import { resolveSystemRunApprovalRequestContext } from "../../infra/system-run-approval-context.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
-import type { ExecApprovalManager } from "../exec-approval-manager.js";
+import { normalizeAgentId } from "../../routing/session-key.js";
+import { InvalidApprovalIdError, type ExecApprovalManager } from "../exec-approval-manager.js";
+import { runApprovalRequestDeliveries } from "./approval-request-delivery.js";
 import {
   handleApprovalWaitDecision,
   handlePendingApprovalRequest,
+  bindApprovalRequesterMetadata,
+  bindApprovalReviewerDeviceIds,
+  buildRequestedApprovalEvent,
   handleApprovalResolve,
-  isApprovalDecision,
-  isApprovalRecordVisibleToClient,
+  listVisiblePendingApprovalRequests,
+  registerPendingApprovalRecord,
+  resolveApprovalDecisionParams,
   respondPendingApprovalLookupError,
   resolvePendingApprovalRecord,
 } from "./approval-shared.js";
-import type { GatewayClient, GatewayRequestHandlers } from "./types.js";
+import type { GatewayRequestHandlers } from "./types.js";
+import { assertValidParams } from "./validation.js";
 
 const APPROVAL_ALLOW_ALWAYS_UNAVAILABLE_DETAILS = {
   reason: "APPROVAL_ALLOW_ALWAYS_UNAVAILABLE",
@@ -93,17 +99,7 @@ export function createExecApprovalHandlers(
 ): GatewayRequestHandlers {
   return {
     "exec.approval.get": async ({ params, respond, client }) => {
-      if (!validateExecApprovalGetParams(params)) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `invalid exec.approval.get params: ${formatValidationErrors(
-              validateExecApprovalGetParams.errors,
-            )}`,
-          ),
-        );
+      if (!assertValidParams(params, validateExecApprovalGetParams, "exec.approval.get", respond)) {
         return;
       }
       const p = params as { id: string };
@@ -136,32 +132,17 @@ export function createExecApprovalHandlers(
       );
     },
     "exec.approval.list": async ({ respond, client }) => {
-      respond(
-        true,
-        manager
-          .listPendingRecords()
-          .filter((record) => isApprovalRecordVisibleToClient({ record, client }))
-          .map((record) => ({
-            id: record.id,
-            request: record.request,
-            createdAtMs: record.createdAtMs,
-            expiresAtMs: record.expiresAtMs,
-          })),
-        undefined,
-      );
+      respond(true, listVisiblePendingApprovalRequests({ manager, client }), undefined);
     },
     "exec.approval.request": async ({ params, respond, context, client }) => {
-      if (!validateExecApprovalRequestParams(params)) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `invalid exec.approval.request params: ${formatValidationErrors(
-              validateExecApprovalRequestParams.errors,
-            )}`,
-          ),
-        );
+      if (
+        !assertValidParams(
+          params,
+          validateExecApprovalRequestParams,
+          "exec.approval.request",
+          respond,
+        )
+      ) {
         return;
       }
       const p = params as {
@@ -176,6 +157,7 @@ export function createExecApprovalHandlers(
         security?: string;
         ask?: string;
         warningText?: string | null;
+        unavailableDecisions?: string[];
         commandSpans?: {
           startIndex: number;
           endIndex: number;
@@ -183,10 +165,14 @@ export function createExecApprovalHandlers(
         agentId?: string;
         resolvedPath?: string;
         sessionKey?: string;
+        sessionId?: string;
+        runId?: string;
+        toolCallId?: string;
         turnSourceChannel?: string;
         turnSourceTo?: string;
         turnSourceAccountId?: string;
         turnSourceThreadId?: string | number;
+        approvalReviewerDeviceIds?: string[];
         requireDeliveryRoute?: boolean;
         suppressDelivery?: boolean;
         timeoutMs?: number;
@@ -195,7 +181,9 @@ export function createExecApprovalHandlers(
       const twoPhase = p.twoPhase === true;
       const timeoutMs =
         typeof p.timeoutMs === "number" ? p.timeoutMs : DEFAULT_EXEC_APPROVAL_TIMEOUT_MS;
-      const explicitId = normalizeOptionalString(p.id) ?? null;
+      // IDs are opaque cross-surface handles. Preserve every supplied byte so
+      // the manager can reject unsafe values instead of silently normalizing them.
+      const explicitId = p.id ?? null;
       const host = normalizeOptionalString(p.host) ?? "";
       const nodeId = normalizeOptionalString(p.nodeId) ?? "";
       const approvalContext = resolveSystemRunApprovalRequestContext({
@@ -212,6 +200,7 @@ export function createExecApprovalHandlers(
       const effectiveAgentId = approvalContext.agentId;
       const effectiveSessionKey = approvalContext.sessionKey;
       const effectiveCommandText = approvalContext.commandText;
+      const requestRunId = normalizeOptionalString(p.runId);
       if (host === "node" && !nodeId) {
         respond(
           false,
@@ -277,7 +266,7 @@ export function createExecApprovalHandlers(
         return;
       }
       const sanitizedCommandText = sanitizedCommandDisplay.text;
-      const commandAnalysis = resolveCommandAnalysisSummaryForDisplay({
+      const commandAnalysis = await resolveCommandAnalysisSummaryForDisplay({
         host,
         commandText: effectiveCommandText,
         commandArgv: effectiveCommandArgv,
@@ -306,6 +295,9 @@ export function createExecApprovalHandlers(
         );
         return;
       }
+      const unavailableDecisions = normalizeExecApprovalUnavailableDecisions(
+        p.unavailableDecisions,
+      );
       const request = {
         command: sanitizedCommandText,
         commandPreview:
@@ -324,41 +316,74 @@ export function createExecApprovalHandlers(
         warningText: warningText ? sanitizeExecApprovalWarningText(warningText) : null,
         commandAnalysis,
         commandSpans,
-        allowedDecisions: resolveExecApprovalAllowedDecisions({ ask: p.ask ?? null }),
+        unavailableDecisions: unavailableDecisions.length > 0 ? unavailableDecisions : undefined,
+        allowedDecisions: resolveExecApprovalRequestAllowedDecisions({
+          ask: p.ask ?? null,
+          unavailableDecisions,
+        }),
         agentId: effectiveAgentId ?? null,
         resolvedPath: p.resolvedPath ?? null,
         sessionKey: effectiveSessionKey ?? null,
+        sessionId: normalizeOptionalString(p.sessionId) ?? null,
+        runId: requestRunId ?? null,
+        toolCallId: normalizeOptionalString(p.toolCallId) ?? null,
         turnSourceChannel: normalizeOptionalString(p.turnSourceChannel) ?? null,
         turnSourceTo: normalizeOptionalString(p.turnSourceTo) ?? null,
         turnSourceAccountId: normalizeOptionalString(p.turnSourceAccountId) ?? null,
         turnSourceThreadId: p.turnSourceThreadId ?? null,
       };
-      const record = manager.create(request, timeoutMs, explicitId);
-      record.requestedByConnId = client?.connId ?? null;
-      record.requestedByDeviceId = client?.connect?.device?.id ?? null;
-      record.requestedByClientId = client?.connect?.client?.id ?? null;
-      record.requestedByDeviceTokenAuth = client?.isDeviceTokenAuth === true;
-      // Use register() to synchronously add to pending map before sending any response.
-      // This ensures the approval ID is valid immediately after the "accepted" response.
-      let decisionPromise: Promise<
-        import("../../infra/exec-approvals.js").ExecApprovalDecision | null
-      >;
-      try {
-        decisionPromise = manager.register(record, timeoutMs);
-      } catch (err) {
+      // This check is adjacent to manager creation with no await between them.
+      // The abort owner records the tombstone before sweeping pending approvals.
+      if (requestRunId && context.chatRunState.hasAbortMarker(requestRunId)) {
         respond(
           false,
           undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, `registration failed: ${String(err)}`),
+          errorShape(ErrorCodes.INVALID_REQUEST, "approval run already aborted", {
+            details: { reason: "EXEC_APPROVAL_RUN_ABORTED" },
+          }),
         );
         return;
       }
-      const requestEvent: ExecApprovalRequest = {
-        id: record.id,
-        request: record.request,
-        createdAtMs: record.createdAtMs,
-        expiresAtMs: record.expiresAtMs,
-      };
+      let record: ReturnType<typeof manager.create>;
+      try {
+        record = manager.create(request, timeoutMs, explicitId);
+      } catch (error) {
+        if (error instanceof InvalidApprovalIdError) {
+          respond(
+            false,
+            undefined,
+            errorShape(ErrorCodes.INVALID_REQUEST, error.message, {
+              details: { code: error.code, reason: error.reason },
+            }),
+          );
+          return;
+        }
+        throw error;
+      }
+      bindApprovalRequesterMetadata({ record, client });
+      if (client?.internal?.approvalRuntime === true) {
+        // Reviewer ids widen approval visibility, so only the server-trusted
+        // approval runtime may bind them onto a pending exec approval.
+        bindApprovalReviewerDeviceIds({
+          record,
+          deviceIds: p.approvalReviewerDeviceIds,
+        });
+      }
+      // Use register() to synchronously add to pending map before sending any response.
+      // This ensures the approval ID is valid immediately after the "accepted" response.
+      const decisionPromise = registerPendingApprovalRecord({
+        manager,
+        record,
+        timeoutMs,
+        respond,
+        context,
+      });
+      if (!decisionPromise) {
+        return;
+      }
+      const requestEvent: ExecApprovalRequest = buildRequestedApprovalEvent(record);
+      const forwardRequest = opts?.forwarder?.handleRequested.bind(opts.forwarder);
+      const iosPushRequest = opts?.iosPushDelivery?.handleRequested?.bind(opts.iosPushDelivery);
       await handlePendingApprovalRequest({
         manager,
         record,
@@ -372,53 +397,20 @@ export function createExecApprovalHandlers(
         approvalKind: "exec",
         requireDeliveryRoute: p.requireDeliveryRoute,
         suppressDelivery: p.suppressDelivery,
-        deliverRequest: () => {
-          const deliveryTasks: Array<Promise<boolean>> = [];
-          if (opts?.forwarder) {
-            deliveryTasks.push(
-              opts.forwarder.handleRequested(requestEvent).catch((err) => {
-                context.logGateway?.error?.(
-                  `exec approvals: forward request failed: ${String(err)}`,
-                );
-                return false;
-              }),
-            );
-          }
-          if (opts?.iosPushDelivery?.handleRequested) {
-            deliveryTasks.push(
-              opts.iosPushDelivery
-                .handleRequested(requestEvent, {
-                  isTargetVisible: (target) =>
-                    isApprovalRecordVisibleToClient({
-                      record,
-                      client: {
-                        connect: {
-                          client: { id: GATEWAY_CLIENT_IDS.IOS_APP },
-                          device: { id: target.deviceId },
-                          scopes: [...target.scopes],
-                        },
-                      } as GatewayClient,
-                    }),
-                })
-                .catch((err) => {
-                  context.logGateway?.error?.(
-                    `exec approvals: iOS push request failed: ${String(err)}`,
-                  );
-                  return false;
-                }),
-            );
-          }
-          if (deliveryTasks.length === 0) {
-            return false;
-          }
-          return (async () => {
-            let delivered = false;
-            for (const task of deliveryTasks) {
-              delivered = (await task) || delivered;
-            }
-            return delivered;
-          })();
-        },
+        deliverRequest: () =>
+          runApprovalRequestDeliveries({
+            context,
+            record,
+            forward: forwardRequest
+              ? [() => forwardRequest(requestEvent), "exec approvals: forward request failed"]
+              : undefined,
+            iosPush: iosPushRequest
+              ? [
+                  (isTargetVisible) => iosPushRequest(requestEvent, { isTargetVisible }),
+                  "exec approvals: iOS push request failed",
+                ]
+              : undefined,
+          }),
         afterDecision: async (decision) => {
           if (decision === null) {
             await opts?.iosPushDelivery?.handleExpired?.(requestEvent);
@@ -427,61 +419,72 @@ export function createExecApprovalHandlers(
         afterDecisionErrorLabel: "exec approvals: iOS push expire failed",
       });
     },
-    "exec.approval.waitDecision": async ({ params, respond, client }) => {
+    "exec.approval.waitDecision": async ({ params, respond, client, context }) => {
       await handleApprovalWaitDecision({
         manager,
         inputId: (params as { id?: string }).id,
         client,
         respond,
+        resolveTerminalReason: (snapshot) => {
+          const runId = normalizeOptionalString(snapshot.request.runId);
+          return runId && context.chatRunState.hasAbortMarker(runId) ? "run-aborted" : undefined;
+        },
       });
     },
     "exec.approval.resolve": async ({ params, respond, client, context }) => {
-      if (!validateExecApprovalResolveParams(params)) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `invalid exec.approval.resolve params: ${formatValidationErrors(
-              validateExecApprovalResolveParams.errors,
-            )}`,
-          ),
-        );
+      const resolveParams = resolveApprovalDecisionParams({
+        rawParams: params,
+        validate: validateExecApprovalResolveParams,
+        methodName: "exec.approval.resolve",
+        respond,
+      });
+      if (!resolveParams) {
         return;
       }
-      const p = params as { id: string; decision: string };
-      if (!isApprovalDecision(p.decision)) {
-        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "invalid decision"));
-        return;
-      }
-      const decision: ExecApprovalDecision = p.decision;
+      const { inputId, decision } = resolveParams;
+      let autoReviewResolution = false;
       await handleApprovalResolve({
+        approvalKind: "exec",
         manager,
-        inputId: p.id,
+        inputId,
         decision,
         respond,
         context,
         client,
         exposeAmbiguousPrefixError: true,
         validateDecision: (snapshot) => {
+          const autoReviewIdentity =
+            client?.internal?.approvalRuntime === true
+              ? client.internal.agentRuntimeIdentity
+              : undefined;
+          if (autoReviewIdentity) {
+            const requestAgentId = normalizeAgentId(snapshot.request.agentId ?? undefined);
+            const requestSessionKey = normalizeOptionalString(snapshot.request.sessionKey);
+            if (
+              decision !== "allow-once" ||
+              snapshot.request.host !== "node" ||
+              requestAgentId !== autoReviewIdentity.agentId ||
+              requestSessionKey !== autoReviewIdentity.sessionKey
+            ) {
+              return {
+                message: "auto-review approval identity does not match request",
+                details: { reason: "AUTO_REVIEW_APPROVAL_IDENTITY_MISMATCH" },
+              };
+            }
+            autoReviewResolution = true;
+          }
           const allowedDecisions = resolveExecApprovalRequestAllowedDecisions(snapshot.request);
           return allowedDecisions.includes(decision)
             ? null
             : {
-                message:
-                  "allow-always is unavailable because the effective policy requires approval every time",
+                message: "allow-always is unavailable for this command",
                 details: APPROVAL_ALLOW_ALWAYS_UNAVAILABLE_DETAILS,
               };
         },
-        resolvedEventName: "exec.approval.resolved",
-        buildResolvedEvent: ({ approvalId, decision, resolvedBy, snapshot, nowMs }) =>
-          ({
-            id: approvalId,
-            decision,
-            resolvedBy,
-            ts: nowMs,
-            request: snapshot.request,
-          }) satisfies ExecApprovalResolved,
+        resolveRecord: ({ approvalId, decision: decisionLocal, resolvedBy }) =>
+          autoReviewResolution
+            ? manager.resolveAutoReview(approvalId, resolvedBy)
+            : manager.resolve(approvalId, decisionLocal, resolvedBy),
         forwardResolved: (resolvedEvent) => opts?.forwarder?.handleResolved(resolvedEvent),
         forwardResolvedErrorLabel: "exec approvals: forward resolve failed",
         extraResolvedHandlers: opts?.iosPushDelivery?.handleResolved

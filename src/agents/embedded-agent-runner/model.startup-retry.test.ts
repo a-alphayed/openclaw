@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Coverage for retrying transient model-runtime misses during startup.
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const discoverAuthStorageMock = vi.fn<(agentDir?: string) => { mocked: true }>(() => ({
   mocked: true,
@@ -10,12 +11,14 @@ const discoverModelsMock = vi.fn<
 const prepareProviderDynamicModelMock = vi.fn<(params: unknown) => Promise<void>>(async () => {});
 let dynamicAttempts = 0;
 const runProviderDynamicModelMock = vi.fn<(params: unknown) => unknown>(() =>
+  // First dynamic lookup simulates startup catalog warmup; the retry path must
+  // resolve on the second attempt only when explicitly enabled.
   dynamicAttempts > 1
     ? {
         id: "gpt-5.4",
         name: "gpt-5.4",
-        provider: "openai-codex",
-        api: "openai-codex-responses",
+        provider: "openai",
+        api: "openai-chatgpt-responses",
         baseUrl: "https://chatgpt.com/backend-api",
         reasoning: true,
         input: ["text"],
@@ -31,17 +34,35 @@ vi.mock("../agent-model-discovery.js", () => ({
   discoverModels: discoverModelsMock,
 }));
 
+vi.mock("../prepared-model-runtime.js", () => ({
+  getPreparedModelRuntimeSnapshot: () => undefined,
+  loadPreparedModelRuntimeSnapshot: async ({ agentDir }: { agentDir: string }) => {
+    const authStorage = discoverAuthStorageMock(agentDir);
+    return {
+      agentDir,
+      config: {},
+      createStores: () => ({
+        authStorage,
+        modelRegistry: discoverModelsMock(authStorage, agentDir),
+      }),
+    };
+  },
+}));
+
 vi.mock("../../plugins/provider-runtime.js", () => ({
   applyProviderResolvedTransportWithPlugin: () => undefined,
   buildProviderUnknownModelHintWithPlugin: () => undefined,
   normalizeProviderResolvedModelWithPlugin: () => undefined,
   normalizeProviderTransportWithPlugin: () => undefined,
   prepareProviderDynamicModel: async () => {},
+  resolveExternalAuthProfilesWithPlugins: () => [],
   runProviderDynamicModel: () => undefined,
   shouldPreferProviderRuntimeResolvedModel: () => false,
 }));
 
 describe("resolveModelAsync startup retry", () => {
+  let resolveModelAsync: typeof import("./model.js").resolveModelAsync;
+
   const runtimeHooks = {
     buildProviderUnknownModelHintWithPlugin: () => undefined,
     normalizeProviderResolvedModelWithPlugin: () => undefined,
@@ -50,6 +71,10 @@ describe("resolveModelAsync startup retry", () => {
     runProviderDynamicModel: (params: unknown) => runProviderDynamicModelMock(params),
     applyProviderResolvedTransportWithPlugin: () => undefined,
   };
+
+  beforeAll(async () => {
+    ({ resolveModelAsync } = await import("./model.js"));
+  });
 
   beforeEach(() => {
     dynamicAttempts = 0;
@@ -63,40 +88,40 @@ describe("resolveModelAsync startup retry", () => {
   });
 
   it("retries once after a transient provider-runtime miss", async () => {
-    const { resolveModelAsync } = await import("./model.js");
-
     const result = await resolveModelAsync(
-      "openai-codex",
+      "openai",
       "gpt-5.4",
       "/tmp/agent",
       {},
       {
+        agentRuntimeId: "openclaw",
         retryTransientProviderRuntimeMiss: true,
         runtimeHooks,
       },
     );
 
     expect(result.error).toBeUndefined();
-    expect(result.model?.provider).toBe("openai-codex");
+    expect(result.model?.provider).toBe("openai");
     expect(result.model?.id).toBe("gpt-5.4");
-    expect(result.model?.api).toBe("openai-codex-responses");
+    expect(result.model?.api).toBe("openai-chatgpt-responses");
     expect(prepareProviderDynamicModelMock).toHaveBeenCalledTimes(2);
     expect(runProviderDynamicModelMock).toHaveBeenCalledTimes(2);
+    for (const call of [prepareProviderDynamicModelMock, runProviderDynamicModelMock]) {
+      expect(call).toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: expect.objectContaining({ agentRuntimeId: "openclaw" }),
+        }),
+      );
+    }
   });
 
   it("does not retry during steady-state misses", async () => {
-    const { resolveModelAsync } = await import("./model.js");
-
-    const result = await resolveModelAsync(
-      "openai-codex",
-      "gpt-5.4",
-      "/tmp/agent",
-      {},
-      { runtimeHooks },
-    );
+    // Normal runtime lookups should not double-hit providers after startup; that
+    // would add latency and duplicate plugin side effects.
+    const result = await resolveModelAsync("openai", "gpt-5.4", "/tmp/agent", {}, { runtimeHooks });
 
     expect(result.model).toBeUndefined();
-    expect(result.error).toBe("Unknown model: openai-codex/gpt-5.4");
+    expect(result.error).toBe("Unknown model: openai/gpt-5.4");
     expect(prepareProviderDynamicModelMock).toHaveBeenCalledTimes(1);
     expect(runProviderDynamicModelMock).toHaveBeenCalledTimes(1);
   });

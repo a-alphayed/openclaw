@@ -1,6 +1,12 @@
+// Session-store key canonicalization across default agents, main aliases, and legacy keys.
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import { listAgentIds, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import {
   canonicalizeMainSessionAlias,
+  resolveAgentMainSessionKey,
   resolveMainSessionKey,
 } from "../config/sessions/main-session.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -12,11 +18,8 @@ import {
   type ParsedAgentSessionKey,
 } from "../routing/session-key.js";
 import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
 
+/** Canonicalize an opaque session key into the agent-scoped store namespace. */
 export function canonicalizeSessionKeyForAgent(agentId: string, key: string): string {
   const lowered = normalizeLowercaseStringOrEmpty(key);
   if (lowered === "global" || lowered === "unknown") {
@@ -68,6 +71,7 @@ function resolveParsedSessionStoreKey(
   return { agentId, sessionKey: `agent:${agentId}:${rest}` };
 }
 
+/** Resolve any incoming session key into the canonical key used in persisted session stores. */
 export function resolveSessionStoreKey(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
@@ -100,13 +104,18 @@ export function resolveSessionStoreKey(params: {
 
   const lowered = normalizeLowercaseStringOrEmpty(raw);
   const rawMainKey = normalizeMainKey(params.cfg.session?.mainKey);
+  const storeAgentId = params.storeAgentId ? normalizeAgentId(params.storeAgentId) : undefined;
   if (lowered === "main" || lowered === rawMainKey) {
+    if (storeAgentId) {
+      return resolveAgentMainSessionKey({ cfg: params.cfg, agentId: storeAgentId });
+    }
     return resolveMainSessionKey(params.cfg);
   }
-  const agentId = resolveDefaultStoreAgentId(params.cfg);
+  const agentId = storeAgentId ?? resolveDefaultStoreAgentId(params.cfg);
   return canonicalizeSessionKeyForAgent(agentId, raw);
 }
 
+/** Resolve the agent that owns a canonical session-store key. */
 export function resolveSessionStoreAgentId(cfg: OpenClawConfig, canonicalKey: string): string {
   if (canonicalKey === "global" || canonicalKey === "unknown") {
     return resolveDefaultStoreAgentId(cfg);
@@ -118,6 +127,7 @@ export function resolveSessionStoreAgentId(cfg: OpenClawConfig, canonicalKey: st
   return resolveDefaultStoreAgentId(cfg);
 }
 
+/** Resolve a session key for lookup inside a specific agent's store. */
 export function resolveStoredSessionKeyForAgentStore(params: {
   cfg: OpenClawConfig;
   agentId: string;
@@ -139,6 +149,7 @@ export function resolveStoredSessionKeyForAgentStore(params: {
   });
 }
 
+/** Resolve the owner agent for a stored session key, returning null for global/unknown keys. */
 export function resolveStoredSessionOwnerAgentId(params: {
   cfg: OpenClawConfig;
   agentId: string;
@@ -149,30 +160,4 @@ export function resolveStoredSessionOwnerAgentId(params: {
     return null;
   }
   return resolveSessionStoreAgentId(params.cfg, canonicalKey);
-}
-
-export function canonicalizeSpawnedByForAgent(
-  cfg: OpenClawConfig,
-  agentId: string,
-  spawnedBy?: string,
-): string | undefined {
-  const raw = normalizeOptionalString(spawnedBy) ?? "";
-  if (!raw) {
-    return undefined;
-  }
-  const lower = normalizeLowercaseStringOrEmpty(raw);
-  if (lower === "global" || lower === "unknown") {
-    return lower;
-  }
-  let result: string;
-  const normalized = normalizeSessionKeyPreservingOpaquePeerIds(raw);
-  if (normalized.startsWith("agent:")) {
-    result = normalized;
-  } else {
-    result = `agent:${normalizeAgentId(agentId)}:${normalized}`;
-  }
-  // Resolve main-alias references (e.g. agent:ops:main -> configured main key).
-  const parsed = parseAgentSessionKey(result);
-  const resolvedAgent = parsed?.agentId ? normalizeAgentId(parsed.agentId) : agentId;
-  return canonicalizeMainSessionAlias({ cfg, agentId: resolvedAgent, sessionKey: result });
 }

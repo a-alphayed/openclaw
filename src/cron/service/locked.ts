@@ -1,6 +1,9 @@
+/** Process-local cron operation serialization by SQLite store partition. */
+import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
+import { cronStoreKey } from "../store/key.js";
 import type { CronServiceState } from "./state.js";
 
-const storeLocks = new Map<string, Promise<void>>();
+const cronOperations = new KeyedAsyncQueue();
 
 const resolveChain = (promise: Promise<unknown>) =>
   promise.then(
@@ -8,15 +11,13 @@ const resolveChain = (promise: Promise<unknown>) =>
     () => undefined,
   );
 
+/** Serializes operations by their actual SQLite partition and service-local order. */
 export async function locked<T>(state: CronServiceState, fn: () => Promise<T>): Promise<T> {
-  const storePath = state.deps.storePath;
-  const storeOp = storeLocks.get(storePath) ?? Promise.resolve();
-  const next = Promise.all([resolveChain(state.op), resolveChain(storeOp)]).then(fn);
-
-  // Keep the chain alive even when the operation fails.
-  const keepAlive = resolveChain(next);
-  state.op = keepAlive;
-  storeLocks.set(storePath, keepAlive);
-
-  return (await next) as T;
+  const previous = state.op;
+  const next = cronOperations.enqueue(cronStoreKey(state.deps.storePath), async () => {
+    await resolveChain(previous);
+    return await fn();
+  });
+  state.op = resolveChain(next);
+  return await next;
 }

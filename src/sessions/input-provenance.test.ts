@@ -1,8 +1,10 @@
+// Input provenance tests cover source metadata attached to session inputs.
 import { describe, expect, it } from "vitest";
 import {
   annotateInterSessionPromptText,
   isAgentMediatedCompletionSourceTool,
   shouldPreserveUserFacingSessionStateForInputProvenance,
+  stripInterSessionPromptPrefixForDisplay,
 } from "./input-provenance.js";
 
 describe("annotateInterSessionPromptText", () => {
@@ -67,6 +69,18 @@ describe("annotateInterSessionPromptText", () => {
   });
 });
 
+describe("stripInterSessionPromptPrefixForDisplay", () => {
+  it("removes generated inter-session envelope text from display content", () => {
+    const marked = annotateInterSessionPromptText("forwarded report", {
+      kind: "inter_session",
+      sourceSessionKey: "agent:main:discord:source",
+      sourceTool: "sessions_send",
+    });
+
+    expect(stripInterSessionPromptPrefixForDisplay(marked)).toBe("forwarded report");
+  });
+});
+
 describe("isAgentMediatedCompletionSourceTool", () => {
   it.each(["agent_harness_task", "image_generate", "music_generate", "video_generate"])(
     "identifies %s as an agent-mediated completion source",
@@ -86,6 +100,7 @@ describe("isAgentMediatedCompletionSourceTool", () => {
 describe("shouldPreserveUserFacingSessionStateForInputProvenance", () => {
   it.each([
     "agent_harness_task",
+    "exec_approval_followup",
     "image_generate",
     "music_generate",
     "subagent_announce",

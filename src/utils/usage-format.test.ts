@@ -1,14 +1,13 @@
+// Usage format tests cover display formatting for token and cost usage.
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import {
-  resetGatewayModelPricingCacheForTest,
-  setGatewayModelPricingForTest,
-} from "../gateway/model-pricing-cache-state.js";
 import * as manifestModelIdNormalization from "../plugins/manifest-model-id-normalization.js";
+import { captureEnv } from "../test-utils/env.js";
 import {
   resetUsageFormatCachesForTest,
   estimateUsageCost,
@@ -16,10 +15,10 @@ import {
   formatUsd,
   resolveModelCostConfig,
   resolveModelCostConfigFingerprint,
-  type PricingTier,
 } from "./usage-format.js";
 
 type ModelCostConfig = NonNullable<ReturnType<typeof resolveModelCostConfig>>;
+type PricingTier = NonNullable<ModelCostConfig["tieredPricing"]>[number];
 
 function requireCostConfig(
   cost: ReturnType<typeof resolveModelCostConfig>,
@@ -42,34 +41,24 @@ function requireTieredPricing(
 }
 
 describe("usage-format", () => {
-  const originalAgentDir = process.env.OPENCLAW_AGENT_DIR;
-  const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+  let envSnapshot: ReturnType<typeof captureEnv> | undefined;
   let agentDir: string;
   let stateDir: string;
 
   beforeEach(async () => {
+    envSnapshot = captureEnv(["OPENCLAW_AGENT_DIR", "OPENCLAW_STATE_DIR"]);
     stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-usage-format-"));
     agentDir = path.join(stateDir, "agents", "main", "agent");
     process.env.OPENCLAW_STATE_DIR = stateDir;
     delete process.env.OPENCLAW_AGENT_DIR;
     await fs.mkdir(agentDir, { recursive: true });
     resetUsageFormatCachesForTest();
-    resetGatewayModelPricingCacheForTest();
   });
 
   afterEach(async () => {
-    if (originalAgentDir === undefined) {
-      delete process.env.OPENCLAW_AGENT_DIR;
-    } else {
-      process.env.OPENCLAW_AGENT_DIR = originalAgentDir;
-    }
-    if (originalStateDir === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR;
-    } else {
-      process.env.OPENCLAW_STATE_DIR = originalStateDir;
-    }
+    envSnapshot?.restore();
+    envSnapshot = undefined;
     resetUsageFormatCachesForTest();
-    resetGatewayModelPricingCacheForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
@@ -80,6 +69,31 @@ describe("usage-format", () => {
     expect(formatTokenCount(999_499)).toBe("999k");
     expect(formatTokenCount(999_500)).toBe("1.0m");
     expect(formatTokenCount(2_500_000)).toBe("2.5m");
+  });
+
+  it("formats token counts at exact boundaries", () => {
+    expect(formatTokenCount(1000)).toBe("1.0k");
+    expect(formatTokenCount(1500)).toBe("1.5k");
+    expect(formatTokenCount(10000)).toBe("10k");
+    expect(formatTokenCount(50000)).toBe("50k");
+    expect(formatTokenCount(1_000_000)).toBe("1.0m");
+    expect(formatTokenCount(1_500_000)).toBe("1.5m");
+    expect(formatTokenCount(10_000_000)).toBe("10.0m");
+  });
+
+  it("returns 0 for invalid and non-positive token counts", () => {
+    expect(formatTokenCount(0)).toBe("0");
+    expect(formatTokenCount(-100)).toBe("0");
+    expect(formatTokenCount(undefined)).toBe("0");
+    expect(formatTokenCount(Number.NaN)).toBe("0");
+    expect(formatTokenCount(Number.POSITIVE_INFINITY)).toBe("0");
+    expect(formatTokenCount(Number.NEGATIVE_INFINITY)).toBe("0");
+  });
+
+  it("rounds thousands overflow to millions at the boundary", () => {
+    // 999,999 / 1000 = 999.999 → toFixed(1) = "1000.0" → crosses to millions
+    expect(formatTokenCount(999_999)).toBe("1.0m");
+    expect(formatTokenCount(9_999)).toBe("10.0k");
   });
 
   it("formats USD values", () => {
@@ -178,14 +192,6 @@ describe("usage-format", () => {
       "utf8",
     );
 
-    setGatewayModelPricingForTest([
-      {
-        provider: "demo-preferred",
-        model: "demo-model",
-        pricing: { input: 30, output: 31, cacheRead: 32, cacheWrite: 33 },
-      },
-    ]);
-
     expect(
       resolveModelCostConfig({
         provider: "demo-preferred",
@@ -198,6 +204,172 @@ describe("usage-format", () => {
       cacheRead: 12,
       cacheWrite: 13,
     });
+  });
+
+  it("prefers explicit configured pricing over a provider-owned static model price", () => {
+    const config = {
+      models: {
+        providers: {
+          openai: {
+            models: [
+              {
+                id: "gpt-5.4",
+                cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    expect(
+      resolveModelCostConfig({
+        provider: "openai",
+        model: "gpt-5.4",
+        config,
+      }),
+    ).toEqual({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0 });
+  });
+
+  it("prefers agent-local pricing over configured and provider-owned static model prices", async () => {
+    const config = {
+      models: {
+        providers: {
+          openai: {
+            models: [
+              {
+                id: "gpt-5.4",
+                cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    await fs.writeFile(
+      path.join(agentDir, "models.json"),
+      JSON.stringify({
+        providers: {
+          openai: {
+            models: [
+              {
+                id: "gpt-5.4",
+                cost: { input: 7, output: 11, cacheRead: 0.5, cacheWrite: 0.25 },
+              },
+            ],
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    expect(
+      resolveModelCostConfig({
+        provider: "openai",
+        model: "gpt-5.4",
+        config,
+      }),
+    ).toEqual({ input: 7, output: 11, cacheRead: 0.5, cacheWrite: 0.25 });
+  });
+
+  it("scopes models.json pricing by agent directory before configured and default pricing", async () => {
+    const secondAgentDir = path.join(stateDir, "agents", "second", "agent");
+    const configuredOnlyAgentDir = path.join(stateDir, "agents", "configured-only", "agent");
+    const writePricing = async (targetAgentDir: string, input: number) => {
+      await fs.mkdir(targetAgentDir, { recursive: true });
+      await fs.writeFile(
+        path.join(targetAgentDir, "models.json"),
+        JSON.stringify({
+          providers: {
+            "demo-scoped": {
+              models: [
+                {
+                  id: "demo-model",
+                  cost: { input, output: 0, cacheRead: 0, cacheWrite: 0 },
+                },
+              ],
+            },
+          },
+        }),
+        "utf8",
+      );
+    };
+    await writePricing(agentDir, 10);
+    await writePricing(secondAgentDir, 20);
+    await fs.mkdir(configuredOnlyAgentDir, { recursive: true });
+
+    const config = {
+      models: {
+        providers: {
+          "demo-scoped": {
+            models: [
+              {
+                id: "demo-model",
+                cost: { input: 30, output: 0, cacheRead: 0, cacheWrite: 0 },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const resolveInputPrice = (scopedAgentDir?: string) =>
+      resolveModelCostConfig({
+        provider: "demo-scoped",
+        model: "demo-model",
+        config,
+        agentDir: scopedAgentDir,
+      })?.input;
+
+    expect(resolveInputPrice(agentDir)).toBe(10);
+    expect(resolveInputPrice(secondAgentDir)).toBe(20);
+    expect(resolveInputPrice(configuredOnlyAgentDir)).toBe(30);
+    expect(resolveInputPrice()).toBe(10);
+  });
+
+  it("bounds the agent-directory models.json pricing cache", async () => {
+    const writePricing = async (targetAgentDir: string, input: number) => {
+      await fs.mkdir(targetAgentDir, { recursive: true });
+      await fs.writeFile(
+        path.join(targetAgentDir, "models.json"),
+        JSON.stringify({
+          providers: {
+            "demo-bounded": {
+              models: [
+                {
+                  id: "demo-model",
+                  cost: { input, output: 0, cacheRead: 0, cacheWrite: 0 },
+                },
+              ],
+            },
+          },
+        }),
+        "utf8",
+      );
+    };
+    const agentDirs = Array.from({ length: 129 }, (_, index) =>
+      path.join(stateDir, "agents", `bounded-${index}`, "agent"),
+    );
+    for (const [index, targetAgentDir] of agentDirs.entries()) {
+      await writePricing(targetAgentDir, index + 1);
+      expect(
+        resolveModelCostConfig({
+          provider: "demo-bounded",
+          model: "demo-model",
+          agentDir: targetAgentDir,
+        })?.input,
+      ).toBe(index + 1);
+    }
+
+    const firstAgentDir = expectDefined(agentDirs[0], "first bounded agent directory");
+    await writePricing(firstAgentDir, 999);
+    expect(
+      resolveModelCostConfig({
+        provider: "demo-bounded",
+        model: "demo-model",
+        agentDir: firstAgentDir,
+      })?.input,
+    ).toBe(999);
   });
 
   it("falls back to openclaw config pricing when models.json is absent", () => {
@@ -216,14 +388,6 @@ describe("usage-format", () => {
       },
     } as unknown as OpenClawConfig;
 
-    setGatewayModelPricingForTest([
-      {
-        provider: "demo-config-provider",
-        model: "demo-model",
-        pricing: { input: 3, output: 4, cacheRead: 0.3, cacheWrite: 0.4 },
-      },
-    ]);
-
     expect(
       resolveModelCostConfig({
         provider: "demo-config-provider",
@@ -235,28 +399,6 @@ describe("usage-format", () => {
       output: 19,
       cacheRead: 0.9,
       cacheWrite: 1.9,
-    });
-  });
-
-  it("falls back to cached gateway pricing when no configured cost exists", () => {
-    setGatewayModelPricingForTest([
-      {
-        provider: "demo-cached-provider",
-        model: "demo-model",
-        pricing: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-      },
-    ]);
-
-    expect(
-      resolveModelCostConfig({
-        provider: "demo-cached-provider",
-        model: "demo-model",
-      }),
-    ).toEqual({
-      input: 2.5,
-      output: 15,
-      cacheRead: 0.25,
-      cacheWrite: 0,
     });
   });
 
@@ -566,6 +708,8 @@ describe("usage-format", () => {
     metadataOnlyModel.cost = { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 };
     const after = resolveModelCostConfigFingerprint(config);
 
+    expect(before).toMatch(/^[0-9a-f]{64}$/u);
+    expect(after).toMatch(/^[0-9a-f]{64}$/u);
     expect(after).not.toBe(before);
     expect(
       resolveModelCostConfig({
@@ -702,7 +846,7 @@ describe("usage-format", () => {
     const tiers: PricingTier[] = [
       { input: 0.46, output: 2.3, cacheRead: 0, cacheWrite: 0, range: [0, 32_000] },
       { input: 0.7, output: 3.5, cacheRead: 0, cacheWrite: 0, range: [32_000, 128_000] },
-      { input: 1.4, output: 7.0, cacheRead: 0, cacheWrite: 0, range: [128_000, 256_000] },
+      { input: 1.4, output: 7, cacheRead: 0, cacheWrite: 0, range: [128_000, 256_000] },
     ];
     const cost = { input: 0.46, output: 2.3, cacheRead: 0, cacheWrite: 0, tieredPricing: tiers };
 
@@ -768,9 +912,9 @@ describe("usage-format", () => {
   it("bills overflow at last tier when only a single small-range tier exists (e.g. <30K)", () => {
     // Only one tier covering [0, 30000), input is 100000
     const tiers: PricingTier[] = [
-      { input: 1.0, output: 3.0, cacheRead: 0.5, cacheWrite: 0, range: [0, 30_000] },
+      { input: 1, output: 3, cacheRead: 0.5, cacheWrite: 0, range: [0, 30_000] },
     ];
-    const cost = { input: 1.0, output: 3.0, cacheRead: 0.5, cacheWrite: 0, tieredPricing: tiers };
+    const cost = { input: 1, output: 3, cacheRead: 0.5, cacheWrite: 0, tieredPricing: tiers };
 
     // 100000 input exceeds the only range, so Tier 1 is the whole-request fallback.
     // Total = 0.1 + 0.015 + 0.001 = 0.116
@@ -892,7 +1036,7 @@ describe("usage-format", () => {
     });
     const tiers1 = requireTieredPricing(requireCostConfig(cost1, "open-ended"), "open-ended");
     expect(tiers1).toHaveLength(2);
-    expect(tiers1[1].range).toEqual([32000, Infinity]);
+    expect(expectDefined(tiers1[1], "tiers1[1] test invariant").range).toEqual([32000, Infinity]);
 
     // [32000, -1] should also be normalized to [32000, Infinity]
     const cost2 = resolveModelCostConfig({
@@ -901,7 +1045,7 @@ describe("usage-format", () => {
     });
     const tiers2 = requireTieredPricing(requireCostConfig(cost2, "negative-end"), "negative-end");
     expect(tiers2).toHaveLength(2);
-    expect(tiers2[1].range).toEqual([32000, Infinity]);
+    expect(expectDefined(tiers2[1], "tiers2[1] test invariant").range).toEqual([32000, Infinity]);
   });
 
   it("resolves tiered pricing from models.json", async () => {
@@ -948,46 +1092,7 @@ describe("usage-format", () => {
     const tiers = requireTieredPricing(requireCostConfig(cost, "models.json"), "models.json");
 
     expect(tiers).toHaveLength(2);
-    expect(tiers[0].range).toEqual([0, 32000]);
-    expect(tiers[1].input).toBe(0.7);
-  });
-
-  it("resolves tiered pricing from cached gateway (LiteLLM)", () => {
-    setGatewayModelPricingForTest([
-      {
-        provider: "volcengine",
-        model: "doubao-seed",
-        pricing: {
-          input: 0.46,
-          output: 2.3,
-          cacheRead: 0,
-          cacheWrite: 0,
-          tieredPricing: [
-            {
-              input: 0.46,
-              output: 2.3,
-              cacheRead: 0,
-              cacheWrite: 0,
-              range: [0, 32000] as [number, number],
-            },
-            {
-              input: 0.7,
-              output: 3.5,
-              cacheRead: 0,
-              cacheWrite: 0,
-              range: [32000, 128000] as [number, number],
-            },
-          ],
-        },
-      },
-    ]);
-
-    const cost = resolveModelCostConfig({
-      provider: "volcengine",
-      model: "doubao-seed",
-    });
-    const tiers = requireTieredPricing(requireCostConfig(cost, "cached gateway"), "cached gateway");
-
-    expect(tiers).toHaveLength(2);
+    expect(expectDefined(tiers[0], "tiers[0] test invariant").range).toEqual([0, 32000]);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").input).toBe(0.7);
   });
 });

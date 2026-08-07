@@ -1,8 +1,11 @@
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../agents/defaults.js";
+import { modelKey } from "../../agents/model-ref-shared.js";
+/** Resolves configured model refs and tags for model-list rows. */
 import {
   buildModelAliasIndex,
   resolveConfiguredModelRef,
   resolveModelRefFromString,
-} from "../../agents/model-selection.js";
+} from "../../agents/model-selection-shared.js";
 import {
   resolveAgentModelFallbackValues,
   resolveAgentModelPrimaryValue,
@@ -11,10 +14,10 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.js";
 import type { ConfiguredEntry } from "./list.types.js";
 import { createModelCatalogProviderAliasCanonicalizer } from "./provider-aliases.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER, modelKey } from "./shared.js";
 
 const DISPLAY_MODEL_PARSE_OPTIONS = { allowPluginNormalization: false } as const;
 
+/** Returns canonical configured model entries with default/fallback/image/configured tags. */
 export function resolveConfiguredEntries(
   cfg: OpenClawConfig,
   metadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">,
@@ -47,6 +50,8 @@ export function resolveConfiguredEntries(
     const key = modelKey(canonicalRef.provider, canonicalRef.model);
     const originalKey = modelKey(ref.provider, ref.model);
     if (originalKey !== key) {
+      // Preserve aliases attached to pre-canonical provider keys so display rows
+      // still show user-facing aliases after catalog provider canonicalization.
       const aliases = aliasesByKey.get(originalKey);
       if (aliases) {
         aliasesByKey.set(key, [...new Set([...(aliasesByKey.get(key) ?? []), ...aliases])]);

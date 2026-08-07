@@ -1,4 +1,11 @@
+// Builds channel status rows and account details for `openclaw status --all`.
+// This layer stays plugin-generic: channel-specific auth rules live in plugin config/status hooks.
+
 import fs from "node:fs";
+import { asRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { resolveInspectedChannelAccount } from "../../channels/account-inspection.js";
 import { hasConfiguredUnavailableCredentialStatus } from "../../channels/account-snapshot-fields.js";
 import {
@@ -19,18 +26,17 @@ import {
   markConfiguredUnavailableCredentialStatusesAvailable,
 } from "../../channels/status/read-model.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { formatPhoneNumberForCli } from "../../infra/phone-number-presentation.js";
 import { listExplicitConfiguredChannelIdsForConfig } from "../../plugins/channel-plugin-ids.js";
-import { resolveMissingOfficialExternalChannelPluginRepairHint } from "../../plugins/official-external-plugin-repair-hints.js";
-import { asRecord } from "../../shared/record-coerce.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
-import { sanitizeForLog } from "../../terminal/ansi.js";
+import { resolveMissingOfficialExternalChannelPluginRepairHints } from "../../plugins/official-external-plugin-repair-hints.js";
+import { resolvePluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.js";
 import {
   summarizeTokenConfig,
   type ChannelAccountTokenSummaryRow,
 } from "./channels-token-summary.js";
 import { formatTimeAgo } from "./format.js";
 
-export type ChannelRow = {
+type ChannelRow = {
   id: ChannelId;
   label: string;
   enabled: boolean;
@@ -62,6 +68,7 @@ function existsSyncMaybe(p: string | undefined): boolean | null {
   }
 }
 
+/** Resolves one configured/default account into the normalized row shape used by status rendering. */
 async function resolveChannelAccountRow(
   params: ResolvedChannelAccountRowParams,
 ): Promise<ChannelAccountRow> {
@@ -148,12 +155,17 @@ const buildAccountNotes = (params: {
   const allowFrom =
     plugin.config.resolveAllowFrom?.({ cfg, accountId: snapshot.accountId }) ?? snapshot.allowFrom;
   if (allowFrom?.length) {
+    // Cap allow-list output so large channel policies do not dominate the status table.
+    const allowInternationalDigits =
+      plugin.configSchema?.uiHints?.allowFrom?.presentation === "phone-number";
     const formatted = formatChannelAllowFrom({
       plugin,
       cfg,
       accountId: snapshot.accountId,
       allowFrom,
-    }).slice(0, 3);
+    })
+      .slice(0, 3)
+      .map((allowEntry) => formatPhoneNumberForCli(allowEntry, { allowInternationalDigits }));
     if (formatted.length > 0) {
       notes.push(`allow:${formatted.join(",")}`);
     }
@@ -168,6 +180,7 @@ function resolveLinkFields(summary: unknown): {
   authAgeMs: number | null;
   selfE164: string | null;
 } {
+  // Plugin summaries are optional extension data; normalize only the fields the core table understands.
   const rec = asRecord(summary);
   const statusState = typeof rec.statusState === "string" ? rec.statusState : null;
   const linked = typeof rec.linked === "boolean" ? rec.linked : null;
@@ -190,6 +203,7 @@ function collectMissingPaths(accounts: ChannelAccountRow[]): string[] {
       "dbPath",
       "authDir",
     ]) {
+      // Account config and snapshots can each expose file-backed credential paths.
       const raw =
         (accountRec[key] as string | undefined) ?? (snapshotRec[key] as string | undefined);
       const ok = existsSyncMaybe(raw);
@@ -214,8 +228,7 @@ function formatLoadFailureDetail(message: string): string {
   return `plugin load failed: ${reason}; run openclaw doctor --fix`;
 }
 
-// `status --all` channels table.
-// Keep this generic: channel-specific rules belong in the channel plugin.
+/** Builds the `status --all` channel summary and per-account detail tables. */
 export async function buildChannelsTable(
   cfg: OpenClawConfig,
   opts?: {
@@ -244,11 +257,20 @@ export async function buildChannelsTable(
   const sourceConfig = opts?.sourceConfig ?? cfg;
   const includeSetupFallbackPlugins = opts?.includeSetupFallbackPlugins ?? true;
   const credentialResolutionSkipped = opts?.credentialResolutionSkipped === true;
+  const workspaceDir = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
+  const metadataSnapshot = resolvePluginMetadataSnapshot({
+    config: cfg,
+    ...(workspaceDir ? { workspaceDir } : {}),
+    env: process.env,
+    allowWorkspaceScopedCurrent: true,
+  });
   const readOnlyPlugins = resolveReadOnlyChannelPluginsForConfig(cfg, {
     activationSourceConfig: sourceConfig,
     includeSetupFallbackPlugins,
+    metadataSnapshot,
   });
   for (const plugin of readOnlyPlugins.plugins) {
+    // Use the plugin's default account even when no accounts are configured so setup guidance is concrete.
     const accountIds = plugin.config.listAccountIds(cfg);
     const defaultAccountId = resolveChannelDefaultAccountId({
       plugin,
@@ -288,6 +310,7 @@ export async function buildChannelsTable(
         hasRuntimeCredentialAvailable({ liveAccounts, accountId: entry.accountId }))
         ? {
             ...entry,
+            // Fast-mode scans may not resolve local secrets; runtime evidence can still prove availability.
             account: markConfiguredUnavailableCredentialStatusesAvailable(entry.account),
           }
         : entry,
@@ -318,6 +341,7 @@ export async function buildChannelsTable(
     const label = plugin.meta.label ?? plugin.id;
 
     const state = (() => {
+      // Precedence matches operator actionability: disabled, local file breakage, plugin issues, auth, link.
       if (!anyEnabled) {
         return "off";
       }
@@ -365,7 +389,7 @@ export async function buildChannelsTable(
         if (link.statusState === "linked") {
           const extra: string[] = [];
           if (link.selfE164) {
-            extra.push(link.selfE164);
+            extra.push(formatPhoneNumberForCli(link.selfE164));
           }
           if (link.authAgeMs != null && link.authAgeMs >= 0) {
             extra.push(`auth ${formatTimeAgo(link.authAgeMs)}`);
@@ -384,7 +408,7 @@ export async function buildChannelsTable(
         const base = link.linked ? "linked" : "not linked";
         const extra: string[] = [];
         if (link.linked && link.selfE164) {
-          extra.push(link.selfE164);
+          extra.push(formatPhoneNumberForCli(link.selfE164));
         }
         if (link.linked && link.authAgeMs != null && link.authAgeMs >= 0) {
           extra.push(`auth ${formatTimeAgo(link.authAgeMs)}`);
@@ -501,17 +525,22 @@ export async function buildChannelsTable(
     ...listExplicitConfiguredChannelIdsForConfig(sourceConfig),
     ...listExplicitConfiguredChannelIdsForConfig(cfg),
   ]);
+  const missingHintsByChannelId = new Map(
+    resolveMissingOfficialExternalChannelPluginRepairHints({
+      config: cfg,
+      activationSourceConfig: sourceConfig,
+      channelIds: missingCandidateChannelIds,
+      manifestRecords: metadataSnapshot.plugins,
+    }).map((hint) => [hint.channelId, hint]),
+  );
   for (const channelId of missingCandidateChannelIds) {
     if (visibleChannelIds.has(channelId)) {
       continue;
     }
-    const hint = resolveMissingOfficialExternalChannelPluginRepairHint({
-      config: cfg,
-      activationSourceConfig: sourceConfig,
-      channelId,
-    });
+    const hint = missingHintsByChannelId.get(channelId);
     if (!hint || hint.channelId !== channelId) {
       if (!includeSetupFallbackPlugins && explicitConfiguredChannelIds.has(channelId)) {
+        // Fast mode intentionally skips setup fallback plugins, but configured ids still deserve visibility.
         rows.push({
           id: channelId,
           label: sanitizeForLog(channelId).trim() || "configured-channel",

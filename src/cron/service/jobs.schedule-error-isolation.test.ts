@@ -1,3 +1,4 @@
+// Schedule error isolation tests cover one bad job not blocking other cron jobs.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CronJob, CronStoreFile } from "../types.js";
 import { recomputeNextRuns } from "./jobs.js";
@@ -135,6 +136,11 @@ describe("cron schedule error isolation", () => {
     // After 3rd error, job should be disabled
     expect(badJob.enabled).toBe(false);
     expect(badJob.state.scheduleErrorCount).toBe(3);
+    expect(badJob.state.autoDisabled).toEqual({
+      reason: "schedule-errors",
+      atMs: Date.now(),
+      consecutiveErrors: 3,
+    });
     expect(state.deps.log.error).toHaveBeenCalledWith(
       {
         jobId: "bad-job",
@@ -143,6 +149,10 @@ describe("cron schedule error isolation", () => {
         err: "TypeError: CronPattern: invalid configuration format ('garbage'), exactly five, six, or seven space separated parts are required.",
       },
       "cron: auto-disabled job after repeated schedule errors",
+    );
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
+      expect.stringContaining("openclaw automations enable bad-job"),
+      expect.objectContaining({ contextKey: "cron:bad-job:auto-disabled" }),
     );
   });
 

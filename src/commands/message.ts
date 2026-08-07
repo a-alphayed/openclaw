@@ -1,3 +1,8 @@
+/** CLI entrypoint for channel message actions. */
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
@@ -10,15 +15,16 @@ import { formatCliCommand } from "../cli/command-format.js";
 import { getScopedChannelsCommandSecretTargets } from "../cli/command-secret-targets.js";
 import { resolveMessageSecretScope } from "../cli/message-secret-scope.js";
 import { createOutboundSendDeps, type CliDeps } from "../cli/outbound-send-deps.js";
+import { parsePositiveIntOrUndefined } from "../cli/program/helpers.js";
 import { withProgress } from "../cli/progress.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { OutboundSendDeps } from "../infra/outbound/deliver.js";
+import {
+  resolveMessageBroadcastAccountPlan,
+  validateExplicitMessageAccountSelection,
+} from "../infra/outbound/message-account-selection.js";
 import { runMessageAction } from "../infra/outbound/message-action-runner.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
 
 function extractMessageId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") {
@@ -51,21 +57,45 @@ function buildMessageCliJson(result: Awaited<ReturnType<typeof runMessageAction>
   };
 }
 
+/** Resolves config/secrets, runs a channel message action, then renders JSON or text. */
 export async function messageCommand(
   opts: Record<string, unknown>,
   deps: CliDeps,
   runtime: RuntimeEnv,
 ) {
   const loadedRaw = getRuntimeConfig();
+  const rawAction = normalizeOptionalString(opts.action) ?? "";
+  const actionInput = rawAction || "send";
+  const normalizedActionInput = normalizeLowercaseStringOrEmpty(actionInput);
   const scope = resolveMessageSecretScope({
     channel: opts.channel,
     target: opts.target,
     targets: opts.targets,
     accountId: opts.accountId,
   });
+  const explicitAccountId = validateExplicitMessageAccountSelection({
+    cfg: loadedRaw,
+    channel: scope.channel,
+    accountId: opts.accountId,
+    checkResolvedAccount: false,
+  });
+  if (explicitAccountId) {
+    scope.accountId = explicitAccountId;
+    opts.accountId = explicitAccountId;
+  }
+  // The message CLI wrapper preloads configured channel plugins before this
+  // command runs, so the operation-local plan sees the canonical registry.
+  const broadcastAccountPlan =
+    normalizedActionInput === "broadcast" && !scope.channel && explicitAccountId
+      ? resolveMessageBroadcastAccountPlan({
+          cfg: loadedRaw,
+          accountId: explicitAccountId,
+        })
+      : undefined;
   const scopedTargets = getScopedChannelsCommandSecretTargets({
     config: loadedRaw,
     channel: scope.channel,
+    ...(broadcastAccountPlan ? { channels: broadcastAccountPlan.secretChannels } : {}),
     accountId: scope.accountId,
   });
   const { effectiveConfig: cfg } = await resolveCommandConfigWithSecrets({
@@ -76,9 +106,6 @@ export async function messageCommand(
     runtime,
     autoEnable: true,
   });
-  const rawAction = normalizeOptionalString(opts.action) ?? "";
-  const actionInput = rawAction || "send";
-  const normalizedActionInput = normalizeLowercaseStringOrEmpty(actionInput);
   const actionMatch = (CHANNEL_MESSAGE_ACTION_NAMES as readonly string[]).find(
     (name) => normalizeLowercaseStringOrEmpty(name) === normalizedActionInput,
   );
@@ -93,6 +120,8 @@ export async function messageCommand(
 
   const outboundDeps: OutboundSendDeps = createOutboundSendDeps(deps);
 
+  // Keep the gateway client identity explicit so channel plugins can distinguish
+  // CLI-originated owner actions from background gateway work.
   const run = async () =>
     await runMessageAction({
       cfg,
@@ -101,6 +130,8 @@ export async function messageCommand(
       deps: outboundDeps,
       agentId: resolveDefaultAgentId(cfg),
       senderIsOwner: opts.senderIsOwner !== false,
+      conversationReadOrigin: "direct-operator",
+      broadcastAccountPlan,
       gateway: {
         clientName: GATEWAY_CLIENT_NAMES.CLI,
         mode: GATEWAY_CLIENT_MODES.CLI,
@@ -128,7 +159,8 @@ export async function messageCommand(
   }
 
   const { formatMessageCliText } = await import("./message-format.js");
-  for (const line of formatMessageCliText(result)) {
+  const displayLimit = parsePositiveIntOrUndefined(opts.limit);
+  for (const line of formatMessageCliText(result, { displayLimit })) {
     runtime.log(line);
   }
 }

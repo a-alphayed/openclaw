@@ -1,3 +1,4 @@
+// Diagnostic memory tests cover memory snapshot capture and diagnostic log output.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -153,6 +154,75 @@ describe("diagnostic memory", () => {
     stop();
 
     expect(events.map((event) => event.type)).toEqual(["diagnostic.memory.pressure"]);
+  });
+
+  it("scales default heap pressure thresholds with enlarged V8 limits", () => {
+    const events: DiagnosticEventPayload[] = [];
+    const stop = onDiagnosticEvent((event) => events.push(event));
+    const gb = 1024 ** 3;
+
+    emitDiagnosticMemorySample({
+      now: 1000,
+      heapSizeLimitBytes: 8 * gb,
+      memoryUsage: memoryUsage({ heapUsed: 2.1 * gb }),
+    });
+    expect(events.filter((event) => event.type === "diagnostic.memory.pressure")).toEqual([]);
+
+    emitDiagnosticMemorySample({
+      now: 2000,
+      heapSizeLimitBytes: 8 * gb,
+      memoryUsage: memoryUsage({ heapUsed: 4.1 * gb }),
+    });
+    emitDiagnosticMemorySample({
+      now: 3000,
+      heapSizeLimitBytes: 8 * gb,
+      memoryUsage: memoryUsage({ heapUsed: 6.1 * gb }),
+    });
+    stop();
+
+    expect(
+      events
+        .filter((event) => event.type === "diagnostic.memory.pressure")
+        .map((event) => ({
+          level: event.level,
+          reason: event.reason,
+          threshold: event.thresholdBytes,
+        })),
+    ).toEqual([
+      { level: "warning", reason: "heap_threshold", threshold: 4 * gb },
+      { level: "critical", reason: "heap_threshold", threshold: 6 * gb },
+    ]);
+  });
+
+  it("scales default heap pressure thresholds down for constrained V8 limits", () => {
+    const events: DiagnosticEventPayload[] = [];
+    const stop = onDiagnosticEvent((event) => events.push(event));
+    const mb = 1024 ** 2;
+
+    emitDiagnosticMemorySample({
+      now: 1000,
+      heapSizeLimitBytes: 1024 * mb,
+      memoryUsage: memoryUsage({ heapUsed: 600 * mb }),
+    });
+    emitDiagnosticMemorySample({
+      now: 2000,
+      heapSizeLimitBytes: 1024 * mb,
+      memoryUsage: memoryUsage({ heapUsed: 800 * mb }),
+    });
+    stop();
+
+    expect(
+      events
+        .filter((event) => event.type === "diagnostic.memory.pressure")
+        .map((event) => ({
+          level: event.level,
+          reason: event.reason,
+          threshold: event.thresholdBytes,
+        })),
+    ).toEqual([
+      { level: "warning", reason: "heap_threshold", threshold: 512 * mb },
+      { level: "critical", reason: "heap_threshold", threshold: 768 * mb },
+    ]);
   });
 
   it("emits pressure when RSS grows quickly", () => {
@@ -358,13 +428,55 @@ describe("diagnostic memory", () => {
         }),
         expect.objectContaining({
           level: "WARN",
-          message:
-            "critical memory pressure snapshot disabled: diagnostics.memoryPressureSnapshot=false",
+          message: "critical memory pressure snapshot disabled",
           attributes: expect.objectContaining({
             subsystem: "gateway/diagnostics/memory",
           }),
         }),
       ]),
+    );
+  });
+
+  it("logs warning pressure with readable units and operator guidance", async () => {
+    setLoggerOverride({ level: "info", consoleLevel: "silent" });
+    const records: Array<Extract<DiagnosticEventPayload, { type: "log.record" }>> = [];
+    const stop = onInternalDiagnosticEvent((event) => {
+      if (event.type === "log.record") {
+        records.push(event);
+      }
+    });
+    try {
+      emitDiagnosticMemorySample({
+        now: Date.parse("2026-04-22T12:00:00.000Z"),
+        memoryUsage: memoryUsage({ rss: 2_012_905_472, heapUsed: 1_307_038_712 }),
+        thresholds: {
+          rssWarningBytes: 1_610_612_736,
+          rssCriticalBytes: 3_221_225_472,
+          pressureRepeatMs: 60_000,
+        },
+      });
+      await flushDiagnosticEvents();
+    } finally {
+      stop();
+    }
+
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: "WARN",
+          message: expect.stringContaining(
+            "memory pressure: level=warning reason=rss_threshold rss=1.87 GiB heap=1.22 GiB threshold=1.5 GiB thresholdRatio=125%",
+          ),
+          attributes: expect.objectContaining({
+            subsystem: "gateway/diagnostics/memory",
+          }),
+        }),
+      ]),
+    );
+    expect(records.at(-1)?.message).toContain("rssBytes=2012905472");
+    expect(records.at(-1)?.message).toContain("heapUsedBytes=1307038712");
+    expect(records.at(-1)?.message).toContain(
+      "nextStep=run openclaw gateway status --deep and openclaw gateway diagnostics export; restart gateway if pressure persists",
     );
   });
 

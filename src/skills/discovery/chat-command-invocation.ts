@@ -1,10 +1,12 @@
-import { getChatCommands } from "../../auto-reply/commands-registry.data.js";
+// Chat command invocation helpers execute skill-provided chat command handlers.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
-} from "../../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import { getChatCommands } from "../../auto-reply/commands-registry.data.js";
 import type { SkillCommandSpec } from "../types.js";
 
+/** Lists slash command names reserved by built-in chat commands and callers. */
 export function listReservedChatSlashCommandNames(extraNames: string[] = []): Set<string> {
   const reserved = new Set<string>();
   for (const command of getChatCommands()) {
@@ -28,6 +30,7 @@ export function listReservedChatSlashCommandNames(extraNames: string[] = []): Se
   return reserved;
 }
 
+// Skill commands allow spaces/underscores in names but compare through dash-normalized lookup.
 function normalizeSkillCommandLookup(value: string): string {
   return (normalizeOptionalLowercaseString(value) ?? "").replace(/[\s_]+/g, "-");
 }
@@ -54,6 +57,67 @@ function findSkillCommand(
       normalizeSkillCommandLookup(entry.skillName) === normalized
     );
   });
+}
+
+function skillReferenceMatches(text: string): IterableIterator<RegExpMatchArray> {
+  return text.matchAll(/\$([-a-zA-Z0-9_:]+)/gu);
+}
+
+function isEscapedReference(text: string, index: number): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) {
+    backslashes += 1;
+  }
+  return backslashes % 2 === 1;
+}
+
+function isShellVariableReference(name: string): boolean {
+  return !/[a-z]/u.test(name);
+}
+
+/** Returns true when text may contain an explicit `$skill-name` reference. */
+export function hasSkillReferenceCandidate(text: string): boolean {
+  for (const match of skillReferenceMatches(text)) {
+    const name = match[1]?.replace(/:+$/gu, "");
+    const index = match.index;
+    if (
+      name &&
+      index !== undefined &&
+      !isEscapedReference(text, index) &&
+      !isShellVariableReference(name)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Resolves explicit `$skill-name` references against the current eligible skill commands. */
+export function resolveSkillReferenceInvocations(params: {
+  text: string;
+  skillCommands: SkillCommandSpec[];
+}): SkillCommandSpec[] {
+  const resolved: SkillCommandSpec[] = [];
+  const seen = new Set<string>();
+  for (const match of skillReferenceMatches(params.text)) {
+    const name = match[1]?.replace(/:+$/gu, "");
+    const index = match.index;
+    if (
+      !name ||
+      index === undefined ||
+      isEscapedReference(params.text, index) ||
+      isShellVariableReference(name)
+    ) {
+      continue;
+    }
+    const command = findSkillCommand(params.skillCommands, name);
+    if (!command || command.modelVisible === false || seen.has(command.name)) {
+      continue;
+    }
+    seen.add(command.name);
+    resolved.push(command);
+  }
+  return resolved;
 }
 
 export function resolveSkillCommandInvocation(params: {

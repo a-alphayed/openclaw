@@ -1,6 +1,13 @@
-import { resolveIntegerOption } from "openclaw/plugin-sdk/number-runtime";
-import { RateLimitError, readRetryAfter } from "./rest-errors.js";
-import { createBucketKey, createRouteKey, readHeaderNumber, readResetAt } from "./rest-routes.js";
+// Discord plugin module implements rest scheduler behavior.
+import { resolveIntegerOption, resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { RateLimitError, readDiscordRateLimitBucket, readRetryAfter } from "./rest-errors.js";
+import {
+  createBucketKey,
+  createRouteKey,
+  readHeaderNumber,
+  readResetAt,
+  resolveRateLimitResetAt,
+} from "./rest-routes.js";
 
 export type RequestPriority = "critical" | "standard" | "background";
 export type RequestQuery = Record<string, string | number | boolean>;
@@ -32,13 +39,13 @@ type BucketState<TData> = {
   routeKeys: Set<string>;
 };
 
-export type RestSchedulerLaneOptions = {
+type RestSchedulerLaneOptions = {
   maxQueueSize: number;
   staleAfterMs?: number;
   weight: number;
 };
 
-export type RestSchedulerOptions = {
+type RestSchedulerOptions = {
   lanes: Record<RequestPriority, RestSchedulerLaneOptions>;
   maxConcurrency: number;
   maxQueueSize: number;
@@ -301,7 +308,7 @@ export class RestScheduler<TData> {
     response: Response,
     parsed: unknown,
   ): void {
-    const bucketHeader = response.headers.get("X-RateLimit-Bucket");
+    const bucketHeader = readDiscordRateLimitBucket(response);
     const bucket = bucketHeader
       ? this.bindRouteToBucket(routeKey, createBucketKey(bucketHeader, path))
       : this.getBucket(this.routeBuckets.get(routeKey) ?? routeKey);
@@ -323,7 +330,10 @@ export class RestScheduler<TData> {
     }
     bucket.rateLimitHits += 1;
     const retryAfterMs = Math.max(0, readRetryAfter(parsed, response, 1) * 1000);
-    const retryAt = Date.now() + retryAfterMs;
+    const retryAt = resolveRateLimitResetAt(retryAfterMs);
+    if (retryAt === undefined) {
+      return;
+    }
     if (response.headers.get("X-RateLimit-Global") === "true" || isGlobalRateLimit(parsed)) {
       this.globalRateLimitUntil = Math.max(this.globalRateLimitUntil, retryAt);
       return;
@@ -342,7 +352,7 @@ export class RestScheduler<TData> {
     const now = Date.now();
     this.invalidRequestTimestamps.push({ at: now, status: response.status });
     this.pruneInvalidRequests(now);
-    const bucketHeader = response.headers.get("X-RateLimit-Bucket");
+    const bucketHeader = readDiscordRateLimitBucket(response);
     const bucketKey = bucketHeader
       ? createBucketKey(bucketHeader, path)
       : (this.routeBuckets.get(routeKey) ?? routeKey);
@@ -381,7 +391,7 @@ export class RestScheduler<TData> {
         this.drainTimer = undefined;
         this.drainQueues();
       },
-      Math.max(0, delayMs),
+      resolveTimerTimeoutMs(delayMs, 0, 0),
     );
     this.drainTimer.unref?.();
   }

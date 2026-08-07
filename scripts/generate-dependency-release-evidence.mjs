@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
+// Generates release dependency evidence artifacts and summaries.
 import { execFileSync } from "node:child_process";
 import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { parseFlagArgs, stringFlag } from "./lib/arg-utils.mjs";
 
+/**
+ * Dependency evidence reports generated for release artifacts.
+ */
 export const DEPENDENCY_EVIDENCE_REPORTS = [
   {
     name: "npm advisory vulnerability gate",
@@ -70,6 +75,9 @@ function runCommand(command, args, { rootDir, execFileSyncImpl = execFileSync })
   });
 }
 
+/**
+ * Resolves the release tag when the release ref is a SHA or tag.
+ */
 export function resolveReleaseTag({ releaseRef, packageVersion }) {
   if (/^[0-9a-fA-F]{40}$/u.test(releaseRef)) {
     return `v${packageVersion}`;
@@ -77,6 +85,9 @@ export function resolveReleaseTag({ releaseRef, packageVersion }) {
   return releaseRef;
 }
 
+/**
+ * Resolves the previous reachable release tag for dependency diffs.
+ */
 export function resolvePreviousReleaseTag({
   rootDir = process.cwd(),
   execFileSyncImpl = execFileSync,
@@ -114,6 +125,9 @@ export function resolvePreviousReleaseTag({
   );
 }
 
+/**
+ * Creates the dependency evidence manifest payload.
+ */
 export function createDependencyEvidenceManifest({
   generatedAt = new Date().toISOString(),
   releaseTag,
@@ -149,6 +163,9 @@ async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
+/**
+ * Reads generated reports and collects summary counts.
+ */
 export async function collectDependencyEvidenceSummaryCounts(evidenceDir) {
   const [vulnerability, transitiveRisk, ownershipSurface, dependencyChanges] = await Promise.all([
     readJson(reportPath(evidenceDir, "dependency-vulnerability-gate.json")),
@@ -171,6 +188,9 @@ export async function collectDependencyEvidenceSummaryCounts(evidenceDir) {
   };
 }
 
+/**
+ * Renders the dependency evidence Markdown summary.
+ */
 export function renderDependencyEvidenceSummary({ releaseTag, releaseSha, baseRef, counts }) {
   return `${[
     "# Dependency release evidence",
@@ -199,6 +219,9 @@ export function renderDependencyEvidenceSummary({ releaseTag, releaseSha, baseRe
   ].join("\n")}\n`;
 }
 
+/**
+ * Renders the GitHub Actions step summary for dependency evidence.
+ */
 export function renderDependencyEvidenceStepSummary({ evidenceArtifactName, baseRef, counts }) {
   return `${[
     "### Dependency release evidence",
@@ -267,7 +290,10 @@ function runEvidenceReports({ rootDir, outputDir, baseRef, execFileSyncImpl }) {
   );
 }
 
-export async function generateDependencyReleaseEvidence({
+/**
+ * Generates dependency evidence reports, manifest, and summaries for a release.
+ */
+async function generateDependencyReleaseEvidence({
   rootDir = process.cwd(),
   outputDir,
   releaseRef,
@@ -354,7 +380,24 @@ export async function generateDependencyReleaseEvidence({
   return { manifest, counts, outputDir };
 }
 
-function parseArgs(argv) {
+function usage() {
+  return `Usage: node scripts/generate-dependency-release-evidence.mjs --output-dir <dir> --release-ref <ref> --npm-dist-tag <tag> [options]
+
+Generates release dependency evidence reports and summary artifacts.
+
+Options:
+  --root <dir>                  Repository root
+  --output-dir <dir>            Evidence artifact directory
+  --release-ref <ref>           Release tag or SHA under validation
+  --npm-dist-tag <tag>          npm dist-tag being validated
+  --base-ref <ref>              Dependency change comparison base
+  --github-output <path>        GitHub Actions output file
+  --github-step-summary <path>  GitHub Actions step summary file
+  -h, --help                    Show this help
+`;
+}
+
+export function parseArgs(argv) {
   const options = {
     rootDir: process.cwd(),
     outputDir: null,
@@ -364,46 +407,46 @@ function parseArgs(argv) {
     githubOutput: process.env.GITHUB_OUTPUT,
     githubStepSummary: process.env.GITHUB_STEP_SUMMARY,
   };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--") {
-      continue;
-    }
-    if (arg === "--root") {
-      options.rootDir = argv[++index];
-      continue;
-    }
-    if (arg === "--output-dir") {
-      options.outputDir = argv[++index];
-      continue;
-    }
-    if (arg === "--release-ref") {
-      options.releaseRef = argv[++index];
-      continue;
-    }
-    if (arg === "--npm-dist-tag") {
-      options.npmDistTag = argv[++index];
-      continue;
-    }
-    if (arg === "--base-ref") {
-      options.baseRef = argv[++index];
-      continue;
-    }
-    if (arg === "--github-output") {
-      options.githubOutput = argv[++index];
-      continue;
-    }
-    if (arg === "--github-step-summary") {
-      options.githubStepSummary = argv[++index];
-      continue;
-    }
-    throw new Error(`Unsupported argument: ${arg}`);
-  }
-  return options;
+  const helpIndex = argv.findIndex((arg) => arg === "-h" || arg === "--help");
+  const parsed = parseFlagArgs(
+    helpIndex === -1 ? argv : argv.slice(0, helpIndex),
+    options,
+    [
+      ["--root", "rootDir", false],
+      ["--output-dir", "outputDir", false],
+      ["--release-ref", "releaseRef", false],
+      ["--npm-dist-tag", "npmDistTag", false],
+      ["--base-ref", "baseRef", false],
+      ["--github-output", "githubOutput", true],
+      ["--github-step-summary", "githubStepSummary", true],
+    ].map(([flag, key, allowEmpty]) =>
+      stringFlag(flag, key, {
+        allowEmpty,
+        allowInline: false,
+        missingValueMessage: `Expected ${flag} <value>.`,
+        rejectShortOptions: true,
+      }),
+    ),
+    {
+      duplicateOptionMessage: (flag) => `${flag} was provided more than once.`,
+      onUnhandledArg(arg) {
+        throw new Error(`Unsupported argument: ${arg}`);
+      },
+    },
+  );
+  return helpIndex === -1 ? parsed : { ...parsed, help: true };
 }
 
+/**
+ * Runs the dependency release evidence generator CLI.
+ */
 export async function main(argv = process.argv.slice(2)) {
-  await generateDependencyReleaseEvidence(parseArgs(argv));
+  const options = parseArgs(argv);
+  if (options.help) {
+    process.stdout.write(usage());
+    return 0;
+  }
+  await generateDependencyReleaseEvidence(options);
   return 0;
 }
 
@@ -412,8 +455,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
     (exitCode) => {
       process.exitCode = exitCode;
     },
-    (error) => {
-      process.stderr.write(`${error.stack ?? error.message ?? String(error)}\n`);
+    /** @param {unknown} error */ (error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;
     },
   );

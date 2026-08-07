@@ -1,10 +1,13 @@
+/**
+ * Tests for live-probe helpers that validate the CLI MCP loopback backend.
+ */
 import {
   createServer as createHttpServer,
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
 import { createServer as createTcpServer, type Server, type Socket } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { verifyCliCronMcpLoopbackPreflight } from "./gateway-cli-backend.live-probe-helpers.js";
 import {
   clearActiveMcpLoopbackRuntimeByOwnerToken,
@@ -58,11 +61,17 @@ function preflightParams(env: NodeJS.ProcessEnv = {}) {
   };
 }
 
-afterEach(() => {
-  clearActiveMcpLoopbackRuntimeByOwnerToken(ownerToken);
-});
-
 describe("gateway CLI backend live probe helpers", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    clearActiveMcpLoopbackRuntimeByOwnerToken(ownerToken);
+  });
+
   it("reads loopback JSON-RPC responses without invoking cron verification when cron is absent", async () => {
     const methods: string[] = [];
     const server = createHttpServer((request, response) => {
@@ -90,7 +99,7 @@ describe("gateway CLI backend live probe helpers", () => {
     activateLoopbackRuntime(port);
     try {
       await expect(verifyCliCronMcpLoopbackPreflight(preflightParams())).rejects.toThrow(
-        "mcp loopback tools/list did not expose cron",
+        "mcp loopback tools/list did not expose automations",
       );
       expect(methods).toEqual(["initialize", "notifications/initialized", "tools/list"]);
     } finally {
@@ -139,5 +148,62 @@ describe("gateway CLI backend live probe helpers", () => {
     } finally {
       server.close();
     }
+  });
+
+  it("preserves the byte-limit diagnostic when body cancellation rejects", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledRejections.push(reason);
+    };
+    const cancel = vi.fn(() => {
+      throw new Error("loopback body cancellation failed");
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65));
+      },
+      cancel,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(body)),
+    );
+    activateLoopbackRuntime(12345);
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      await expect(
+        verifyCliCronMcpLoopbackPreflight(
+          preflightParams({ OPENCLAW_MCP_LOOPBACK_PROBE_MAX_BODY_BYTES: "64" }),
+        ),
+      ).rejects.toThrow("mcp loopback response body exceeded 64 bytes");
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(body.locked).toBe(false);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(unhandledRejections).toStrictEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      expect(process.listeners("unhandledRejection")).not.toContain(onUnhandledRejection);
+    }
+  });
+
+  it("still propagates loopback response read errors and releases the reader lock", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("loopback response read failed"));
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(body)),
+    );
+    activateLoopbackRuntime(12345);
+
+    await expect(verifyCliCronMcpLoopbackPreflight(preflightParams())).rejects.toThrow(
+      "loopback response read failed",
+    );
+    expect(body.locked).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+// Active tool schema warning tests cover doctor warnings for active tool schema drift.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { createOpenClawCodingTools } from "../../../agents/agent-tools.js";
 import type { AnyAgentTool } from "../../../agents/tools/common.js";
@@ -15,7 +16,7 @@ const toolState = vi.hoisted(() => ({
     compat?: Record<string, unknown>;
   } | null,
   resolveModelError: null as Error | null,
-  resolveModel: vi.fn(),
+  resolveModelAsync: vi.fn(),
   createTools: vi.fn<typeof createOpenClawCodingTools>(),
   normalizeTools: vi.fn(
     (options: { tools: AnyAgentTool[]; modelApi?: string; model?: unknown }) => options.tools,
@@ -23,7 +24,7 @@ const toolState = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../agents/embedded-agent-runner/model.js", () => ({
-  resolveModel: (...args: unknown[]) => toolState.resolveModel(...args),
+  resolveModelAsync: (...args: unknown[]) => toolState.resolveModelAsync(...args),
 }));
 
 vi.mock("../../../agents/agent-tools.js", () => ({
@@ -37,8 +38,8 @@ vi.mock("../../../agents/agent-tools.js", () => ({
 }));
 
 vi.mock("../../../plugins/tools.js", () => ({
-  getPluginToolMeta: (tool: { name: string }) => {
-    const pluginId = toolState.pluginIds[tool.name];
+  getPluginToolMeta: (toolLocal: { name: string }) => {
+    const pluginId = toolState.pluginIds[toolLocal.name];
     return pluginId ? { pluginId, optional: false } : undefined;
   },
 }));
@@ -68,7 +69,7 @@ describe("active tool schema doctor warnings", () => {
     toolState.throwError = null;
     toolState.runtimeModel = null;
     toolState.resolveModelError = null;
-    toolState.resolveModel.mockReset().mockImplementation(() => {
+    toolState.resolveModelAsync.mockReset().mockImplementation(async () => {
       if (toolState.resolveModelError) {
         throw toolState.resolveModelError;
       }
@@ -82,35 +83,67 @@ describe("active tool schema doctor warnings", () => {
     toolState.normalizeTools.mockReset().mockImplementation((options) => options.tools);
   });
 
-  it("warns with plugin ownership for active tools blocked by runtime projection", () => {
+  it("warns with plugin ownership for active tools blocked by runtime projection", async () => {
     toolState.tools = [
       tool("message", { type: "object", properties: {} }),
-      tool("dofbot_move_angles", { type: "array", items: { type: "number" } }),
+      tool("fuzzplugin_move_angles", { type: "array", items: { type: "number" } }),
     ];
-    toolState.pluginIds = { dofbot_move_angles: "dofbot" };
+    toolState.pluginIds = { fuzzplugin_move_angles: "fuzzplugin" };
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
+      await collectActiveToolSchemaProjectionWarnings({
         cfg: {
           plugins: {
             entries: {
-              dofbot: { enabled: true },
+              fuzzplugin: { enabled: true },
             },
           },
         },
         env: { HOME: "/tmp/openclaw-test" },
       }),
     ).toEqual([
-      '- agents.main: active tool "dofbot_move_angles" from plugin "dofbot" has unsupported runtime input schema (dofbot_move_angles.parameters.type must be "object"). OpenClaw will quarantine this tool at runtime; fix or disable the plugin, or remove the tool from active allowlists.',
+      '- agents.main: active tool "fuzzplugin_move_angles" from plugin "fuzzplugin" has unsupported runtime input schema (fuzzplugin_move_angles.parameters.type must be "object"). OpenClaw will quarantine this tool at runtime; fix or disable the plugin, or remove the tool from active allowlists.',
+    ]);
+    expect(toolState.createTools).toHaveBeenCalledWith(
+      expect.objectContaining({ toolPolicyAuditLogLevel: "debug" }),
+    );
+  });
+
+  it("warns about unreadable active tool entries without crashing", async () => {
+    const healthy = tool("message", { type: "object", properties: {} });
+    toolState.tools = new Proxy([healthy] as AnyAgentTool[], {
+      get(target, property, receiver) {
+        if (property === "0") {
+          throw new Error("fuzzplugin tool entry getter exploded");
+        }
+        if (property === "1") {
+          return healthy;
+        }
+        if (property === "length") {
+          return 2;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(
+      await collectActiveToolSchemaProjectionWarnings({
+        cfg: {},
+        env: { HOME: "/tmp/openclaw-test" },
+      }),
+    ).toEqual([
+      '- agents.main: active tool "tool[0]" has unsupported runtime input schema (tool[0] is unreadable). OpenClaw will quarantine this tool at runtime; fix or disable the plugin, or remove the tool from active allowlists.',
     ]);
   });
 
-  it("does not validate disabled plugin mode", () => {
-    toolState.tools = [tool("dofbot_move_angles", { type: "array", items: { type: "number" } })];
-    toolState.pluginIds = { dofbot_move_angles: "dofbot" };
+  it("does not validate disabled plugin mode", async () => {
+    toolState.tools = [
+      tool("fuzzplugin_move_angles", { type: "array", items: { type: "number" } }),
+    ];
+    toolState.pluginIds = { fuzzplugin_move_angles: "fuzzplugin" };
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
+      await collectActiveToolSchemaProjectionWarnings({
         cfg: { plugins: { enabled: false } },
         env: { HOME: "/tmp/openclaw-test" },
       }),
@@ -119,9 +152,49 @@ describe("active tool schema doctor warnings", () => {
     expect(toolState.normalizeTools).not.toHaveBeenCalled();
   });
 
-  it("validates provider-normalized runtime schemas before reporting doctor health", () => {
+  it("resolves provider discovery asynchronously before agent lifecycle publication", async () => {
+    toolState.runtimeModel = {
+      id: "llama-3.1-8b-instant",
+      name: "Llama 3.1 8B Instant",
+      provider: "groq",
+      api: "openai-completions",
+    };
+    const cfg = {
+      agents: {
+        defaults: {
+          model: { primary: "groq/llama-3.1-8b-instant" },
+        },
+      },
+    };
+
+    expect(
+      await collectActiveToolSchemaProjectionWarnings({
+        cfg,
+        env: { HOME: "/tmp/openclaw-test" },
+      }),
+    ).toEqual([]);
+    expect(toolState.resolveModelAsync).toHaveBeenCalledWith(
+      "groq",
+      "llama-3.1-8b-instant",
+      expect.any(String),
+      cfg,
+      expect.objectContaining({
+        agentId: "main",
+        workspaceDir: expect.any(String),
+      }),
+    );
+    expect(toolState.createTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelProvider: "groq",
+        modelId: "llama-3.1-8b-instant",
+        modelApi: "openai-completions",
+      }),
+    );
+  });
+
+  it("validates provider-normalized runtime schemas before reporting doctor health", async () => {
     const healthyTool = tool("message", { type: "object", properties: {} });
-    const dynamicTool = tool("dofbot_move_angles", { type: "object", properties: {} });
+    const dynamicTool = tool("fuzzplugin_move_angles", { type: "object", properties: {} });
     toolState.runtimeModel = {
       id: "gpt-5.5",
       name: "GPT-5.5",
@@ -131,7 +204,7 @@ describe("active tool schema doctor warnings", () => {
       compat: { unsupportedToolSchemaKeywords: ["$dynamicRef"] },
     };
     toolState.tools = [healthyTool, dynamicTool];
-    toolState.pluginIds = { dofbot_move_angles: "dofbot" };
+    toolState.pluginIds = { fuzzplugin_move_angles: "fuzzplugin" };
     toolState.normalizeTools.mockImplementation(({ tools, modelApi, model }) => {
       if (
         modelApi !== "openai-responses" ||
@@ -141,8 +214,8 @@ describe("active tool schema doctor warnings", () => {
         return tools;
       }
       return tools.map((entry) =>
-        entry.name === "dofbot_move_angles"
-          ? tool("dofbot_move_angles", {
+        entry.name === "fuzzplugin_move_angles"
+          ? tool("fuzzplugin_move_angles", {
               type: "object",
               properties: {
                 target: { $dynamicRef: "#target" },
@@ -153,7 +226,7 @@ describe("active tool schema doctor warnings", () => {
     });
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
+      await collectActiveToolSchemaProjectionWarnings({
         cfg: {
           agents: {
             defaults: {
@@ -162,14 +235,14 @@ describe("active tool schema doctor warnings", () => {
           },
           plugins: {
             entries: {
-              dofbot: { enabled: true },
+              fuzzplugin: { enabled: true },
             },
           },
         },
         env: { HOME: "/tmp/openclaw-test" },
       }),
     ).toEqual([
-      '- agents.main: active tool "dofbot_move_angles" from plugin "dofbot" has unsupported runtime input schema (dofbot_move_angles.parameters.properties.target.$dynamicRef). OpenClaw will quarantine this tool at runtime; fix or disable the plugin, or remove the tool from active allowlists.',
+      '- agents.main: active tool "fuzzplugin_move_angles" from plugin "fuzzplugin" has unsupported runtime input schema (fuzzplugin_move_angles.parameters.properties.target.$dynamicRef). OpenClaw will quarantine this tool at runtime; fix or disable the plugin, or remove the tool from active allowlists.',
     ]);
     expect(toolState.createTools).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -186,14 +259,14 @@ describe("active tool schema doctor warnings", () => {
     );
   });
 
-  it("reports runtime schema normalization failures instead of crashing doctor", () => {
+  it("reports runtime schema normalization failures instead of crashing doctor", async () => {
     toolState.tools = [tool("message", { type: "object", properties: {} })];
     toolState.normalizeTools.mockImplementation(() => {
       throw new Error("provider schema hook failed");
     });
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
+      await collectActiveToolSchemaProjectionWarnings({
         cfg: {},
         env: { HOME: "/tmp/openclaw-test" },
       }),
@@ -202,12 +275,12 @@ describe("active tool schema doctor warnings", () => {
     ]);
   });
 
-  it("reports runtime model context failures instead of crashing doctor", () => {
+  it("reports runtime model context failures instead of crashing doctor", async () => {
     toolState.resolveModelError = new Error("provider model hook failed");
     toolState.tools = [tool("message", { type: "object", properties: {} })];
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
+      await collectActiveToolSchemaProjectionWarnings({
         cfg: {},
         env: { HOME: "/tmp/openclaw-test" },
       }),
@@ -218,12 +291,12 @@ describe("active tool schema doctor warnings", () => {
     expect(toolState.normalizeTools).toHaveBeenCalled();
   });
 
-  it("reports toolset construction failures instead of crashing doctor", () => {
+  it("reports toolset construction failures instead of crashing doctor", async () => {
     toolState.throwError = new Error("plugin startup failed");
 
     expect(
-      collectActiveToolSchemaProjectionWarnings({
-        cfg: { plugins: { entries: { dofbot: { enabled: true } } } },
+      await collectActiveToolSchemaProjectionWarnings({
+        cfg: { plugins: { entries: { fuzzplugin: { enabled: true } } } },
         env: { HOME: "/tmp/openclaw-test" },
       }),
     ).toEqual([

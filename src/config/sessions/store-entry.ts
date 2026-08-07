@@ -1,9 +1,15 @@
+// Store entry lookup resolves canonical keys and safe legacy aliases.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { normalizeConversationPeerId } from "../../routing/conversation-ref.js";
 import {
   normalizeSessionKeyPreservingOpaquePeerIds,
   parseThreadSessionSuffix,
   requiresFoldedSessionKeyAliasProof,
 } from "../../sessions/session-key-utils.js";
-import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
+import {
+  deliveryContextFromSession,
+  sessionDeliveryOrigin,
+} from "../../utils/delivery-context.shared.js";
 import type { SessionEntry } from "./types.js";
 
 export function normalizeStoreSessionKey(sessionKey: string): string {
@@ -17,6 +23,7 @@ export function foldedSessionKeyAliasCandidates(normalizedKey: string): string[]
     aliases.add(foldedLegacyKey);
   }
   if (requiresFoldedSessionKeyAliasProof(normalizedKey)) {
+    // Thread suffixes preserve their opaque thread id while only folding the legacy base key.
     const { baseSessionKey, threadId } = parseThreadSessionSuffix(normalizedKey);
     const foldedBaseKey = normalizeLowercaseStringOrEmpty(baseSessionKey);
     if (baseSessionKey && threadId && foldedBaseKey !== baseSessionKey) {
@@ -44,13 +51,9 @@ function normalizeEntryTarget(value: unknown): string {
 }
 
 function entryDeliveryTargets(entry: SessionEntry | undefined): string[] {
-  const candidates = [
-    entry?.deliveryContext?.to,
-    entry?.lastTo,
-    entry?.origin?.nativeChannelId,
-    entry?.origin?.to,
-    entry?.groupId,
-  ];
+  const context = deliveryContextFromSession(entry);
+  const origin = sessionDeliveryOrigin(entry);
+  const candidates = [context?.to, origin?.nativeChannelId, origin?.to, entry?.groupId];
   return candidates.map(normalizeEntryTarget).filter(Boolean);
 }
 
@@ -65,9 +68,7 @@ function normalizeEntryThreadId(value: unknown): string {
 }
 
 function entryThreadId(entry: SessionEntry | undefined): string {
-  return normalizeEntryThreadId(
-    entry?.deliveryContext?.threadId ?? entry?.lastThreadId ?? entry?.origin?.threadId,
-  );
+  return normalizeEntryThreadId(deliveryContextFromSession(entry)?.threadId);
 }
 
 /** Tail-preserved keys like Matrix rooms need delivery-target proof before a
@@ -107,11 +108,171 @@ export function hasMismatchedCaseSensitiveDeliveryProof(
   const { baseSessionKey, threadId } = parseThreadSessionSuffix(normalizedKey);
   const normalizedBaseKey = baseSessionKey ?? normalizedKey;
   const targets = entryDeliveryTargets(entry);
+  // Existing delivery metadata is treated as proof against folding to a different opaque target.
   if (targets.length > 0 && !targets.some((target) => normalizedBaseKey.includes(target))) {
     return true;
   }
   const storedThreadId = entryThreadId(entry);
   return Boolean(threadId && storedThreadId && storedThreadId !== threadId);
+}
+
+/** Restores an opaque case-sensitive peer only when the row's delivery target proves it. */
+export function resolveDeliveryProvenCanonicalSessionKey(
+  sessionKey: string,
+  entry: SessionEntry,
+): string {
+  const normalizedKey = normalizeStoreSessionKey(sessionKey);
+  const delivery = deliveryContextFromSession(entry);
+  const channel = delivery?.channel?.trim().toLowerCase();
+  const peerId =
+    channel && delivery?.to ? normalizeConversationPeerId(channel, delivery.to) : undefined;
+  if (!channel || !peerId) {
+    return normalizedKey;
+  }
+  const parsedThread = parseThreadSessionSuffix(normalizedKey);
+  const baseSessionKey = parsedThread.baseSessionKey ?? normalizedKey;
+  const foldedBase = baseSessionKey.toLowerCase();
+  let peerStart = -1;
+  // Direct peer ids are lowercase-canonical; only case-preserving channel/group
+  // contracts can restore an opaque mixed-case id from delivery proof.
+  for (const peerKind of ["channel", "group"] as const) {
+    const marker = `${channel}:${peerKind}:`;
+    const nestedMarkerIndex = foldedBase.lastIndexOf(`:${marker}`);
+    const markerIndex = foldedBase.startsWith(marker)
+      ? 0
+      : nestedMarkerIndex >= 0
+        ? nestedMarkerIndex + 1
+        : -1;
+    if (markerIndex >= 0) {
+      peerStart = Math.max(peerStart, markerIndex + marker.length);
+    }
+  }
+  if (peerStart < 0) {
+    return normalizedKey;
+  }
+  const storedPeerId = baseSessionKey.slice(peerStart);
+  if (storedPeerId.toLowerCase() !== peerId.toLowerCase()) {
+    return normalizedKey;
+  }
+  const threadId = parsedThread.threadId
+    ? String(delivery?.threadId ?? parsedThread.threadId).trim()
+    : undefined;
+  const candidate = normalizeStoreSessionKey(
+    `${baseSessionKey.slice(0, peerStart)}${peerId}${threadId ? `:thread:${threadId}` : ""}`,
+  );
+  return candidate !== normalizedKey &&
+    foldedSessionKeyAliasCandidates(candidate).includes(normalizedKey) &&
+    isConfirmedLowercasedLegacyAlias(entry, candidate)
+    ? candidate
+    : normalizedKey;
+}
+
+export function collectSessionEntryLookupKeys(_database: unknown, sessionKey: string): string[] {
+  const trimmedKey = sessionKey.trim();
+  return trimmedKey
+    ? [
+        ...new Set([
+          trimmedKey,
+          ...foldedSessionKeyAliasCandidates(normalizeStoreSessionKey(trimmedKey)),
+        ]),
+      ]
+    : [];
+}
+
+type SessionEntryCandidate = {
+  entry: SessionEntry;
+  sessionKey: string;
+};
+
+function resolveSessionEntryCandidates(params: {
+  entries: readonly SessionEntryCandidate[];
+  sessionKey: string;
+}): {
+  normalizedKey: string;
+  existing: SessionEntryCandidate | undefined;
+  legacyKeys: string[];
+} {
+  const trimmedKey = params.sessionKey.trim();
+  const normalizedKey = normalizeStoreSessionKey(trimmedKey);
+  const foldedLegacyKeys = foldedSessionKeyAliasCandidates(normalizedKey);
+  const entries = new Map(params.entries.map((candidate) => [candidate.sessionKey, candidate]));
+  const legacyKeySet = new Set<string>();
+  const trimmedCandidate = entries.get(trimmedKey);
+  if (
+    trimmedKey !== normalizedKey &&
+    trimmedCandidate &&
+    !hasMismatchedCaseSensitiveDeliveryProof(trimmedCandidate.entry, normalizedKey)
+  ) {
+    legacyKeySet.add(trimmedKey);
+  }
+  // Matrix folded aliases need proof they still deliver to this room. Otherwise a
+  // genuinely case-distinct sibling that merely folds to the same lowercase could
+  // be deleted or returned as this room's existing session.
+  let foldedLegacyEntry: SessionEntryCandidate | undefined;
+  let foldedLegacyUpdatedAt = 0;
+  for (const foldedLegacyKey of foldedLegacyKeys) {
+    const candidate = entries.get(foldedLegacyKey);
+    if (!candidate || !isConfirmedLowercasedLegacyAlias(candidate.entry, normalizedKey)) {
+      continue;
+    }
+    legacyKeySet.add(foldedLegacyKey);
+    const updatedAt = candidate.entry.updatedAt ?? 0;
+    if (!foldedLegacyEntry || updatedAt > foldedLegacyUpdatedAt) {
+      foldedLegacyEntry = candidate;
+      foldedLegacyUpdatedAt = updatedAt;
+    }
+  }
+  // An exact (opaque-preserving-normalized) entry always wins over any folded
+  // legacy alias, regardless of freshness (openclaw#75670). Only when no exact
+  // entry exists do we fall back to a confirmed legacy alias.
+  const exactEntry = entries.get(normalizedKey);
+  const usableExactEntry = hasMismatchedCaseSensitiveDeliveryProof(exactEntry?.entry, normalizedKey)
+    ? undefined
+    : exactEntry;
+  const exactKeyWins = requiresFoldedSessionKeyAliasProof(normalizedKey);
+  const fallbackLegacyEntry =
+    legacyKeySet.size > 0 &&
+    !hasMismatchedCaseSensitiveDeliveryProof(trimmedCandidate?.entry, normalizedKey)
+      ? trimmedCandidate
+      : undefined;
+  let existing = exactKeyWins
+    ? (usableExactEntry ?? foldedLegacyEntry ?? fallbackLegacyEntry)
+    : undefined;
+  let existingUpdatedAt = existing?.entry.updatedAt ?? 0;
+  if (!exactKeyWins) {
+    for (const candidate of [usableExactEntry, foldedLegacyEntry, fallbackLegacyEntry]) {
+      const candidateUpdatedAt = candidate?.entry.updatedAt ?? 0;
+      if (candidate && (!existing || candidateUpdatedAt > existingUpdatedAt)) {
+        existing = candidate;
+        existingUpdatedAt = candidateUpdatedAt;
+      }
+    }
+  }
+  for (const [candidateKey, candidate] of entries) {
+    if (candidateKey === normalizedKey) {
+      continue;
+    }
+    // Only collapse TRUE canonical aliases (same opaque-preserving key, e.g. a
+    // structural-token-case variant). Do NOT collapse keys that merely fold to the
+    // same lowercase — those can be case-distinct Matrix rooms that must survive.
+    if (normalizeStoreSessionKey(candidateKey) !== normalizedKey) {
+      continue;
+    }
+    if (hasMismatchedCaseSensitiveDeliveryProof(candidate.entry, normalizedKey)) {
+      continue;
+    }
+    legacyKeySet.add(candidateKey);
+    const candidateUpdatedAt = candidate.entry.updatedAt ?? 0;
+    if (!existing || candidateUpdatedAt > existingUpdatedAt) {
+      existing = candidate;
+      existingUpdatedAt = candidateUpdatedAt;
+    }
+  }
+  return {
+    normalizedKey,
+    existing,
+    legacyKeys: [...legacyKeySet],
+  };
 }
 
 export function resolveSessionStoreEntry(params: {
@@ -122,88 +283,13 @@ export function resolveSessionStoreEntry(params: {
   existing: SessionEntry | undefined;
   legacyKeys: string[];
 } {
-  const trimmedKey = params.sessionKey.trim();
-  const normalizedKey = normalizeStoreSessionKey(trimmedKey);
-  const foldedLegacyKeys = foldedSessionKeyAliasCandidates(normalizedKey);
-  const legacyKeySet = new Set<string>();
-  if (
-    trimmedKey !== normalizedKey &&
-    Object.prototype.hasOwnProperty.call(params.store, trimmedKey) &&
-    !hasMismatchedCaseSensitiveDeliveryProof(params.store[trimmedKey], normalizedKey)
-  ) {
-    legacyKeySet.add(trimmedKey);
-  }
-  // Matrix folded aliases need proof they still deliver to this room. Otherwise a
-  // genuinely case-distinct sibling that merely folds to the same lowercase could
-  // be deleted or returned as this room's existing session.
-  let foldedLegacyEntry: SessionEntry | undefined;
-  let foldedLegacyUpdatedAt = 0;
-  for (const foldedLegacyKey of foldedLegacyKeys) {
-    if (
-      !Object.prototype.hasOwnProperty.call(params.store, foldedLegacyKey) ||
-      !isConfirmedLowercasedLegacyAlias(params.store[foldedLegacyKey], normalizedKey)
-    ) {
-      continue;
-    }
-    legacyKeySet.add(foldedLegacyKey);
-    const entry = params.store[foldedLegacyKey];
-    const updatedAt = entry?.updatedAt ?? 0;
-    if (!foldedLegacyEntry || updatedAt > foldedLegacyUpdatedAt) {
-      foldedLegacyEntry = entry;
-      foldedLegacyUpdatedAt = updatedAt;
-    }
-  }
-  // An exact (opaque-preserving-normalized) entry always wins over any folded
-  // legacy alias, regardless of freshness (openclaw#75670). Only when no exact
-  // entry exists do we fall back to a confirmed legacy alias.
-  const exactEntry = Object.prototype.hasOwnProperty.call(params.store, normalizedKey)
-    ? params.store[normalizedKey]
-    : undefined;
-  const usableExactEntry = hasMismatchedCaseSensitiveDeliveryProof(exactEntry, normalizedKey)
-    ? undefined
-    : exactEntry;
-  const exactKeyWins = requiresFoldedSessionKeyAliasProof(normalizedKey);
-  const fallbackLegacyEntry =
-    legacyKeySet.size > 0 &&
-    !hasMismatchedCaseSensitiveDeliveryProof(params.store[trimmedKey], normalizedKey)
-      ? params.store[trimmedKey]
-      : undefined;
-  let existing = exactKeyWins
-    ? (usableExactEntry ?? foldedLegacyEntry ?? fallbackLegacyEntry)
-    : undefined;
-  let existingUpdatedAt = existing?.updatedAt ?? 0;
-  if (!exactKeyWins) {
-    for (const candidate of [usableExactEntry, foldedLegacyEntry, fallbackLegacyEntry]) {
-      const candidateUpdatedAt = candidate?.updatedAt ?? 0;
-      if (candidate && (!existing || candidateUpdatedAt > existingUpdatedAt)) {
-        existing = candidate;
-        existingUpdatedAt = candidateUpdatedAt;
-      }
-    }
-  }
-  for (const [candidateKey, candidateEntry] of Object.entries(params.store)) {
-    if (candidateKey === normalizedKey) {
-      continue;
-    }
-    // Only collapse TRUE canonical aliases (same opaque-preserving key, e.g. a
-    // structural-token-case variant). Do NOT collapse keys that merely fold to the
-    // same lowercase — those can be case-distinct Matrix rooms that must survive.
-    if (normalizeStoreSessionKey(candidateKey) !== normalizedKey) {
-      continue;
-    }
-    if (hasMismatchedCaseSensitiveDeliveryProof(candidateEntry, normalizedKey)) {
-      continue;
-    }
-    legacyKeySet.add(candidateKey);
-    const candidateUpdatedAt = candidateEntry?.updatedAt ?? 0;
-    if (!existing || candidateUpdatedAt > existingUpdatedAt) {
-      existing = candidateEntry;
-      existingUpdatedAt = candidateUpdatedAt;
-    }
-  }
+  const resolved = resolveSessionEntryCandidates({
+    entries: Object.entries(params.store).map(([sessionKey, entry]) => ({ entry, sessionKey })),
+    sessionKey: params.sessionKey,
+  });
   return {
-    normalizedKey,
-    existing,
-    legacyKeys: [...legacyKeySet],
+    normalizedKey: resolved.normalizedKey,
+    existing: resolved.existing?.entry,
+    legacyKeys: resolved.legacyKeys,
   };
 }

@@ -5,9 +5,15 @@ export {
 export {
   countPendingDescendantRuns,
   countPendingDescendantRunsExcludingRun,
+  hasDescendantRunAwaitingSettle,
   isSubagentSessionRunActive,
   listSubagentRunsForRequester,
   resolveRequesterForChildSession,
   shouldIgnorePostCompletionAnnounceForSession,
 } from "./subagent-registry-announce-read.js";
-export { replaceSubagentRunAfterSteer } from "./subagent-registry-steer-runtime.js";
+
+export async function replaceSubagentRunAfterSteer(
+  params: Parameters<typeof import("./subagent-registry.js").replaceSubagentRunAfterSteer>[0],
+) {
+  return (await import("./subagent-registry.js")).replaceSubagentRunAfterSteer(params);
+}

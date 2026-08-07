@@ -1,14 +1,18 @@
+/**
+ * Regression coverage for core tool allow/deny policy helpers.
+ * Verifies sandbox policy resolution, explicit lists, and tool matching.
+ */
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { pickSandboxToolPolicy } from "./sandbox-tool-policy.js";
 import { isToolAllowed, resolveSandboxToolPolicyForAgent } from "./sandbox/tool-policy.js";
 import type { SandboxToolPolicy } from "./sandbox/types.js";
 import { isToolAllowedByPolicyName } from "./tool-policy-match.js";
-import { TOOL_POLICY_CONFORMANCE } from "./tool-policy.conformance.js";
 import {
   collectExplicitAllowlist,
   DEFAULT_PLUGIN_TOOLS_ALLOWLIST_ENTRY,
   expandToolGroups,
+  hasRestrictiveAllowPolicy,
   normalizeToolName,
   resolveToolProfilePolicy,
   TOOL_GROUPS,
@@ -30,7 +34,7 @@ describe("tool-policy", () => {
   it("resolves known profiles and ignores unknown ones", () => {
     const coding = resolveToolProfilePolicy("coding");
     expect(coding?.allow).toContain("read");
-    expect(coding?.allow).toContain("cron");
+    expect(coding?.allow).toContain("automations");
     expect(coding?.allow).not.toContain("gateway");
     expect(resolveToolProfilePolicy("nope")).toBeUndefined();
   });
@@ -48,6 +52,9 @@ describe("tool-policy", () => {
     expect(normalizeToolName(" BASH ")).toBe("exec");
     expect(normalizeToolName("apply-patch")).toBe("apply_patch");
     expect(normalizeToolName("READ")).toBe("read");
+    // Pre-rename scheduler tool name from persisted config (RFC 0026).
+    expect(normalizeToolName("cron")).toBe("automations");
+    expect(normalizeToolName("automations")).toBe("automations");
   });
 
   it("collects explicit allowlist entries", () => {
@@ -76,16 +83,18 @@ describe("tool-policy", () => {
       "*",
     ]);
   });
-});
 
-describe("TOOL_POLICY_CONFORMANCE", () => {
-  it("matches exported TOOL_GROUPS exactly", () => {
-    expect(TOOL_POLICY_CONFORMANCE.toolGroups).toEqual(TOOL_GROUPS);
+  it("does not treat additive allow-all policies as restrictive", () => {
+    expect(hasRestrictiveAllowPolicy(pickSandboxToolPolicy({ alsoAllow: ["optional-demo"] }))).toBe(
+      false,
+    );
+    expect(
+      hasRestrictiveAllowPolicy(pickSandboxToolPolicy({ allow: [], alsoAllow: ["optional-demo"] })),
+    ).toBe(false);
   });
 
-  it("is JSON-serializable", () => {
-    const serialized = JSON.stringify(TOOL_POLICY_CONFORMANCE);
-    expect(JSON.parse(serialized)).toEqual({ toolGroups: TOOL_GROUPS });
+  it("still treats explicit bounded allowlists as restrictive", () => {
+    expect(hasRestrictiveAllowPolicy(pickSandboxToolPolicy({ allow: ["read"] }))).toBe(true);
   });
 });
 
@@ -171,6 +180,16 @@ describe("resolveSandboxToolPolicyForAgent", () => {
     const resolved = resolveSandboxToolPolicyForAgent(cfg, undefined);
     expect(resolved.allow).toEqual(["read"]);
     expect(resolved.deny).toEqual(["image"]);
+  });
+});
+
+describe("isToolAllowedByPolicyName — legacy scheduler tool name (RFC 0026)", () => {
+  it("allows the renamed tool through persisted legacy allow lists", () => {
+    expect(isToolAllowedByPolicyName("automations", { allow: ["cron"] })).toBe(true);
+  });
+
+  it("denies the renamed tool through persisted legacy deny lists", () => {
+    expect(isToolAllowedByPolicyName("automations", { deny: ["cron"] })).toBe(false);
   });
 });
 

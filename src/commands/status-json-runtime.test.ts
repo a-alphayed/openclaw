@@ -1,3 +1,4 @@
+// Status JSON runtime tests cover runtime status payload construction and command dependencies.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveStatusJsonOutput } from "./status-json-runtime.ts";
 
@@ -40,7 +41,7 @@ function createScan() {
     pluginCompatibility: [
       {
         pluginId: "legacy",
-        code: "legacy-before-agent-start",
+        code: "deprecated-memory-embedding-provider-api",
         severity: "warn",
         message: "warn",
       },
@@ -104,7 +105,7 @@ describe("status-json-runtime", () => {
     expect(payloadInput.pluginCompatibility).toStrictEqual([
       {
         pluginId: "legacy",
-        code: "legacy-before-agent-start",
+        code: "deprecated-memory-embedding-provider-api",
         severity: "warn",
         message: "warn",
       },
@@ -152,11 +153,11 @@ describe("status-json-runtime", () => {
     expect(payloadInput.pluginCompatibility).toBeUndefined();
   });
 
-  it("suppresses health errors when requested", async () => {
+  it("preserves failed deep health probes in nonthrowing JSON output", async () => {
     mocks.resolveStatusRuntimeSnapshot.mockResolvedValueOnce({
       securityAudit: undefined,
       usage: undefined,
-      health: undefined,
+      health: { error: "gateway health probe timed out" },
       lastHeartbeat: { status: "ok" },
       gatewayService: { label: "LaunchAgent" },
       nodeService: { label: "node" },
@@ -172,7 +173,7 @@ describe("status-json-runtime", () => {
     expect(mocks.buildStatusJsonPayload).toHaveBeenCalledOnce();
     const payloadInput = requireStatusPayloadInput();
     expect(payloadInput.surface.gatewayProbeAuth).toStrictEqual({ token: "tok" });
-    expect(payloadInput.health).toBeUndefined();
+    expect(payloadInput.health).toEqual({ error: "gateway health probe timed out" });
     expect(mocks.resolveStatusRuntimeSnapshot).toHaveBeenCalledWith({
       config: { update: { channel: "stable" }, gateway: {} },
       sourceConfig: { gateway: {} },

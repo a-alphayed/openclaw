@@ -1,7 +1,9 @@
+// Doctor missing-state e2e tests cover warning output when the state directory is absent.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { withEnvAsync } from "../test-utils/env.js";
 import {
   callGateway,
   createDoctorRuntime,
@@ -12,14 +14,17 @@ import { loadDoctorCommandForTest, terminalNoteMock } from "./doctor.note-test-h
 import "./doctor.fast-path-mocks.js";
 
 let doctorCommand: typeof import("./doctor.js").doctorCommand;
+let defaultDoctorCommand: typeof import("./doctor.js").doctorCommand;
+let reloadDefaultDoctorCommand = false;
 
-const CODEX_PROVIDER_ID = "openai-codex";
-const CODEX_PROFILE_ID = "openai-codex:user@example.com";
+const OPENAI_PROVIDER_ID = "openai";
+const LEGACY_CODEX_PROVIDER_ID = "openai-codex";
+const CODEX_PROFILE_ID = "openai:user@example.com";
 const CODEX_PROFILE_EMAIL = "user@example.com";
 
 function configCodexOAuthProfile() {
   return {
-    provider: CODEX_PROVIDER_ID,
+    provider: OPENAI_PROVIDER_ID,
     mode: "oauth",
     email: CODEX_PROFILE_EMAIL,
   };
@@ -28,7 +33,7 @@ function configCodexOAuthProfile() {
 function storedCodexOAuthProfile() {
   return {
     type: "oauth",
-    provider: CODEX_PROVIDER_ID,
+    provider: OPENAI_PROVIDER_ID,
     access: "access-token",
     refresh: "refresh-token",
     expires: Date.now() + 60_000,
@@ -51,7 +56,7 @@ function mockCodexProviderSnapshot(params: {
     config: {
       models: {
         providers: {
-          [CODEX_PROVIDER_ID]: params.provider,
+          [LEGACY_CODEX_PROVIDER_ID]: params.provider,
         },
       },
       ...(params.withConfigOAuth
@@ -98,26 +103,53 @@ function requireTerminalNote(params: { title?: string; messageIncludes?: string 
   return note;
 }
 
+function mockDoctorBrowserFastPath(): void {
+  vi.doMock("./doctor-browser.js", () => ({
+    detectLegacyClawdBrowserProfileResidue: vi.fn().mockResolvedValue(null),
+    maybeArchiveLegacyClawdBrowserProfileResidue: vi.fn().mockResolvedValue({
+      changes: [],
+      warnings: [],
+    }),
+    noteChromeMcpBrowserReadiness: vi.fn().mockResolvedValue(undefined),
+  }));
+}
+
 describe("doctor command", () => {
-  beforeEach(async () => {
-    doctorCommand = await loadDoctorCommandForTest({
+  beforeAll(async () => {
+    defaultDoctorCommand = await loadDoctorCommandForTest({
       unmockModules: ["../flows/doctor-health-contributions.js", "./doctor-state-integrity.js"],
     });
   });
 
-  it("warns when the state directory is missing", async () => {
+  beforeEach(async () => {
+    if (reloadDefaultDoctorCommand) {
+      vi.doUnmock("../plugin-sdk/facade-loader.js");
+      mockDoctorBrowserFastPath();
+      defaultDoctorCommand = await loadDoctorCommandForTest({
+        unmockModules: ["../flows/doctor-health-contributions.js", "./doctor-state-integrity.js"],
+      });
+      reloadDefaultDoctorCommand = false;
+    }
+    doctorCommand = defaultDoctorCommand;
+    terminalNoteMock.mockClear();
+  });
+
+  it("reports when the state directory was missing at doctor start", async () => {
     mockDoctorConfigSnapshot();
 
     const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-missing-state-"));
     fs.rmSync(missingDir, { recursive: true, force: true });
-    process.env.OPENCLAW_STATE_DIR = missingDir;
-    await doctorCommand(createDoctorRuntime(), {
-      nonInteractive: true,
-      workspaceSuggestions: false,
+    await withEnvAsync({ OPENCLAW_STATE_DIR: missingDir }, async () => {
+      await doctorCommand(createDoctorRuntime(), {
+        nonInteractive: true,
+        workspaceSuggestions: false,
+      });
     });
 
-    const stateNote = requireTerminalNote({ messageIncludes: "state directory missing" });
-    expect(String(stateNote[0])).toContain("CRITICAL");
+    requireTerminalNote({
+      title: "State integrity",
+      messageIncludes: "State directory was missing at doctor start",
+    });
   });
 
   it("routes browser readiness through health contributions and degrades gracefully when browser facade is unavailable", async () => {
@@ -133,36 +165,40 @@ describe("doctor command", () => {
         loadBundledPluginPublicSurfaceModuleSync,
       };
     });
-    doctorCommand = await loadDoctorCommandForTest({
-      unmockModules: [
-        "../flows/doctor-health-contributions.js",
-        "./doctor-browser.js",
-        "./doctor-state-integrity.js",
-      ],
-    });
+    try {
+      doctorCommand = await loadDoctorCommandForTest({
+        unmockModules: [
+          "../flows/doctor-health-contributions.js",
+          "./doctor-browser.js",
+          "./doctor-state-integrity.js",
+        ],
+      });
 
-    mockDoctorConfigSnapshot({
-      config: {
-        browser: {
-          defaultProfile: "user",
+      mockDoctorConfigSnapshot({
+        config: {
+          browser: {
+            defaultProfile: "user",
+          },
         },
-      },
-    });
+      });
 
-    await runDoctorNonInteractive();
+      await runDoctorNonInteractive();
 
-    expect(loadBundledPluginPublicSurfaceModuleSync).toHaveBeenCalledWith({
-      dirName: "browser",
-      artifactBasename: "browser-doctor.js",
-    });
-    const browserFallbackNote = requireTerminalNote({
-      title: "Browser",
-      messageIncludes: "Browser health check is unavailable",
-    });
-    expect(String(browserFallbackNote[0])).toContain("missing browser doctor facade");
+      expect(loadBundledPluginPublicSurfaceModuleSync).toHaveBeenCalledWith({
+        dirName: "browser",
+        artifactBasename: "browser-doctor.js",
+      });
+      const browserFallbackNote = requireTerminalNote({
+        title: "Browser",
+        messageIncludes: "Browser health check is unavailable",
+      });
+      expect(String(browserFallbackNote[0])).toContain("missing browser doctor facade");
+    } finally {
+      reloadDefaultDoctorCommand = true;
+    }
   });
 
-  it("warns about opencode provider overrides", async () => {
+  it("warns about active OpenCode provider overrides", async () => {
     mockDoctorConfigSnapshot({
       config: {
         models: {
@@ -194,7 +230,7 @@ describe("doctor command", () => {
     expect(warned).toBe(true);
   });
 
-  it("warns when a legacy openai-codex provider override shadows configured Codex OAuth", async () => {
+  it("warns when a legacy Codex provider override shadows configured Codex OAuth", async () => {
     mockCodexProviderSnapshot({
       provider: {
         api: "openai-responses",
@@ -209,7 +245,7 @@ describe("doctor command", () => {
     expect(hasCodexOAuthWarning("models.providers.openai-codex")).toBe(true);
   });
 
-  it("warns when a legacy openai-codex provider override shadows stored Codex OAuth", async () => {
+  it("warns when a legacy Codex provider override shadows stored Codex OAuth", async () => {
     mockCodexProviderSnapshot({
       provider: {
         api: "openai-responses",
@@ -225,7 +261,7 @@ describe("doctor command", () => {
     expect(hasCodexOAuthWarning("models.providers.openai-codex")).toBe(true);
   });
 
-  it("warns when an inline openai-codex model keeps the legacy OpenAI transport", async () => {
+  it("warns when an inline OpenAI model keeps the legacy OpenAI transport", async () => {
     mockCodexProviderSnapshot({
       provider: {
         models: [
@@ -244,7 +280,7 @@ describe("doctor command", () => {
     expect(hasCodexOAuthWarning("legacy transport override")).toBe(true);
   });
 
-  it("does not warn for a custom openai-codex proxy override", async () => {
+  it("does not warn for a custom OpenAI proxy override", async () => {
     mockCodexProviderSnapshot({
       provider: {
         api: "openai-responses",
@@ -259,7 +295,7 @@ describe("doctor command", () => {
     expect(hasCodexOAuthWarning()).toBe(false);
   });
 
-  it("does not warn for header-only openai-codex overrides", async () => {
+  it("does not warn for header-only OpenAI overrides", async () => {
     mockCodexProviderSnapshot({
       provider: {
         baseUrl: "https://custom.example.com",
@@ -275,7 +311,7 @@ describe("doctor command", () => {
     expect(hasCodexOAuthWarning()).toBe(false);
   });
 
-  it("does not warn about an openai-codex provider override without Codex OAuth", async () => {
+  it("does not warn about a legacy Codex provider override without Codex OAuth", async () => {
     mockCodexProviderSnapshot({
       provider: {
         api: "openai-responses",
@@ -839,7 +875,7 @@ describe("doctor command", () => {
     expect(skippedGatewayHealth).toBe(false);
   });
 
-  it("keeps gateway health probes when env password wins over an exec password ref", async () => {
+  it("skips password-mode probes when configured password is an exec SecretRef", async () => {
     mockDoctorConfigSnapshot({
       config: {
         gateway: {
@@ -867,6 +903,7 @@ describe("doctor command", () => {
     const previousPassword = process.env.OPENCLAW_GATEWAY_PASSWORD;
     process.env.OPENCLAW_GATEWAY_PASSWORD = "fallback-password";
     try {
+      callGateway.mockClear();
       await doctorCommand(createDoctorRuntime(), {
         nonInteractive: true,
         workspaceSuggestions: false,
@@ -879,15 +916,12 @@ describe("doctor command", () => {
       }
     }
 
-    const skippedGatewayHealth = terminalNoteMock.mock.calls.some(([message, title]) => {
-      return (
-        title === "Gateway" &&
-        String(message).includes(
-          "Gateway health probes skipped because gateway credentials use an exec SecretRef.",
-        )
-      );
+    expect(callGateway).not.toHaveBeenCalled();
+    requireTerminalNote({
+      title: "Gateway",
+      messageIncludes:
+        "Gateway health probes skipped because gateway credentials use an exec SecretRef.",
     });
-    expect(skippedGatewayHealth).toBe(false);
   });
 
   it("keeps remote gateway health probes when env token wins over an exec password ref", async () => {
@@ -1089,3 +1123,4 @@ describe("doctor command", () => {
     expect(warned).toBe(false);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

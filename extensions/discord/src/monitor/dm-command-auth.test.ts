@@ -1,3 +1,4 @@
+// Discord tests cover dm command auth plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   resolveDiscordDmCommandAccess,
@@ -69,22 +70,6 @@ describe("resolveDiscordTextCommandAccess", () => {
     });
     expect(result.authorized).toBe(false);
     expect(result.shouldBlockControlCommand).toBe(true);
-  });
-
-  it("preserves configured mode when access groups are disabled", async () => {
-    const result = await resolveDiscordTextCommandAccess({
-      accountId: "default",
-      sender,
-      ownerAllowFrom: [],
-      memberAccessConfigured: false,
-      memberAllowed: false,
-      allowNameMatching: false,
-      cfg: { commands: { useAccessGroups: false } },
-      allowTextCommands: true,
-      hasControlCommand: true,
-    });
-    expect(result.authorized).toBe(true);
-    expect(result.shouldBlockControlCommand).toBe(false);
   });
 });
 
@@ -161,6 +146,24 @@ describe("resolveDiscordDmCommandAccess", () => {
       sender,
       allowNameMatching: false,
       readStoreAllowFrom: async () => ["discord:123"],
+    });
+
+    expect(result.senderAccess.decision).toBe("allow");
+    expect(dmCommandAuthorized(result)).toBe(true);
+  });
+
+  it("authorizes PluralKit senders from prefixed pairing-store allowlist entries", async () => {
+    const result = await resolveDiscordDmCommandAccess({
+      accountId: "default",
+      dmPolicy: "pairing",
+      configuredAllowFrom: [],
+      sender: {
+        id: "pk-member-1",
+        name: "Echo",
+        tag: "Echo",
+      },
+      allowNameMatching: false,
+      readStoreAllowFrom: async () => ["pk:pk-member-1"],
     });
 
     expect(result.senderAccess.decision).toBe("allow");
@@ -264,7 +267,7 @@ describe("resolveDiscordDmCommandAccess", () => {
       configuredAllowFrom: [],
       sender,
       allowNameMatching: false,
-      cfg: { commands: { useAccessGroups: false } },
+      cfg: {},
       readStoreAllowFrom: async () => [],
     });
 

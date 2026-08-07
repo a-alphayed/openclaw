@@ -1,3 +1,5 @@
+// Deepinfra tests cover speech provider plugin behavior.
+import { requireFirstPostJsonRequest } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { buildDeepInfraSpeechProvider } from "./speech-provider.js";
 
@@ -7,18 +9,18 @@ const {
   readProviderBinaryResponseMock,
   resolveProviderHttpRequestConfigMock,
 } = vi.hoisted(() => ({
-    assertOkOrThrowHttpErrorMock: vi.fn(async () => {}),
-    postJsonRequestMock: vi.fn(),
-    readProviderBinaryResponseMock: vi.fn(async (response: Response) => {
-      return new Uint8Array(await response.arrayBuffer());
-    }),
-    resolveProviderHttpRequestConfigMock: vi.fn((params: Record<string, unknown>) => ({
-      baseUrl: params.baseUrl ?? params.defaultBaseUrl ?? "https://api.deepinfra.com/v1/openai",
-      allowPrivateNetwork: false,
-      headers: new Headers(params.defaultHeaders as HeadersInit | undefined),
-      dispatcherPolicy: undefined,
-    })),
-  }));
+  assertOkOrThrowHttpErrorMock: vi.fn(async () => {}),
+  postJsonRequestMock: vi.fn(),
+  readProviderBinaryResponseMock: vi.fn(async (response: Response) => {
+    return new Uint8Array(await response.arrayBuffer());
+  }),
+  resolveProviderHttpRequestConfigMock: vi.fn((params: Record<string, unknown>) => ({
+    baseUrl: params.baseUrl ?? params.defaultBaseUrl ?? "https://api.deepinfra.com/v1/openai",
+    allowPrivateNetwork: false,
+    headers: new Headers(params.defaultHeaders as HeadersInit | undefined),
+    dispatcherPolicy: undefined,
+  })),
+}));
 
 vi.mock("openclaw/plugin-sdk/provider-http", () => ({
   assertOkOrThrowHttpError: assertOkOrThrowHttpErrorMock,
@@ -31,14 +33,6 @@ afterAll(() => {
   vi.doUnmock("openclaw/plugin-sdk/provider-http");
   vi.resetModules();
 });
-
-function requireFirstPostJsonRequest(): unknown {
-  const [call] = postJsonRequestMock.mock.calls;
-  if (!call) {
-    throw new Error("expected DeepInfra speech request");
-  }
-  return call[0];
-}
 
 describe("deepinfra speech provider", () => {
   afterEach(() => {
@@ -125,7 +119,10 @@ describe("deepinfra speech provider", () => {
       ],
     ]);
     expect(postJsonRequestMock).toHaveBeenCalledOnce();
-    const postRequest = requireFirstPostJsonRequest();
+    const postRequest = requireFirstPostJsonRequest(
+      postJsonRequestMock,
+      "DeepInfra speech request",
+    );
     const postRequestHeaders = Reflect.get(postRequest ?? {}, "headers");
     expect(postRequestHeaders).toBeInstanceOf(Headers);
     expect(Object.fromEntries((postRequestHeaders as Headers).entries())).toEqual({

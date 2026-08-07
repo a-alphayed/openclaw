@@ -1,9 +1,12 @@
+/** Quality contract, fallback, and audit helpers for compaction safeguard summaries. */
+import { localeLowercasePreservingWhitespace } from "@openclaw/normalization-core/string-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { extractKeywords, isQueryStopWordToken } from "../../memory-host-sdk/query.js";
-import { localeLowercasePreservingWhitespace } from "../../shared/string-coerce.js";
-import { uniqueStrings } from "../../shared/string-normalization.js";
 import type { CompactionSummarizationInstructions } from "../compaction.js";
 import { wrapUntrustedPromptDataBlock } from "../sanitize-for-prompt.js";
 
+// Compaction summary quality helpers. They define the structured summary contract
+// and audit whether summaries preserve pending asks plus exact identifiers.
 const MAX_EXTRACTED_IDENTIFIERS = 12;
 const MAX_UNTRUSTED_INSTRUCTION_CHARS = 4000;
 const MAX_ASK_OVERLAP_TOKENS = 12;
@@ -20,6 +23,7 @@ const STRICT_EXACT_IDENTIFIERS_INSTRUCTION =
 const POLICY_OFF_EXACT_IDENTIFIERS_INSTRUCTION =
   "For ## Exact identifiers, include identifiers only when needed for continuity; do not enforce literal-preservation rules.";
 
+/** Wraps operator-provided compaction instruction text as untrusted prompt data. */
 export function wrapUntrustedInstructionBlock(label: string, text: string): string {
   return wrapUntrustedPromptDataBlock({
     label,
@@ -35,21 +39,21 @@ function resolveExactIdentifierSectionInstruction(
   if (policy === "off") {
     return POLICY_OFF_EXACT_IDENTIFIERS_INSTRUCTION;
   }
-  if (policy === "custom") {
-    const custom = summarizationInstructions?.identifierInstructions?.trim();
-    if (custom) {
-      const customBlock = wrapUntrustedInstructionBlock(
+  const custom =
+    policy === "custom" ? summarizationInstructions?.identifierInstructions?.trim() : undefined;
+  if (custom) {
+    // Operator text is runtime data, never prompt authority.
+    return (
+      wrapUntrustedInstructionBlock(
         "For ## Exact identifiers, apply this operator-defined policy text",
         custom,
-      );
-      if (customBlock) {
-        return customBlock;
-      }
-    }
+      ) || STRICT_EXACT_IDENTIFIERS_INSTRUCTION
+    );
   }
   return STRICT_EXACT_IDENTIFIERS_INSTRUCTION;
 }
 
+/** Build the required structured summary instructions for compaction. */
 export function buildCompactionStructureInstructions(
   customInstructions?: string,
   summarizationInstructions?: CompactionSummarizationInstructions,
@@ -64,14 +68,9 @@ export function buildCompactionStructureInstructions(
     "When prior compaction summaries are present, re-distill them with new messages and remove stale duplicate detail.",
   ].join("\n");
   const custom = customInstructions?.trim();
-  if (!custom) {
-    return sectionsTemplate;
-  }
-  const customBlock = wrapUntrustedInstructionBlock("Additional context from /compact", custom);
-  if (!customBlock) {
-    return sectionsTemplate;
-  }
-  return `${sectionsTemplate}\n\n${customBlock}`;
+  const customBlock =
+    custom && wrapUntrustedInstructionBlock("Additional context from /compact", custom);
+  return customBlock ? `${sectionsTemplate}\n\n${customBlock}` : sectionsTemplate;
 }
 
 function normalizedSummaryLines(summary: string): string[] {
@@ -94,33 +93,25 @@ function hasRequiredSummarySections(summary: string): boolean {
   return true;
 }
 
-export function buildStructuredFallbackSummary(
-  previousSummary: string | undefined,
-  _summarizationInstructions?: CompactionSummarizationInstructions,
-): string {
+/** Return a structured fallback summary when model output is missing/invalid. */
+export function buildStructuredFallbackSummary(previousSummary: string | undefined): string {
   const trimmedPreviousSummary = previousSummary?.trim() ?? "";
   if (trimmedPreviousSummary && hasRequiredSummarySections(trimmedPreviousSummary)) {
     return trimmedPreviousSummary;
   }
-  const exactIdentifiersSummary = "None captured.";
-  return [
-    "## Decisions",
+  const values = [
     trimmedPreviousSummary || "No prior history.",
-    "",
-    "## Open TODOs",
     "None.",
-    "",
-    "## Constraints/Rules",
     "None.",
-    "",
-    "## Pending user asks",
     "None.",
-    "",
-    "## Exact identifiers",
-    exactIdentifiersSummary,
-  ].join("\n");
+    "None captured.",
+  ];
+  return REQUIRED_SUMMARY_SECTIONS.map((heading, index) => `${heading}\n${values[index]}`).join(
+    "\n\n",
+  );
 }
 
+/** Appends a bounded post-compaction section to an existing summary. */
 export function appendSummarySection(summary: string, section: string): string {
   if (!section) {
     return summary;
@@ -153,18 +144,18 @@ function summaryIncludesIdentifier(summary: string, identifier: string): boolean
   return summary.includes(identifier);
 }
 
+/** Extracts likely exact identifiers that summaries should preserve literally. */
 export function extractOpaqueIdentifiers(text: string): string[] {
+  // Host/port candidates start at token boundaries so a long non-identifier
+  // does not retry the greedy branch at every character.
   const matches =
     text.match(
-      /([A-Fa-f0-9]{8,}|https?:\/\/\S+|\/[\w.-]{2,}(?:\/[\w.-]+)+|[A-Za-z]:\\[\w\\.-]+|[A-Za-z0-9._-]+\.[A-Za-z0-9._/-]+:\d{1,5}|\b\d{6,}\b)/g,
+      /([A-Fa-f0-9]{8,}|https?:\/\/\S+|\/[\w.-]{2,}(?:\/[\w.-]+)+|[A-Za-z]:\\[\w\\.-]+|(?<![A-Za-z0-9._-])[A-Za-z0-9._-]+\.[A-Za-z0-9._/-]+:\d{1,5}|\b\d{6,}\b)/g,
     ) ?? [];
-  return Array.from(
-    new Set(
-      matches
-        .map((value) => sanitizeExtractedIdentifier(value))
-        .map((value) => normalizeOpaqueIdentifier(value))
-        .filter((value) => value.length >= 4),
-    ),
+  return uniqueStrings(
+    matches
+      .map((value) => normalizeOpaqueIdentifier(sanitizeExtractedIdentifier(value)))
+      .filter((value) => value.length >= 4),
   ).slice(0, MAX_EXTRACTED_IDENTIFIERS);
 }
 
@@ -194,30 +185,17 @@ function hasAskOverlap(summary: string, latestAsk: string | null): boolean {
   if (askTokens.length === 0) {
     return true;
   }
-  const meaningfulAskTokens = askTokens.filter((token) => {
-    if (token.length <= 1) {
-      return false;
-    }
-    if (isQueryStopWordToken(token)) {
-      return false;
-    }
-    return true;
-  });
+  const meaningfulAskTokens = askTokens.filter(
+    (token) => token.length > 1 && !isQueryStopWordToken(token),
+  );
   const tokensToCheck = meaningfulAskTokens.length > 0 ? meaningfulAskTokens : askTokens;
-  if (tokensToCheck.length === 0) {
-    return true;
-  }
   const summaryTokens = new Set(tokenizeAskOverlapText(summary));
-  let overlapCount = 0;
-  for (const token of tokensToCheck) {
-    if (summaryTokens.has(token)) {
-      overlapCount += 1;
-    }
-  }
+  const overlapCount = tokensToCheck.filter((token) => summaryTokens.has(token)).length;
   const requiredMatches = tokensToCheck.length >= MIN_ASK_OVERLAP_TOKENS_FOR_DOUBLE_MATCH ? 2 : 1;
   return overlapCount >= requiredMatches;
 }
 
+/** Audits a candidate summary for required sections, pending asks, and identifier preservation. */
 export function auditSummaryQuality(params: {
   summary: string;
   identifiers: string[];

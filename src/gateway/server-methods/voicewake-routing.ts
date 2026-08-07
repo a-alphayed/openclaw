@@ -1,3 +1,4 @@
+// Gateway RPC handlers for voice wake routing configuration.
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import {
   loadVoiceWakeRoutingConfig,
@@ -7,13 +8,10 @@ import {
 } from "../../infra/voicewake-routing.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
+/** Gateway request handlers for reading and updating voice wake routing. */
 export const voicewakeRoutingHandlers: GatewayRequestHandlers = {
   "voicewake.routing.get": async ({ respond }) => {
-    try {
-      respond(true, { config: await loadVoiceWakeRoutingConfig() });
-    } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, String(err)));
-    }
+    respond(true, { config: await loadVoiceWakeRoutingConfig() });
   },
   "voicewake.routing.set": async ({ params, respond, context }) => {
     if (
@@ -34,13 +32,11 @@ export const voicewakeRoutingHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, validated.message));
       return;
     }
-    try {
-      const normalized = normalizeVoiceWakeRoutingConfig(params.config);
-      const config = await setVoiceWakeRoutingConfig(normalized);
-      context.broadcastVoiceWakeRoutingChanged(config);
-      respond(true, { config });
-    } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, String(err)));
-    }
+    // Validate first for caller-friendly errors, then normalize before
+    // persistence so broadcasts carry the canonical routing shape.
+    const normalized = normalizeVoiceWakeRoutingConfig(params.config);
+    const config = await setVoiceWakeRoutingConfig(normalized);
+    context.broadcastVoiceWakeRoutingChanged(config);
+    respond(true, { config });
   },
 };

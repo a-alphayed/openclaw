@@ -1,4 +1,11 @@
+/**
+ * Sandbox media path resolution helpers.
+ *
+ * Bridges media references through sandbox filesystems while enforcing workspace-only boundaries when required.
+ */
 import path from "node:path";
+import { createBoundedOutboundMediaReadFile } from "../media/bounded-read-file.js";
+import type { OutboundMediaReadFile } from "../media/load-options.js";
 import { resolveMediaReferenceSandboxPath } from "../media/media-reference.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import type { SandboxFsBridge, SandboxResolvedPath } from "./sandbox/fs-bridge.js";
@@ -12,12 +19,15 @@ export type SandboxedBridgeMediaPathConfig = {
 
 export function createSandboxBridgeReadFile(params: {
   sandbox: Pick<SandboxedBridgeMediaPathConfig, "root" | "bridge">;
-}): (filePath: string) => Promise<Buffer> {
-  return async (filePath: string) =>
-    await params.sandbox.bridge.readFile({
-      filePath,
-      cwd: params.sandbox.root,
-    });
+}): OutboundMediaReadFile {
+  return createBoundedOutboundMediaReadFile(
+    async (filePath, options) =>
+      await params.sandbox.bridge.readFile({
+        filePath,
+        cwd: params.sandbox.root,
+        maxBytes: options?.maxBytes,
+      }),
+  );
 }
 
 export async function resolveSandboxedBridgeMediaPath(params: {

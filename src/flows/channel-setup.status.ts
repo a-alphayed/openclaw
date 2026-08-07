@@ -1,37 +1,39 @@
+// Channel setup status helpers format channel setup progress and docs links.
+import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
+import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { listChatChannels } from "../channels/chat-meta.js";
-import { listChannelPluginCatalogEntries } from "../channels/plugins/catalog.js";
+import type { ChannelPluginCatalogEntry } from "../channels/plugins/catalog.js";
 import { listChannelSetupPlugins } from "../channels/plugins/setup-registry.js";
-import type { ChannelSetupPlugin } from "../channels/plugins/setup-wizard-types.js";
+import type {
+  ChannelSetupPlugin,
+  ChannelSetupStatus,
+  ChannelSetupWizardAdapter,
+  SetupChannelsOptions,
+} from "../channels/plugins/setup-wizard-types.js";
 import type { ChannelMeta } from "../channels/plugins/types.core.js";
 import { formatChannelPrimerLine, formatChannelSelectionLine } from "../channels/registry.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { resolveChannelSetupEntries } from "../commands/channel-setup/discovery.js";
 import { shouldShowChannelInSetup } from "../commands/channel-setup/discovery.js";
 import { resolveChannelSetupWizardAdapterForPlugin } from "../commands/channel-setup/registry.js";
-import type {
-  ChannelSetupWizardAdapter,
-  ChannelSetupStatus,
-  SetupChannelsOptions,
-} from "../commands/channel-setup/types.js";
 import type { ChannelChoice } from "../commands/onboard-types.js";
 import { isChannelConfigured } from "../config/channel-configured.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import {
   findBundledPluginSourceInMap,
   resolveBundledPluginSources,
   type BundledPluginSource,
 } from "../plugins/bundled-sources.js";
-import { formatDocsLink } from "../terminal/links.js";
-import { sanitizeTerminalText } from "../terminal/safe-text.js";
 import { t, wizardT } from "../wizard/i18n/index.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
 import type { FlowContribution } from "./types.js";
 
 type ChannelStatusSummary = {
   installedPlugins: ChannelSetupPlugin[];
-  catalogEntries: ReturnType<typeof listChannelPluginCatalogEntries>;
-  installedCatalogEntries: ReturnType<typeof listChannelPluginCatalogEntries>;
+  catalogEntries: ChannelPluginCatalogEntry[];
+  installedCatalogEntries: ChannelPluginCatalogEntry[];
   statusByChannel: Map<ChannelChoice, ChannelSetupStatus>;
   statusLines: string[];
 };
@@ -50,8 +52,6 @@ type ChannelSetupSelectionEntry = {
     label: string;
     selectionLabel?: string;
     exposure?: { setup?: boolean };
-    showConfigured?: boolean;
-    showInSetup?: boolean;
   };
 };
 
@@ -356,23 +356,38 @@ export async function collectChannelStatus(params: {
       resolveChannelSetupWizardAdapterForPlugin(
         installedPlugins.find((plugin) => plugin.id === channel),
       ));
-  const statusEntries = await Promise.all(
-    installedPlugins.flatMap((plugin) => {
-      if (!shouldShowChannelInSetup(plugin.meta)) {
-        return [];
-      }
-      const adapter = resolveAdapter(plugin.id);
-      if (!adapter) {
-        return [];
-      }
-      return adapter.getStatus({
-        cfg: params.cfg,
-        options: params.options,
-        accountOverrides: params.accountOverrides,
-      });
-    }),
+  const statusEntries = (
+    await Promise.all(
+      installedPlugins
+        .filter((plugin) => shouldShowChannelInSetup(plugin.meta))
+        .map(async (plugin): Promise<ChannelSetupStatus | undefined> => {
+          try {
+            const adapter = resolveAdapter(plugin.id);
+            if (!adapter) {
+              return undefined;
+            }
+            return await adapter.getStatus({
+              cfg: params.cfg,
+              options: params.options,
+              accountOverrides: params.accountOverrides,
+            });
+          } catch (error) {
+            const detail = formatSetupFreeText(formatErrorMessage(error));
+            return {
+              channel: plugin.id,
+              configured: isChannelConfigured(params.cfg, plugin.id),
+              statusLines: [
+                `${formatSetupSelectionLabel(plugin.meta.label, plugin.id)}: status unavailable (${detail})`,
+              ],
+              selectionHint: "status unavailable",
+            };
+          }
+        }),
+    )
+  ).filter((status): status is ChannelSetupStatus => status !== undefined);
+  const statusByChannel = new Map(
+    statusEntries.map((entry: ChannelSetupStatus) => [entry.channel, entry]),
   );
-  const statusByChannel = new Map(statusEntries.map((entry) => [entry.channel, entry]));
   const fallbackStatuses = listChatChannels()
     .filter((meta) => shouldShowChannelInSetup(meta))
     .filter((meta) => !statusByChannel.has(meta.id))

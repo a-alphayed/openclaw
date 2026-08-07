@@ -1,5 +1,11 @@
+/**
+ * Tests workspace-root path guarding for file tools.
+ * Covers container path mapping, malformed suffix cleanup, and normalized path
+ * forwarding for guarded operations.
+ */
 import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createOpenClawReadTool } from "./agent-tools.read.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 
 type AssertSandboxPath = typeof import("./sandbox-paths.js").assertSandboxPath;
@@ -35,7 +41,7 @@ async function loadModule() {
 let wrapToolWorkspaceRootGuardWithOptions: typeof import("./agent-tools.read.js").wrapToolWorkspaceRootGuardWithOptions;
 
 describe("wrapToolWorkspaceRootGuardWithOptions", () => {
-  const root = "/tmp/root";
+  const root = path.resolve("/tmp/root");
   const assertSandboxPathImpl: AssertSandboxPath = async ({ filePath }) => ({
     resolved:
       filePath.startsWith("file://") || path.isAbsolute(filePath)
@@ -64,6 +70,25 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
       cwd: root,
       root,
     });
+  });
+
+  it("strips malformed XML arg-value suffixes before guarding path params", async () => {
+    const { execute, tool } = createToolHarness();
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root);
+
+    await wrapped.execute("tc-suffix", { path: "docs/readme.md</arg_value>>" });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: "docs/readme.md",
+      cwd: root,
+      root,
+    });
+    expect(execute).toHaveBeenCalledWith(
+      "tc-suffix",
+      { path: "docs/readme.md" },
+      undefined,
+      undefined,
+    );
   });
 
   it("maps file:// container workspace paths to host workspace root", async () => {
@@ -192,7 +217,7 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
 
   it("maps additional container mounts to their own guarded host roots", async () => {
     const { tool } = createToolHarness();
-    const agentRoot = "/tmp/agent-root";
+    const agentRoot = path.resolve("/tmp/agent-root");
     const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
       additionalContainerMounts: [{ containerRoot: "/agent", hostRoot: agentRoot }],
       containerWorkdir: "/workspace",
@@ -207,9 +232,26 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
     });
   });
 
+  it("normalizes container paths before matching additional mounts", async () => {
+    const { tool } = createToolHarness();
+    const skillRoot = path.resolve("/tmp/skill-root");
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      additionalContainerMounts: [{ containerRoot: "/workspace/skills", hostRoot: skillRoot }],
+      containerWorkdir: "/workspace",
+    });
+
+    await wrapped.execute("tc-skill-traverse", { path: "/workspace/skills/../README.md" });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: path.resolve(root, "README.md"),
+      cwd: root,
+      root,
+    });
+  });
+
   it("maps file URLs under additional container mounts", async () => {
     const { tool } = createToolHarness();
-    const agentRoot = "/tmp/agent-root";
+    const agentRoot = path.resolve("/tmp/agent-root");
     const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
       additionalContainerMounts: [{ containerRoot: "/agent", hostRoot: agentRoot }],
       containerWorkdir: "/workspace",
@@ -256,5 +298,86 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
       undefined,
       undefined,
     );
+  });
+
+  it("rejects custom path params that become empty after suffix stripping", async () => {
+    const { execute, tool } = createToolHarness();
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      containerWorkdir: "/workspace",
+      pathParamKeys: ["outPath"],
+      normalizeGuardedPathParams: true,
+    });
+
+    await expect(
+      wrapped.execute("tc-outpath-empty-suffix", { outPath: "</arg_value>>" }),
+    ).rejects.toThrow(/Malformed path parameter: outPath/);
+
+    expect(mocks.assertSandboxPath).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("createOpenClawReadTool malformed XML arg-value suffix handling", () => {
+  it("strips the suffix from read paths before invoking the base tool", async () => {
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ok" }] }));
+    const base = {
+      name: "read",
+      label: "read",
+      description: "read a file",
+      parameters: {},
+      execute,
+    } as unknown as AnyAgentTool;
+    const tool = createOpenClawReadTool(base);
+
+    await tool.execute("read-1", { path: "notes.txt</arg_value>>" });
+
+    expect(execute).toHaveBeenCalledWith(
+      "read-1",
+      {
+        path: "notes.txt",
+        offset: 1,
+      },
+      undefined,
+    );
+  });
+
+  it("normalizes hallucinated Office/codex read path extensions", async () => {
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ok" }] }));
+    const base = {
+      name: "read",
+      label: "read",
+      description: "read a file",
+      parameters: {},
+      execute,
+    } as unknown as AnyAgentTool;
+    const tool = createOpenClawReadTool(base);
+
+    await tool.execute("read-1", { path: "reports/final.docodex" });
+
+    expect(execute).toHaveBeenCalledWith(
+      "read-1",
+      {
+        path: "reports/final.docx",
+        offset: 1,
+      },
+      undefined,
+    );
+  });
+
+  it("rejects read paths that become empty after suffix stripping", async () => {
+    const execute = vi.fn();
+    const base = {
+      name: "read",
+      label: "read",
+      description: "read a file",
+      parameters: {},
+      execute,
+    } as unknown as AnyAgentTool;
+    const tool = createOpenClawReadTool(base);
+
+    await expect(tool.execute("read-1", { path: "</arg_value>>" })).rejects.toThrow(
+      /Missing required parameter: path/,
+    );
+    expect(execute).not.toHaveBeenCalled();
   });
 });

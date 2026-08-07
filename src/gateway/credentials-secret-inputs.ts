@@ -1,3 +1,5 @@
+// Gateway credential secret-input resolver.
+// Resolves SecretRefs before applying Gateway credential precedence rules.
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveSecretInputRef } from "../config/types.secrets.js";
 import { resolveSecretInputString } from "../secrets/resolve-secret-input-string.js";
@@ -27,14 +29,14 @@ type GatewayCredentialSecretInputOptions = {
   urlOverrideSource?: "cli" | "env";
   env?: NodeJS.ProcessEnv;
   modeOverride?: GatewayCredentialMode;
-  localTokenPrecedence?: GatewayCredentialPrecedence;
-  localPasswordPrecedence?: GatewayCredentialPrecedence;
+  localPrecedence?: GatewayCredentialPrecedence;
   remoteTokenPrecedence?: GatewayRemoteCredentialPrecedence;
   remotePasswordPrecedence?: GatewayRemoteCredentialPrecedence;
   remoteTokenFallback?: GatewayRemoteCredentialFallback;
   remotePasswordFallback?: GatewayRemoteCredentialFallback;
 };
 
+/** Internal options after explicit auth has been trimmed to real credential values. */
 type NormalizedGatewayCredentialSecretInputOptions = Omit<
   GatewayCredentialSecretInputOptions,
   "explicitAuth"
@@ -98,8 +100,7 @@ function resolveGatewayCredentialsFromConfigOptions(params: {
     urlOverride: options.urlOverride,
     urlOverrideSource: options.urlOverrideSource,
     modeOverride: options.modeOverride,
-    localTokenPrecedence: options.localTokenPrecedence,
-    localPasswordPrecedence: options.localPasswordPrecedence,
+    localPrecedence: options.localPrecedence,
     remoteTokenPrecedence: options.remoteTokenPrecedence,
     remotePasswordPrecedence: options.remotePasswordPrecedence ?? "env-first", // pragma: allowlist secret
     remoteTokenFallback: options.remoteTokenFallback,
@@ -159,6 +160,8 @@ function canGatewaySecretInputPathWin(params: {
       value: undefined,
     });
   }
+  // Inject one path at a time so normal credential precedence decides whether
+  // that secret ref is on the active auth path without resolving real secrets.
   assignResolvedGatewaySecretInput({
     config: probeConfig,
     path: params.path,
@@ -186,6 +189,7 @@ function canGatewaySecretInputPathWin(params: {
   }
 }
 
+/** Test whether resolving a configured secret-ref path could affect selected credentials. */
 export function gatewaySecretInputPathCanWin(
   params: GatewayCredentialSecretInputOptions & { path: SupportedGatewaySecretInputPath },
 ): boolean {
@@ -254,6 +258,7 @@ async function resolvePreferredGatewaySecretInputs(params: {
   return nextConfig;
 }
 
+/** Resolve only secret refs that can win, then select Gateway credentials. */
 async function resolveGatewayCredentialsFromConfigWithSecretInputs(params: {
   options: NormalizedGatewayCredentialSecretInputOptions;
   env: NodeJS.ProcessEnv;
@@ -284,6 +289,8 @@ async function resolveGatewayCredentialsFromConfigWithSecretInputs(params: {
       if (resolvedConfig === params.options.config) {
         resolvedConfig = structuredClone(params.options.config);
       }
+      // Resolve refs lazily on demand as a backstop for precedence cases the
+      // optimistic scan skipped, but stop if the same path loops.
       const resolvedValue = await resolveConfiguredGatewaySecretInput({
         config: resolvedConfig,
         path,
@@ -299,6 +306,7 @@ async function resolveGatewayCredentialsFromConfigWithSecretInputs(params: {
   }
 }
 
+/** Resolve Gateway credentials after materializing winning configured secret refs. */
 export async function resolveGatewayCredentialsWithSecretInputs(
   params: GatewayCredentialSecretInputOptions,
 ): Promise<{ token?: string; password?: string }> {

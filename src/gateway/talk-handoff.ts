@@ -1,5 +1,15 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+// Gateway Talk handoff registry.
+// Manages short-lived browser Talk rooms, tokens, events, and turn ownership.
+import { randomBytes, randomUUID } from "node:crypto";
+import {
+  asDateTimestampMs,
+  isFutureDateTimestampMs,
+  resolveDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sha256Base64Url } from "../infra/crypto-digest.js";
+import { resolveGlobalMap } from "../shared/global-singleton.js";
 import { recordTalkObservabilityEvent } from "../talk/observability.js";
 import {
   createTalkSessionController,
@@ -14,7 +24,8 @@ import {
 const DEFAULT_TALK_HANDOFF_TTL_MS = 10 * 60 * 1000;
 const MAX_TALK_HANDOFF_TTL_MS = 60 * 60 * 1000;
 
-export type TalkHandoffCreateParams = {
+/** Inputs captured when a gateway caller creates a managed Talk room. */
+type TalkHandoffCreateParams = {
   sessionKey: string;
   sessionId?: string;
   channel?: string;
@@ -28,7 +39,8 @@ export type TalkHandoffCreateParams = {
   ttlMs?: number;
 };
 
-export type TalkHandoffRecord = {
+/** Private handoff state, including the hashed room token and event controller. */
+type TalkHandoffRecord = {
   id: string;
   roomId: string;
   roomUrl: string;
@@ -48,7 +60,8 @@ export type TalkHandoffRecord = {
   room: TalkHandoffRoomState;
 };
 
-export type TalkHandoffPublicRecord = Omit<TalkHandoffRecord, "tokenHash" | "room"> & {
+/** Public handoff shape returned to clients; never includes token material. */
+type TalkHandoffPublicRecord = Omit<TalkHandoffRecord, "tokenHash" | "room"> & {
   room: {
     activeClientId?: string;
     activeTurnId?: string;
@@ -56,11 +69,11 @@ export type TalkHandoffPublicRecord = Omit<TalkHandoffRecord, "tokenHash" | "roo
   };
 };
 
-export type TalkHandoffCreateResult = TalkHandoffPublicRecord & {
+type TalkHandoffCreateResult = TalkHandoffPublicRecord & {
   token: string;
 };
 
-export type TalkHandoffJoinResult =
+type TalkHandoffJoinResult =
   | {
       ok: true;
       record: TalkHandoffPublicRecord;
@@ -71,7 +84,7 @@ export type TalkHandoffJoinResult =
     }
   | { ok: false; reason: "not_found" | "expired" | "invalid_token" };
 
-export type TalkHandoffRevokeResult = {
+type TalkHandoffRevokeResult = {
   revoked: boolean;
   roomId?: string;
   activeClientId?: string;
@@ -95,12 +108,18 @@ type TalkHandoffRoomState = {
   talk: TalkSessionController;
 };
 
-const handoffs = new Map<string, TalkHandoffRecord>();
+const handoffs = resolveGlobalMap<string, TalkHandoffRecord>(
+  Symbol.for("openclaw.talkHandoffs"),
+  "close-and-restart",
+);
 
+/** Creates a short-lived Talk room and returns the only plaintext join token. */
 export function createTalkHandoff(params: TalkHandoffCreateParams): TalkHandoffCreateResult {
   pruneExpiredTalkHandoffs();
-  const createdAt = Date.now();
+  const rawCreatedAt = Date.now();
+  const createdAt = resolveDateTimestampMs(rawCreatedAt);
   const ttlMs = normalizeTtlMs(params.ttlMs);
+  const expiresAt = resolveExpiresAtMsFromDurationMs(ttlMs, { nowMs: rawCreatedAt }) ?? 0;
   const id = randomUUID();
   const roomId = `talk_${id}`;
   const token = randomBytes(32).toString("base64url");
@@ -127,7 +146,7 @@ export function createTalkHandoff(params: TalkHandoffCreateParams): TalkHandoffC
     transport: params.transport ?? "managed-room",
     brain: params.brain ?? "agent-consult",
     createdAt,
-    expiresAt: createdAt + ttlMs,
+    expiresAt,
     room,
   };
   appendTalkHandoffRoomEvent(record, {
@@ -138,11 +157,13 @@ export function createTalkHandoff(params: TalkHandoffCreateParams): TalkHandoffC
   return { ...toPublicTalkHandoffRecord(record), token };
 }
 
+/** Returns a non-expired handoff record for gateway-internal callers. */
 export function getTalkHandoff(id: string): TalkHandoffRecord | undefined {
   pruneExpiredTalkHandoffs();
   return handoffs.get(id);
 }
 
+/** Joins a managed room, replacing any previous active client for that room. */
 export function joinTalkHandoff(
   id: string,
   token: string,
@@ -173,6 +194,7 @@ export function joinTalkHandoff(
   };
 }
 
+/** Starts a client turn in a joined managed room. */
 export function startTalkHandoffTurn(
   id: string,
   token: string,
@@ -199,6 +221,7 @@ export function startTalkHandoffTurn(
   };
 }
 
+/** Ends the active managed-room turn and returns the emitted Talk event. */
 export function endTalkHandoffTurn(
   id: string,
   token: string,
@@ -224,6 +247,7 @@ export function endTalkHandoffTurn(
   };
 }
 
+/** Cancels the active managed-room turn with a client-visible reason. */
 export function cancelTalkHandoffTurn(
   id: string,
   token: string,
@@ -249,6 +273,7 @@ export function cancelTalkHandoffTurn(
   };
 }
 
+/** Revokes a handoff and emits the final room-close event if it existed. */
 export function revokeTalkHandoff(id: string): TalkHandoffRevokeResult {
   pruneExpiredTalkHandoffs();
   const record = handoffs.get(id);
@@ -269,12 +294,9 @@ export function revokeTalkHandoff(id: string): TalkHandoffRevokeResult {
   };
 }
 
-export function verifyTalkHandoffToken(record: TalkHandoffRecord, token: string): boolean {
+/** Verifies the caller token without exposing the stored token hash. */
+function verifyTalkHandoffToken(record: TalkHandoffRecord, token: string): boolean {
   return record.tokenHash === hashTalkHandoffToken(token);
-}
-
-export function clearTalkHandoffsForTest(): void {
-  handoffs.clear();
 }
 
 function normalizeTtlMs(value: number | undefined): number {
@@ -285,8 +307,12 @@ function normalizeTtlMs(value: number | undefined): number {
 }
 
 function pruneExpiredTalkHandoffs(now = Date.now()): void {
+  const validNow = asDateTimestampMs(now);
+  if (validNow === undefined) {
+    return;
+  }
   for (const [id, record] of handoffs) {
-    if (record.expiresAt <= now) {
+    if (!isFutureDateTimestampMs(record.expiresAt, { nowMs: validNow })) {
       appendTalkHandoffRoomEvent(record, {
         type: "session.closed",
         payload: { reason: "expired", handoffId: id, roomId: record.roomId },
@@ -298,7 +324,7 @@ function pruneExpiredTalkHandoffs(now = Date.now()): void {
 }
 
 function hashTalkHandoffToken(token: string): string {
-  return createHash("sha256").update(token).digest("base64url");
+  return sha256Base64Url(token);
 }
 
 function toPublicTalkHandoffRecord(record: TalkHandoffRecord): TalkHandoffPublicRecord {
@@ -344,7 +370,9 @@ function resolveTalkHandoffAccess(
   if (!record) {
     return { ok: false, reason: "not_found" };
   }
-  if (record.expiresAt <= Date.now()) {
+  if (!isFutureDateTimestampMs(record.expiresAt)) {
+    // Expiry emits the same close event as explicit revocation so room clients
+    // can reconcile state without knowing which cleanup path won the race.
     appendTalkHandoffRoomEvent(record, {
       type: "session.closed",
       payload: { reason: "expired", handoffId: id, roomId: record.roomId },

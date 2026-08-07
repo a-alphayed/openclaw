@@ -1,3 +1,4 @@
+// Discord plugin module implements interactive dispatch behavior.
 import type { ChannelStructuredComponents } from "openclaw/plugin-sdk/channel-contract";
 import {
   createInteractiveConversationBindingHelpers,
@@ -90,7 +91,14 @@ export async function dispatchDiscordPluginInteractiveHandler(params: {
         },
         respond: params.respond,
         ...createInteractiveConversationBindingHelpers({
-          registration,
+          // Untrusted callbacks may reach their plugin, but never inherit conversation-binding authority.
+          registration:
+            params.ctx.auth?.isAuthorizedSender &&
+            params.ctx.senderId?.trim() &&
+            params.ctx.accountId?.trim() &&
+            params.ctx.conversationId?.trim()
+              ? registration
+              : { ...registration, pluginRoot: undefined },
           senderId: params.ctx.senderId,
           conversation: {
             channel: "discord",

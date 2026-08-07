@@ -1,11 +1,13 @@
+/** Session-manager scoped runtime state for compaction safeguard configuration. */
 import type { AgentCompactionIdentifierPolicy } from "../../config/types.agent-defaults.js";
 import type { Model } from "../../llm/types.js";
 import { createSessionManagerRuntimeRegistry } from "./session-manager-runtime-registry.js";
 
-export type CompactionSafeguardRuntimeValue = {
+/** Runtime knobs consumed by the compaction safeguard extension. */
+type CompactionSafeguardRuntimeValue = {
   maxHistoryShare?: number;
   contextWindowTokens?: number;
-  identifierPolicy?: AgentCompactionIdentifierPolicy;
+  identifierPolicy?: AgentCompactionIdentifierPolicy | "custom";
   identifierInstructions?: string;
   customInstructions?: string;
   /**
@@ -39,6 +41,7 @@ export const setCompactionSafeguardRuntime = registry.set;
 
 export const getCompactionSafeguardRuntime = registry.get;
 
+/** Stores a human-readable compaction cancel reason on the session runtime state. */
 export function setCompactionSafeguardCancelReason(
   sessionManager: unknown,
   reason: string | undefined,
@@ -46,14 +49,9 @@ export function setCompactionSafeguardCancelReason(
   const current = getCompactionSafeguardRuntime(sessionManager);
   const trimmed = reason?.trim();
 
-  if (!current) {
-    if (!trimmed) {
-      return;
-    }
-    setCompactionSafeguardRuntime(sessionManager, { cancelReason: trimmed });
+  if (!current && !trimmed) {
     return;
   }
-
   const next = { ...current };
   if (trimmed) {
     next.cancelReason = trimmed;
@@ -63,6 +61,7 @@ export function setCompactionSafeguardCancelReason(
   setCompactionSafeguardRuntime(sessionManager, next);
 }
 
+/** Reads and clears the pending compaction cancel reason for one session manager. */
 export function consumeCompactionSafeguardCancelReason(sessionManager: unknown): string | null {
   const current = getCompactionSafeguardRuntime(sessionManager);
   const reason = current?.cancelReason?.trim();

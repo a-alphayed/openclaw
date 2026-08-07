@@ -1,3 +1,7 @@
+// Appends the read-only diagnosis section for `openclaw status --all`.
+// Every line that can include logs, config, or connection details is redacted before display.
+
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ProgressReporter } from "../../cli/progress.js";
 import { formatConfigIssueLine } from "../../config/issue-format.js";
 import {
@@ -20,12 +24,12 @@ import {
   formatPluginCompatibilityNotice,
   type PluginCompatibilityNotice,
 } from "../../plugins/status.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import {
   formatUpdateRestartActionLines,
   formatUpdateRestartStatusValue,
 } from "../status-update-restart.ts";
 import type { NodeOnlyGatewayInfo } from "../status.node-mode.js";
+import { formatTelemetryExporterSummary } from "../telemetry-exporter-summary.js";
 import { formatTimeAgo, redactSecrets } from "./format.js";
 import { readFileTailLines, summarizeLogTail } from "./gateway.js";
 
@@ -112,6 +116,7 @@ function countDeliveryEvent(snapshot: DeliveryDiagnosticsLike, type: string): nu
 }
 
 function latestDeliveryEventAgeMs(snapshot: DeliveryDiagnosticsLike): number | null {
+  // Only inbound/dispatch lifecycle events count as delivery freshness signals.
   const latestTs = (snapshot.events ?? [])
     .filter((event) =>
       [
@@ -129,6 +134,7 @@ function latestDeliveryEventAgeMs(snapshot: DeliveryDiagnosticsLike): number | n
   return latestTs > 0 ? Date.now() - latestTs : null;
 }
 
+/** Appends config, gateway, channel, delivery, and log diagnostics to the status-all report. */
 export async function appendStatusAllDiagnosis(params: {
   lines: string[];
   progress: ProgressReporter;
@@ -152,6 +158,7 @@ export async function appendStatusAllDiagnosis(params: {
   channelsStatus: unknown;
   channelIssues: ChannelIssueLike[];
   deliveryDiagnostics: unknown;
+  exporterDiagnostics: unknown;
   agentStatus?: AgentStatusLike;
   gatewayReachable: boolean;
   health: unknown;
@@ -178,6 +185,7 @@ export async function appendStatusAllDiagnosis(params: {
     const status = !params.snap.exists ? "fail" : params.snap.valid ? "ok" : "warn";
     emitCheck(`Config: ${params.snap.path ?? "(unknown)"}`, status);
     const issues = [...(params.snap.legacyIssues ?? []), ...(params.snap.issues ?? [])];
+    // Legacy and current schema checks can report the same path/message pair.
     const uniqueIssues = issues.filter(
       (issue, index) =>
         issues.findIndex((x) => x.path === issue.path && x.message === issue.message) === index,
@@ -228,6 +236,7 @@ export async function appendStatusAllDiagnosis(params: {
   }
 
   const lastErrClean = normalizeOptionalString(params.lastErr) ?? "";
+  // Restart logs sometimes end with a single brace from truncated JSON; suppress that noise.
   const isTrivialLastErr = lastErrClean.length < 8 || lastErrClean === "}" || lastErrClean === "{";
   if (lastErrClean && !isTrivialLastErr) {
     lines.push("");
@@ -328,6 +337,14 @@ export async function appendStatusAllDiagnosis(params: {
     }
   }
 
+  const exporterSummary = formatTelemetryExporterSummary(params.exporterDiagnostics);
+  if (exporterSummary) {
+    emitCheck(exporterSummary.title, exporterSummary.status);
+    for (const line of exporterSummary.lines) {
+      lines.push(`  ${muted(line)}`);
+    }
+  }
+
   if (params.deliveryDiagnostics != null) {
     if (isDeliveryDiagnosticsLike(params.deliveryDiagnostics)) {
       const received = countDeliveryEvent(params.deliveryDiagnostics, "message.received");
@@ -379,6 +396,7 @@ export async function appendStatusAllDiagnosis(params: {
   params.progress.setLabel("Reading logs…");
   const logPaths = (() => {
     try {
+      // macOS supervised installs write stdout/stderr differently than node-managed gateway logs.
       return process.platform === "darwin"
         ? resolveGatewaySupervisorLogPaths(process.env, { platform: "darwin" })
         : resolveGatewayLogPaths(process.env);

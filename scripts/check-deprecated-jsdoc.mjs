@@ -1,13 +1,14 @@
 #!/usr/bin/env node
+// Checks deprecated JSDoc blocks for required migration details.
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
 
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = resolveRepoRoot(import.meta.url);
 const SCAN_ROOTS = ["src", "extensions", "packages"];
 const SOURCE_FILE_RE = /\.(?:ts|tsx)$/;
 const SKIP_PATH_RE =

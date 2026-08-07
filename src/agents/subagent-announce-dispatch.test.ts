@@ -1,24 +1,7 @@
+// Subagent announce dispatch tests lock down direct-vs-steer ordering for
+// progress updates and completion messages.
 import { describe, expect, it, vi } from "vitest";
-import {
-  mapSteerOutcomeToDeliveryResult,
-  runSubagentAnnounceDispatch,
-} from "./subagent-announce-dispatch.js";
-
-describe("mapSteerOutcomeToDeliveryResult", () => {
-  it("maps steered to delivered", () => {
-    expect(mapSteerOutcomeToDeliveryResult({ status: "steered" })).toEqual({
-      delivered: true,
-      path: "steered",
-    });
-  });
-
-  it("maps none to not-delivered", () => {
-    expect(mapSteerOutcomeToDeliveryResult({ status: "none" })).toEqual({
-      delivered: false,
-      path: "none",
-    });
-  });
-});
+import { runSubagentAnnounceDispatch } from "./subagent-announce-dispatch.js";
 
 describe("runSubagentAnnounceDispatch", () => {
   async function runNonCompletionDispatch(params: {
@@ -62,6 +45,58 @@ describe("runSubagentAnnounceDispatch", () => {
     ]);
   });
 
+  it("does not direct-fallback when steering loses source ownership", async () => {
+    const steer = vi.fn(async () => ({ status: "source_owner_changed" }) as const);
+    const direct = vi.fn(async () => ({ delivered: true, path: "direct" as const }));
+
+    const result = await runSubagentAnnounceDispatch({
+      expectsCompletionMessage: false,
+      steer,
+      direct,
+    });
+
+    expect(direct).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      delivered: false,
+      path: "none",
+      reason: "source_owner_changed",
+      terminal: true,
+    });
+  });
+
+  it.each([true, false])(
+    "never steers when direct delivery is required and direct delivery succeeds: %s",
+    async (delivered) => {
+      const steer = vi.fn(async () => ({ status: "steered" }) as const);
+      const direct = vi.fn(async () => ({
+        delivered,
+        path: "direct" as const,
+        ...(delivered ? {} : { error: "direct delivery failed" }),
+      }));
+
+      const result = await runSubagentAnnounceDispatch({
+        expectsCompletionMessage: false,
+        requireDirectDelivery: true,
+        steer,
+        direct,
+      });
+
+      expect(direct).toHaveBeenCalledOnce();
+      expect(steer).not.toHaveBeenCalled();
+      expect(result.delivered).toBe(delivered);
+      expect(result.path).toBe("direct");
+      expect(result.error).toBe(delivered ? undefined : "direct delivery failed");
+      expect(result.phases).toEqual([
+        {
+          phase: "direct-primary",
+          delivered,
+          path: "direct",
+          error: delivered ? undefined : "direct delivery failed",
+        },
+      ]);
+    },
+  );
+
   it("uses direct-first ordering for completion mode", async () => {
     const steer = vi.fn(async () => ({ status: "steered" }) as const);
     const direct = vi.fn(async () => ({ delivered: true, path: "direct" as const }));
@@ -103,6 +138,38 @@ describe("runSubagentAnnounceDispatch", () => {
     ]);
   });
 
+  it("does not fallback-steer after an ambiguous completion direct failure", async () => {
+    const steer = vi.fn(async () => ({ status: "steered" }) as const);
+    const direct = vi.fn(async () => ({
+      delivered: false,
+      path: "direct" as const,
+      error: "media send may have partially succeeded",
+      disposition: "ambiguous" as const,
+    }));
+
+    // Ambiguous direct failures can represent partial media delivery; fallback
+    // steering would risk duplicate or contradictory completion messages.
+    const result = await runSubagentAnnounceDispatch({
+      expectsCompletionMessage: true,
+      steer,
+      direct,
+    });
+
+    expect(direct).toHaveBeenCalledTimes(1);
+    expect(steer).not.toHaveBeenCalled();
+    expect(result.delivered).toBe(false);
+    expect(result.path).toBe("direct");
+    expect(result.error).toBe("media send may have partially succeeded");
+    expect(result.phases).toEqual([
+      {
+        phase: "direct-primary",
+        delivered: false,
+        path: "direct",
+        error: "media send may have partially succeeded",
+      },
+    ]);
+  });
+
   it("returns direct failure when completion fallback steering cannot deliver", async () => {
     const steer = vi.fn(async () => ({ status: "none" }) as const);
     const direct = vi.fn(async () => ({
@@ -124,6 +191,28 @@ describe("runSubagentAnnounceDispatch", () => {
       { phase: "direct-primary", delivered: false, path: "direct", error: "failed" },
       { phase: "steer-fallback", delivered: false, path: "none", error: undefined },
     ]);
+  });
+
+  it("returns terminal source ownership loss from completion fallback steering", async () => {
+    const steer = vi.fn(async () => ({ status: "source_owner_changed" }) as const);
+    const direct = vi.fn(async () => ({
+      delivered: false,
+      path: "direct" as const,
+      error: "network",
+    }));
+
+    const result = await runSubagentAnnounceDispatch({
+      expectsCompletionMessage: true,
+      steer,
+      direct,
+    });
+
+    expect(result).toMatchObject({
+      delivered: false,
+      path: "none",
+      reason: "source_owner_changed",
+      terminal: true,
+    });
   });
 
   it("does not fall through to direct delivery when non-completion steering drops the new item", async () => {

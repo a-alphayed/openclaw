@@ -1,3 +1,4 @@
+// Slack tests cover channels plugin behavior.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const enqueueSystemEventMock = vi.hoisted(() => vi.fn());
@@ -5,9 +6,6 @@ let registerSlackChannelEvents: typeof import("./channels.js").registerSlackChan
 let createSlackSystemEventTestHarness: typeof import("./system-event-test-harness.js").createSlackSystemEventTestHarness;
 
 vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
-  enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
-}));
-vi.mock("openclaw/plugin-sdk/system-event-runtime.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
 }));
 type SlackChannelHandler = (args: {

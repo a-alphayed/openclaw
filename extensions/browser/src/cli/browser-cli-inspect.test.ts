@@ -1,3 +1,4 @@
+// Browser tests cover browser cli inspect plugin behavior.
 import { Command } from "commander";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createCliRuntimeCapture } from "../../test-support.js";
@@ -183,6 +184,26 @@ describe("browser cli snapshot defaults", () => {
     const params = await runSnapshot(["--limit", "+10", "--depth", "+0"]);
     expect(params?.query?.limit).toBe(10);
     expect(params?.query?.depth).toBe(0);
+  });
+
+  it.each([
+    {
+      args: ["screenshot", "tab-1", "--type", "webp"],
+      error: "Invalid --type: expected png or jpeg",
+    },
+    {
+      args: ["snapshot", "--format", "html"],
+      error: "Invalid --format: expected aria or ai",
+    },
+    {
+      args: ["snapshot", "--mode", "full"],
+      error: "Invalid --mode: expected efficient",
+    },
+  ])("rejects unsupported inspect option values before dispatch", async ({ args, error }) => {
+    await expect(runBrowserInspect(args)).rejects.toThrow("__exit__:1");
+
+    expect(runtime.error.mock.calls.at(-1)?.[0]).toContain(error);
+    expect(sharedMocks.callBrowserRequest).not.toHaveBeenCalled();
   });
 
   it("sends screenshot request with trimmed target id and jpeg type", async () => {

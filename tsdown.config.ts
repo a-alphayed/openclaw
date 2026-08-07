@@ -1,6 +1,7 @@
+// tsdown config defines package build entrypoints and output options.
 import fs from "node:fs";
 import path from "node:path";
-import { defineConfig, type UserConfig } from "tsdown";
+import type { UserConfig } from "tsdown";
 import {
   collectBundledPluginBuildEntries,
   NON_PACKAGED_BUNDLED_PLUGIN_DIRS,
@@ -8,8 +9,19 @@ import {
 import {
   buildPluginSdkEntrySources,
   pluginSdkEntrypoints,
+  productionPluginSdkEntrypoints,
   publicPluginSdkEntrypoints,
 } from "./scripts/lib/plugin-sdk-entries.mjs";
+import {
+  createStateSchemaInlinePlugin,
+  STATE_SCHEMA_INLINE_PLUGIN_NAME,
+} from "./scripts/lib/state-schema-inline-plugin.mjs";
+import {
+  TSDOWN_PACKAGE_CONFIG_GROUP,
+  TSDOWN_UNIFIED_CONFIG_GROUP,
+  TSDOWN_UNIFIED_DTS_CONFIG_GROUPS,
+} from "./scripts/lib/tsdown-config-groups.mjs";
+import { tsdownPackageOutputRoot } from "./scripts/lib/tsdown-output-roots.mjs";
 
 type InputOptionsFactory = Extract<NonNullable<UserConfig["inputOptions"]>, Function>;
 type InputOptionsArg = InputOptionsFactory extends (
@@ -38,6 +50,8 @@ const env = {
 };
 const OUTPUT_SOURCE_MAPS = process.env.OUTPUT_SOURCE_MAPS === "1";
 const RUN_NODE_SKIP_DTS_BUILD = process.env.OPENCLAW_RUN_NODE_SKIP_DTS_BUILD === "1";
+const TSDOWN_DECLARATIONS = !RUN_NODE_SKIP_DTS_BUILD;
+export { createStateSchemaInlinePlugin, STATE_SCHEMA_INLINE_PLUGIN_NAME };
 
 const SUPPRESSED_EVAL_WARNING_PATHS = [
   "@protobufjs/inquire/index.js",
@@ -106,7 +120,7 @@ function buildInputOptions(options: InputOptionsArg): InputOptionsReturn {
       return false;
     }
     const haystack = normalizedLogHaystack(log);
-    return SUPPRESSED_EVAL_WARNING_PATHS.some((path) => haystack.includes(path));
+    return SUPPRESSED_EVAL_WARNING_PATHS.some((pathLocal) => haystack.includes(pathLocal));
   }
 
   return {
@@ -131,23 +145,29 @@ function buildInputOptions(options: InputOptionsArg): InputOptionsReturn {
   };
 }
 
-function nodeBuildConfig(config: UserConfig): UserConfig {
+function nodeBuildConfig(
+  config: UserConfig,
+  declarations: UserConfig["dts"] = TSDOWN_DECLARATIONS,
+): UserConfig {
   return {
     ...config,
+    dts: declarations,
     env,
+    outExtensions: () => ({ js: ".js", dts: ".d.ts" }),
     fixedExtension: false,
-    platform: "node",
     sourcemap: OUTPUT_SOURCE_MAPS,
     inputOptions: buildInputOptions,
   };
 }
 
-function nodeWorkspacePackageBuildConfig(config: UserConfig): UserConfig {
+function nodeWorkspacePackageBuildConfig(packageDir: string, config: UserConfig = {}): UserConfig {
   return {
     ...config,
+    dts: TSDOWN_DECLARATIONS,
+    entry: config.entry ?? buildPackageDistEntriesFromExports(packageDir),
     env,
-    format: "esm",
-    platform: "node",
+    name: config.name ?? TSDOWN_PACKAGE_CONFIG_GROUP,
+    outDir: config.outDir ?? tsdownPackageOutputRoot(packageDir),
     sourcemap: OUTPUT_SOURCE_MAPS,
     inputOptions: buildInputOptions,
   };
@@ -155,9 +175,9 @@ function nodeWorkspacePackageBuildConfig(config: UserConfig): UserConfig {
 
 const bundledPluginBuildEntries = collectBundledPluginBuildEntries();
 const shouldBuildPrivateQaEntries = process.env.OPENCLAW_BUILD_PRIVATE_QA === "1";
-const productionPluginSdkEntrypoints = shouldBuildPrivateQaEntries
+const selectedPluginSdkEntrypoints = shouldBuildPrivateQaEntries
   ? pluginSdkEntrypoints
-  : publicPluginSdkEntrypoints;
+  : productionPluginSdkEntrypoints;
 
 function buildBundledHookEntries(): Record<string, string> {
   const hooksRoot = path.join(process.cwd(), "src", "hooks", "bundled");
@@ -196,10 +216,13 @@ const explicitNeverBundleDependencies = [
   "@lancedb/lancedb",
   "@larksuiteoapi/node-sdk",
   "@matrix-org/matrix-sdk-crypto-nodejs",
+  "@openclaw/ai",
   "@vitest/expect",
+  "jimp",
   "matrix-js-sdk",
   "prism-media",
   "qrcode-terminal",
+  "sharp",
   "typescript",
   "vitest",
 ].toSorted((left, right) => left.localeCompare(right));
@@ -212,8 +235,20 @@ function shouldNeverBundleDependency(id: string): boolean {
 
 function shouldAlwaysBundleDependency(id: string): boolean {
   return (
+    id === "openclaw/plugin-sdk/ssrf-runtime-internal" ||
     id === "@openclaw/fs-safe" ||
     id.startsWith("@openclaw/fs-safe/") ||
+    id === "@openclaw/normalization-core" ||
+    id.startsWith("@openclaw/normalization-core/") ||
+    id === "@openclaw/retry" ||
+    id === "@openclaw/media-core" ||
+    id.startsWith("@openclaw/media-core/") ||
+    [
+      "@openclaw/acp-core",
+      "@openclaw/session-url-contract",
+      "@openclaw/workboard-contract",
+    ].includes(id) ||
+    id.startsWith("@openclaw/acp-core/") ||
     id === "zod" ||
     id.startsWith("zod/")
   );
@@ -243,6 +278,7 @@ function buildCoreDistEntries(): Record<string, string> {
   return {
     index: "src/index.ts",
     entry: "src/entry.ts",
+    "docker-healthcheck": "src/docker-healthcheck.ts",
     // Ensure this module is bundled as an entry so legacy CLI shims can resolve its exports.
     "cli/daemon-cli": "src/cli/daemon-cli.ts",
     // Keep long-lived lazy runtime boundaries on stable filenames so rebuilt
@@ -253,10 +289,19 @@ function buildCoreDistEntries(): Record<string, string> {
     "agents/code-mode.worker": "src/agents/code-mode.worker.ts",
     "agents/compaction-planning.worker": "src/agents/compaction-planning.worker.ts",
     "agents/model-provider-auth.worker": "src/agents/model-provider-auth.worker.ts",
+    "audit/audit-event-writer.worker": "src/audit/audit-event-writer.worker.ts",
+    "config/sessions/session-accessor.sqlite-archive.worker":
+      "src/config/sessions/session-accessor.sqlite-archive.worker.ts",
+    "config/sessions/session-transcript-reconcile.worker":
+      "src/config/sessions/session-transcript-reconcile.worker.ts",
+    "state/openclaw-database-verify.worker": "src/state/openclaw-database-verify.worker.ts",
+    "system-agent/setup-inference-detection.worker":
+      "src/system-agent/setup-inference-detection.worker.ts",
     "acp/control-plane/manager": "src/acp/control-plane/manager.ts",
     "cli/gateway-lifecycle.runtime": "src/cli/gateway-cli/lifecycle.runtime.ts",
     "provider-dispatcher.runtime": "src/auto-reply/reply/provider-dispatcher.runtime.ts",
     "server-close.runtime": "src/gateway/server-close.runtime.ts",
+    "gateway/worker-environments/runtime": "src/gateway/worker-environments/runtime.ts",
     "plugins/hook-runner-global": "src/plugins/hook-runner-global.ts",
     "plugins/memory-state": "src/plugins/memory-state.ts",
     "plugins/synthetic-auth.runtime": "src/plugins/synthetic-auth.runtime.ts",
@@ -266,7 +311,7 @@ function buildCoreDistEntries(): Record<string, string> {
     "media-understanding/apply.runtime": "src/media-understanding/apply.runtime.ts",
     "commands/doctor/shared/plugin-registry-migration":
       "src/commands/doctor/shared/plugin-registry-migration.ts",
-    "commands/status.summary.runtime": "src/commands/status.summary.runtime.ts",
+    "commands/status.summary.runtime": "src/status/summary.runtime.ts",
     "infra/boundary-file-read": "src/infra/boundary-file-read.ts",
     "plugins/provider-discovery.runtime": "src/plugins/provider-discovery.runtime.ts",
     "plugins/provider-runtime.runtime": "src/plugins/provider-runtime.runtime.ts",
@@ -275,7 +320,6 @@ function buildCoreDistEntries(): Record<string, string> {
     "plugins/loader": "src/plugins/loader.ts",
     "plugins/sdk-alias": "src/plugins/sdk-alias.ts",
     "facade-activation-check.runtime": "src/plugin-sdk/facade-activation-check.runtime.ts",
-    extensionAPI: "src/extensionAPI.ts",
     "infra/warning-filter": "src/infra/warning-filter.ts",
     "telegram-ingress-worker.runtime": bundledPluginFile(
       "telegram",
@@ -287,33 +331,38 @@ function buildCoreDistEntries(): Record<string, string> {
     "plugins/runtime/index": "src/plugins/runtime/index.ts",
     "llm-slug-generator": "src/hooks/llm-slug-generator.ts",
     "mcp/plugin-tools-serve": "src/mcp/plugin-tools-serve.ts",
+    "mcp/openclaw-tools-serve": "src/mcp/openclaw-tools-serve.ts",
   };
 }
 
 function buildDockerE2eHarnessEntries(): Record<string, string> {
   return {
-    // Mounted Docker harnesses run against the npm tarball image, so any
-    // internal module they assert must have a stable package dist entry.
+    // Mounted Docker harnesses need stable package dist entries for asserted internal modules.
     "agents/agent-bundle-mcp-materialize": "src/agents/agent-bundle-mcp-materialize.ts",
     "agents/agent-bundle-mcp-runtime": "src/agents/agent-bundle-mcp-runtime.ts",
+    "agents/conversation-capability-profile": "src/agents/conversation-capability-profile.ts",
     "agents/embedded-agent-runner/effective-tool-policy":
       "src/agents/embedded-agent-runner/effective-tool-policy.ts",
     "agents/embedded-agent-runner/tool-split": "src/agents/embedded-agent-runner/tool-split.ts",
     "agents/embedded-agent-runner/run/runtime-context-prompt":
       "src/agents/embedded-agent-runner/run/runtime-context-prompt.ts",
-    "auto-reply/reply/commands-crestodian": "src/auto-reply/reply/commands-crestodian.ts",
+    "auto-reply/reply/commands-system-agent": "src/auto-reply/reply/commands-system-agent.ts",
     "cli/run-main": "src/cli/run-main.ts",
     "commitments/runtime": "src/commitments/runtime.ts",
+    "commitments/runtime.test-support": "src/commitments/runtime.test-support.ts",
     "commitments/store": "src/commitments/store.ts",
     "config/config": "src/config/config.ts",
-    "crestodian/crestodian": "src/crestodian/crestodian.ts",
-    "crestodian/rescue-message": "src/crestodian/rescue-message.ts",
+    "infra/sqlite-audit-record-store": "src/infra/sqlite-audit-record-store.ts",
+    "system-agent/audit": "src/system-agent/audit.ts",
+    "system-agent/system-agent": "src/system-agent/system-agent.ts",
+    "system-agent/rescue-message": "src/system-agent/rescue-message.ts",
+    "system-agent/setup-inference": "src/system-agent/setup-inference.ts",
     "gateway/protocol/index": "packages/gateway-protocol/src/index.ts",
     "infra/errors": "src/infra/errors.ts",
     "infra/ws": "src/infra/ws.ts",
     "plugin-sdk/provider-onboard": "src/plugin-sdk/provider-onboard.ts",
     "plugins/tools": "src/plugins/tools.ts",
-    "shared/string-coerce": "src/shared/string-coerce.ts",
+    "normalization-core/string-coerce": "packages/normalization-core/src/string-coerce.ts",
   };
 }
 
@@ -323,78 +372,63 @@ function buildAgentCoreDistEntries(): Record<string, string> {
     agent: "packages/agent-core/src/agent.ts",
     "agent-loop": "packages/agent-core/src/agent-loop.ts",
     llm: "packages/agent-core/src/llm.ts",
-    node: "packages/agent-core/src/node.ts",
     "runtime-deps": "packages/agent-core/src/runtime-deps.ts",
     types: "packages/agent-core/src/types.ts",
     validation: "packages/agent-core/src/validation.ts",
-    "harness/agent-harness": "packages/agent-core/src/harness/agent-harness.ts",
-    "harness/types": "packages/agent-core/src/harness/types.ts",
     "harness/messages": "packages/agent-core/src/harness/messages.ts",
     "harness/env/kill-tree": "packages/agent-core/src/harness/env/kill-tree.ts",
-    "harness/session": "packages/agent-core/src/harness/session/session.ts",
-    "harness/session/jsonl-repo": "packages/agent-core/src/harness/session/jsonl-repo.ts",
-    "harness/session/jsonl-storage": "packages/agent-core/src/harness/session/jsonl-storage.ts",
-    "harness/session/memory-repo": "packages/agent-core/src/harness/session/memory-repo.ts",
-    "harness/session/memory-storage": "packages/agent-core/src/harness/session/memory-storage.ts",
-    "harness/session/repo-utils": "packages/agent-core/src/harness/session/repo-utils.ts",
-    "harness/session/uuid": "packages/agent-core/src/harness/session/uuid.ts",
     "harness/compaction": "packages/agent-core/src/harness/compaction/compaction.ts",
     "harness/branch-summarization":
       "packages/agent-core/src/harness/compaction/branch-summarization.ts",
-    "harness/prompt-templates": "packages/agent-core/src/harness/prompt-templates.ts",
-    "harness/skills": "packages/agent-core/src/harness/skills.ts",
-    "harness/system-prompt": "packages/agent-core/src/harness/system-prompt.ts",
-    "harness/utils/shell-output": "packages/agent-core/src/harness/utils/shell-output.ts",
+    "harness/prompt-template-arguments":
+      "packages/agent-core/src/harness/prompt-template-arguments.ts",
     "harness/utils/truncate": "packages/agent-core/src/harness/utils/truncate.ts",
   };
 }
 
-function buildGatewayProtocolDistEntries(): Record<string, string> {
-  return {
-    // Package exports resolve from packages/gateway-protocol/dist, while the
-    // root build still emits dist/gateway/protocol/index for Docker harnesses.
-    index: "packages/gateway-protocol/src/index.ts",
-    "client-info": "packages/gateway-protocol/src/client-info.ts",
-    "connect-error-details": "packages/gateway-protocol/src/connect-error-details.ts",
-    schema: "packages/gateway-protocol/src/schema.ts",
-    "startup-unavailable": "packages/gateway-protocol/src/startup-unavailable.ts",
-    version: "packages/gateway-protocol/src/version.ts",
+function buildPackageDistEntriesFromExports(packageDir: string): Record<string, string> {
+  const packageJsonPath = path.join("packages", packageDir, "package.json");
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
+    exports?: Record<string, unknown>;
   };
+  const entries: Record<string, string> = {};
+  for (const [exportKey, value] of Object.entries(packageJson.exports ?? {})) {
+    const entry =
+      exportKey === "." ? "index" : exportKey.startsWith("./") ? exportKey.slice(2) : "";
+    if (!entry || entry.includes("..")) {
+      continue;
+    }
+    const importPath =
+      typeof value === "object" && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>).import
+        : value;
+    if (typeof importPath !== "string" || !importPath.startsWith("./dist/")) {
+      continue;
+    }
+    const sourcePath = importPath
+      .replace(/^\.\/dist\//u, `packages/${packageDir}/src/`)
+      .replace(/\.mjs$/u, ".ts");
+    entries[entry] = sourcePath;
+  }
+  return Object.fromEntries(Object.entries(entries).toSorted(([a], [b]) => a.localeCompare(b)));
 }
 
-function buildGatewayClientDistEntries(): Record<string, string> {
+function buildLlmCoreDistEntries(): Record<string, string> {
   return {
-    // Keep package entrypoints explicit so package.json exports and root build
-    // config cannot drift when client internals are split again.
-    index: "packages/gateway-client/src/index.ts",
-    readiness: "packages/gateway-client/src/readiness.ts",
-    timeouts: "packages/gateway-client/src/timeouts.ts",
-  };
-}
-
-function buildNetPolicyDistEntries(): Record<string, string> {
-  return {
-    // These subpaths are imported by root runtime code and exported by the
-    // package. Keep the build list adjacent to package.json exports.
-    index: "packages/net-policy/src/index.ts",
-    ip: "packages/net-policy/src/ip.ts",
-    ipv4: "packages/net-policy/src/ipv4.ts",
-    "redact-sensitive-url": "packages/net-policy/src/redact-sensitive-url.ts",
-    "url-userinfo": "packages/net-policy/src/url-userinfo.ts",
-  };
-}
-
-function buildSpeechCoreDistEntries(): Record<string, string> {
-  return {
-    api: "packages/speech-core/api.ts",
-    "runtime-api": "packages/speech-core/runtime-api.ts",
-    speaker: "packages/speech-core/speaker.ts",
-    "voice-models": "packages/speech-core/voice-models.ts",
+    index: "packages/llm-core/src/index.ts",
+    types: "packages/llm-core/src/types.ts",
+    "utils/diagnostics": "packages/llm-core/src/utils/diagnostics.ts",
+    "utils/event-stream": "packages/llm-core/src/utils/event-stream.ts",
+    validation: "packages/llm-core/src/validation.ts",
   };
 }
 
 function shouldExternalizeAgentCoreDependency(id: string): boolean {
   return (
+    id === "@openclaw/ai" ||
+    id.startsWith("@openclaw/ai/") ||
+    id === "@openclaw/llm-core" ||
+    id.startsWith("@openclaw/llm-core/") ||
     id === "ignore" ||
     id === "openclaw" ||
     id.startsWith("openclaw/") ||
@@ -410,11 +444,8 @@ function shouldExternalizeGatewayProtocolDependency(id: string): boolean {
 }
 
 function shouldExternalizeGatewayClientDependency(id: string): boolean {
-  return (
-    id === "ws" ||
-    id.startsWith("ws/") ||
-    id === "@openclaw/gateway-protocol" ||
-    id.startsWith("@openclaw/gateway-protocol/")
+  return ["ws", "@openclaw/gateway-protocol"].some(
+    (dependency) => id === dependency || id.startsWith(`${dependency}/`),
   );
 }
 
@@ -422,8 +453,18 @@ function shouldExternalizeNetPolicyDependency(id: string): boolean {
   return id === "ipaddr.js" || id.startsWith("ipaddr.js/");
 }
 
-function shouldExternalizeSpeechCoreDependency(id: string): boolean {
-  return id === "openclaw" || id.startsWith("openclaw/");
+function shouldExternalizeLlmCoreDependency(id: string): boolean {
+  return id === "typebox" || id.startsWith("typebox/");
+}
+
+function shouldExternalizeMarkdownCoreDependency(id: string): boolean {
+  return (
+    id === "markdown-it" || id.startsWith("markdown-it/") || id === "yaml" || id.startsWith("yaml/")
+  );
+}
+
+function shouldExternalizeTerminalCoreDependency(id: string): boolean {
+  return id === "@clack/prompts" || id.startsWith("@clack/prompts/") || id === "chalk";
 }
 
 const coreDistEntries = buildCoreDistEntries();
@@ -436,12 +477,42 @@ function buildUnifiedDistEntries(): Record<string, string> {
   return {
     ...coreDistEntries,
     ...dockerE2eHarnessEntries,
-    // Internal compat artifact for the root-alias.cjs lazy loader.
-    "plugin-sdk/compat": "src/plugin-sdk/compat.ts",
+    ...Object.fromEntries(
+      Object.entries(buildPackageDistEntriesFromExports("normalization-core")).map(
+        ([entry, source]) => [`normalization-core/${entry}`, source],
+      ),
+    ),
+    ...Object.fromEntries(
+      Object.entries(buildPackageDistEntriesFromExports("retry")).map(([entry, source]) => [
+        `retry/${entry}`,
+        source,
+      ]),
+    ),
+    ...Object.fromEntries(
+      Object.entries(buildPackageDistEntriesFromExports("media-core")).map(([entry, source]) => [
+        `media-core/${entry}`,
+        source,
+      ]),
+    ),
+    ...Object.fromEntries(
+      Object.entries(buildPackageDistEntriesFromExports("acp-core")).map(([entry, source]) => [
+        `acp-core/${entry}`,
+        source,
+      ]),
+    ),
+    ...Object.fromEntries(
+      Object.entries(buildPackageDistEntriesFromExports("terminal-core")).map(([entry, source]) => [
+        `terminal-core/${entry}`,
+        source,
+      ]),
+    ),
     // Private bundled Codex helper for app-server user MCP config projection.
     "plugin-sdk/codex-mcp-projection": "src/plugin-sdk/codex-mcp-projection.ts",
+    // Private bundled Codex helper for app-server transcript mirroring.
+    "plugin-sdk/codex-session-transcript-runtime":
+      "src/plugin-sdk/codex-session-transcript-runtime.ts",
     ...Object.fromEntries(
-      Object.entries(buildPluginSdkEntrySources(productionPluginSdkEntrypoints)).map(
+      Object.entries(buildPluginSdkEntrySources(selectedPluginSdkEntrypoints)).map(
         ([entry, source]) => [`plugin-sdk/${entry}`, source],
       ),
     ),
@@ -458,61 +529,166 @@ function buildUnifiedDistEntries(): Record<string, string> {
   };
 }
 
-export default defineConfig([
+type UnifiedEntry = [name: string, source: string];
+
+function partitionUnifiedEntryGroups(
+  entryGroups: UnifiedEntry[][],
+  partitionCount: number,
+): UnifiedEntry[][] {
+  const partitions = Array.from({ length: partitionCount }, () => [] as UnifiedEntry[]);
+  for (const entryGroup of entryGroups) {
+    let targetIndex = 0;
+    for (let index = 1; index < partitions.length; index += 1) {
+      const candidate = partitions[index];
+      const target = partitions[targetIndex];
+      if (candidate && target && candidate.length < target.length) {
+        targetIndex = index;
+      }
+    }
+    const target = partitions[targetIndex];
+    if (!target) {
+      throw new Error("unified declaration partition count must be positive");
+    }
+    target.push(...entryGroup);
+  }
+  return partitions;
+}
+
+function normalizeDeclarationEntrySource(source: string): string {
+  const relativeSource = path.isAbsolute(source) ? path.relative(process.cwd(), source) : source;
+  return relativeSource.replaceAll(path.sep, "/");
+}
+
+function buildUnifiedDeclarationPartitions(
+  entries: Record<string, string>,
+): Array<{ name: string; sources: string[] }> {
+  const sortedEntries = Object.entries(entries).toSorted(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  const baseEntries = sortedEntries.filter(
+    ([name]) => !name.startsWith("plugin-sdk/") && !name.startsWith("extensions/"),
+  );
+  const pluginSdkEntries = sortedEntries.filter(([name]) => name.startsWith("plugin-sdk/"));
+  const extensionEntriesById = new Map<string, UnifiedEntry[]>();
+  for (const entry of sortedEntries) {
+    const [name] = entry;
+    if (!name.startsWith("extensions/")) {
+      continue;
+    }
+    const extensionId = name.split("/", 3)[1];
+    if (!extensionId) {
+      continue;
+    }
+    const extensionEntries = extensionEntriesById.get(extensionId) ?? [];
+    extensionEntries.push(entry);
+    extensionEntriesById.set(extensionId, extensionEntries);
+  }
+
+  const publicPluginSdkEntryNames = new Set(
+    publicPluginSdkEntrypoints.map((entry) => `plugin-sdk/${entry}`),
+  );
+  const pluginSdkPartitions = [
+    pluginSdkEntries.filter(([name]) => publicPluginSdkEntryNames.has(name)),
+    pluginSdkEntries.filter(([name]) => !publicPluginSdkEntryNames.has(name)),
+  ];
+  const extensionPartitions = partitionUnifiedEntryGroups(
+    [...extensionEntriesById.entries()]
+      .toSorted(([left], [right]) => left.localeCompare(right))
+      .map(([, extensionEntries]) => extensionEntries),
+    5,
+  );
+  const partitions = [baseEntries, ...pluginSdkPartitions, ...extensionPartitions];
+
+  return TSDOWN_UNIFIED_DTS_CONFIG_GROUPS.map((name, index) => {
+    const partition = partitions[index];
+    if (!partition) {
+      throw new Error(`missing unified declaration partition for ${name}`);
+    }
+    return {
+      name,
+      sources: partition.map(([, source]) => normalizeDeclarationEntrySource(source)),
+    };
+  });
+}
+
+const unifiedDistEntries = buildUnifiedDistEntries();
+const unifiedDeps = {
+  alwaysBundle: shouldAlwaysBundleDependency,
+  neverBundle: shouldNeverBundleDependency,
+  // Keep dts generation from inlining externalized package types.
+  dts: { neverBundle: shouldNeverBundleDependency },
+};
+
+const configs = [
   nodeBuildConfig({
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
+    name: TSDOWN_PACKAGE_CONFIG_GROUP,
     entry: buildAgentCoreDistEntries(),
-    outDir: "packages/agent-core/dist",
+    outDir: tsdownPackageOutputRoot("agent-core"),
     deps: {
       neverBundle: shouldExternalizeAgentCoreDependency,
     },
   }),
-  nodeWorkspacePackageBuildConfig({
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
-    entry: buildGatewayProtocolDistEntries(),
-    outDir: "packages/gateway-protocol/dist",
+  nodeWorkspacePackageBuildConfig("gateway-protocol", {
     deps: {
       neverBundle: shouldExternalizeGatewayProtocolDependency,
     },
   }),
-  nodeWorkspacePackageBuildConfig({
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
-    entry: buildGatewayClientDistEntries(),
-    outDir: "packages/gateway-client/dist",
+  nodeWorkspacePackageBuildConfig("gateway-client", {
     deps: {
       neverBundle: shouldExternalizeGatewayClientDependency,
     },
   }),
-  nodeWorkspacePackageBuildConfig({
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
-    entry: buildNetPolicyDistEntries(),
-    outDir: "packages/net-policy/dist",
+  nodeWorkspacePackageBuildConfig("net-policy", {
     deps: {
       neverBundle: shouldExternalizeNetPolicyDependency,
     },
   }),
-  nodeWorkspacePackageBuildConfig({
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
-    entry: buildSpeechCoreDistEntries(),
-    outDir: "packages/speech-core/dist",
+  nodeWorkspacePackageBuildConfig("media-generation-core"),
+  nodeWorkspacePackageBuildConfig("media-understanding-common"),
+  nodeWorkspacePackageBuildConfig("markdown-core", {
     deps: {
-      neverBundle: shouldExternalizeSpeechCoreDependency,
+      neverBundle: shouldExternalizeMarkdownCoreDependency,
     },
   }),
-  nodeBuildConfig({
-    // Build core entrypoints, plugin-sdk subpaths, bundled plugin entrypoints,
-    // and bundled hooks in one graph so runtime singletons are emitted once.
-    clean: true,
-    dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
-    entry: buildUnifiedDistEntries(),
+  nodeWorkspacePackageBuildConfig("normalization-core"),
+  nodeWorkspacePackageBuildConfig("retry"),
+  nodeWorkspacePackageBuildConfig("media-core"),
+  nodeWorkspacePackageBuildConfig("acp-core"),
+  nodeWorkspacePackageBuildConfig("terminal-core", {
     deps: {
-      alwaysBundle: shouldAlwaysBundleDependency,
-      neverBundle: shouldNeverBundleDependency,
+      neverBundle: shouldExternalizeTerminalCoreDependency,
     },
   }),
-]);
+  nodeWorkspacePackageBuildConfig("llm-core", {
+    entry: buildLlmCoreDistEntries(),
+    deps: {
+      neverBundle: shouldExternalizeLlmCoreDependency,
+    },
+  }),
+  nodeWorkspacePackageBuildConfig("model-catalog-core"),
+  nodeBuildConfig(
+    {
+      name: TSDOWN_UNIFIED_CONFIG_GROUP,
+      // Build core entrypoints, plugin-sdk subpaths, bundled plugin entrypoints,
+      // and bundled hooks in one graph so runtime singletons are emitted once.
+      entry: unifiedDistEntries,
+      deps: unifiedDeps,
+      plugins: [createStateSchemaInlinePlugin()],
+    },
+    false,
+  ),
+  ...(TSDOWN_DECLARATIONS
+    ? buildUnifiedDeclarationPartitions(unifiedDistEntries).map(({ name, sources }) =>
+        nodeBuildConfig(
+          {
+            name,
+            entry: unifiedDistEntries,
+            deps: unifiedDeps,
+          },
+          { emitDtsOnly: true, entry: sources },
+        ),
+      )
+    : []),
+] satisfies UserConfig[];
+
+export default configs;

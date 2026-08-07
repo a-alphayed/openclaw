@@ -1,3 +1,4 @@
+// Slack tests cover pins plugin behavior.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const pinEnqueueMock = vi.hoisted(() => vi.fn());
@@ -6,9 +7,6 @@ let buildPinHarness: typeof import("./system-event-test-harness.js").createSlack
 type PinOverrides = import("./system-event-test-harness.js").SlackSystemEventTestOverrides;
 
 vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
-  enqueueSystemEvent: (...args: unknown[]) => pinEnqueueMock(...args),
-}));
-vi.mock("openclaw/plugin-sdk/system-event-runtime.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => pinEnqueueMock(...args),
 }));
 type PinHandler = (args: { event: Record<string, unknown>; body: unknown }) => Promise<void>;

@@ -1,3 +1,4 @@
+// Covers JSONL socket request framing and response handling.
 import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";

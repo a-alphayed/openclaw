@@ -1,20 +1,11 @@
+// Shared fixtures for session-history sanitization tests.
 import { expect, vi } from "vitest";
 import type { AgentMessage } from "./runtime/index.js";
 import type { SessionManager } from "./sessions/index.js";
-import type { TranscriptPolicy } from "./transcript-policy.js";
 
 type SessionEntry = { type: string; customType: string; data: unknown };
-export type SanitizeSessionHistoryFn = (params: {
-  messages: AgentMessage[];
-  modelApi: string;
-  provider: string;
-  allowedToolNames?: Iterable<string>;
-  sessionManager: SessionManager;
-  sessionId: string;
-  modelId?: string;
-  policy?: TranscriptPolicy;
-  preserveLatestAssistantThinking?: boolean;
-}) => Promise<AgentMessage[]>;
+export type SanitizeSessionHistoryFn =
+  typeof import("./embedded-agent-runner/replay-history.js").sanitizeSessionHistory;
 type SanitizeSessionHistoryMockedHelpers = typeof import("./embedded-agent-helpers.js");
 export type SanitizeSessionHistoryHarness = {
   sanitizeSessionHistory: SanitizeSessionHistoryFn;
@@ -40,11 +31,19 @@ export function makeModelSnapshotEntry(data: {
   };
 }
 
-export function makeInMemorySessionManager(entries: SessionEntry[]): SessionManager {
+export function makeInMemorySessionManager(
+  entries: SessionEntry[],
+  activeBranchEntries: SessionEntry[] = entries,
+): SessionManager {
   return {
     getEntries: vi.fn(() => entries),
+    getBranch: vi.fn(() => activeBranchEntries),
     appendCustomEntry: vi.fn((customType: string, data: unknown) => {
-      entries.push({ type: "custom", customType, data });
+      const entry = { type: "custom", customType, data };
+      entries.push(entry);
+      if (activeBranchEntries !== entries) {
+        activeBranchEntries.push(entry);
+      }
     }),
   } as unknown as SessionManager;
 }
@@ -52,6 +51,7 @@ export function makeInMemorySessionManager(entries: SessionEntry[]): SessionMana
 export function makeMockSessionManager(): SessionManager {
   return {
     getEntries: vi.fn().mockReturnValue([]),
+    getBranch: vi.fn().mockReturnValue([]),
     appendCustomEntry: vi.fn(),
   } as unknown as SessionManager;
 }
@@ -77,6 +77,8 @@ export async function createSanitizeSessionHistoryProviderRuntimeMock(
   );
   return {
     ...actual,
+    // Default to no provider plugin participation; individual tests opt in to
+    // hooks so ownership boundaries stay explicit.
     resolveProviderRuntimePlugin: vi.fn(() => undefined),
     sanitizeProviderReplayHistoryWithPlugin: vi.fn(() => undefined),
     validateProviderReplayTurnsWithPlugin: vi.fn(() => undefined),
@@ -107,6 +109,8 @@ export async function createSanitizeSessionHistoryProviderHookRuntimeMock(
 export async function loadSanitizeSessionHistoryWithCleanMocks(): Promise<SanitizeSessionHistoryHarness> {
   vi.resetModules();
   vi.resetAllMocks();
+  // Reload replay-history after mocks reset so each suite sees the same module
+  // graph the production runner would import.
   const mockedHelpers = await import("./embedded-agent-helpers.js");
   vi.mocked(mockedHelpers.sanitizeSessionMessagesImages).mockImplementation(async (msgs) => msgs);
   const mod = await import("./embedded-agent-runner/replay-history.js");
@@ -119,6 +123,7 @@ export async function loadSanitizeSessionHistoryWithCleanMocks(): Promise<Saniti
 export function makeReasoningAssistantMessages(opts?: {
   thinkingSignature?: "object" | "json";
   includeText?: boolean;
+  timestamp?: number;
 }): AgentMessage[] {
   const thinkingSignature: unknown =
     opts?.thinkingSignature === "json"
@@ -141,6 +146,7 @@ export function makeReasoningAssistantMessages(opts?: {
     {
       role: "assistant",
       content,
+      ...(opts?.timestamp === undefined ? {} : { timestamp: opts.timestamp }),
     },
   ];
 
@@ -167,6 +173,8 @@ export function expectOpenAIResponsesStrictSanitizeCall(
   sanitizeSessionMessagesImagesMock: unknown,
   messages: AgentMessage[],
 ) {
+  // OpenAI Responses replay preserves strict tool-call ids; downgrading ids here
+  // would make later assistant/tool turns impossible to correlate.
   const mock = sanitizeSessionMessagesImagesMock as {
     mock?: { calls: Array<[AgentMessage[], string, Record<string, unknown>]> };
   };
@@ -188,7 +196,10 @@ function makeSnapshotChangedOpenAIReasoningScenario() {
   ];
   return {
     sessionManager: makeInMemorySessionManager(sessionEntries),
-    messages: makeReasoningAssistantMessages({ thinkingSignature: "object", includeText: true }),
+    messages: makeReasoningAssistantMessages({
+      thinkingSignature: "object",
+      includeText: true,
+    }),
     modelId: "gpt-5.4",
   };
 }
