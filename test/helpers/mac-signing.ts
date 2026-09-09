@@ -20,6 +20,12 @@ export async function installFakeCodesign(binDir: string) {
     `#!/usr/bin/env bash
 set -euo pipefail
 ${nativeMetadataReply}
+if [ "$#" -gt 0 ]; then
+  case "\${@: -1}" in
+    *openclaw-codesign-preflight.*) exit 0 ;;
+  esac
+fi
+
 if [ -n "\${CODESIGN_ARGS_LOG:-}" ]; then
   printf '%s\\n' "$*" >>"$CODESIGN_ARGS_LOG"
 fi
@@ -68,6 +74,10 @@ export async function installTransientFakeCodesign(binDir: string) {
     `#!/usr/bin/env bash
 set -euo pipefail
 ${nativeMetadataReply}
+target="\${@: -1}"
+case "$target" in
+  *openclaw-codesign-preflight.*) exit 0 ;;
+esac
 count=0
 if [ -f "$CODESIGN_COUNT_FILE" ]; then
   count="$(cat "$CODESIGN_COUNT_FILE")"
@@ -163,6 +173,7 @@ const fs = require('node:fs');
 const args = process.argv.slice(2), target = args.at(-1);
 const config = JSON.parse(fs.readFileSync(${JSON.stringify(options)}, 'utf8'));
 (async () => {
+if (target.includes('openclaw-codesign-preflight.')) return;
 if (config.swapStage === 'before-sign' && args.includes('--sign') && target === config.swapTarget) {
   // An external driver swaps the directory only after the confined signer is ready.
   await new Promise((resolve, reject) => {
