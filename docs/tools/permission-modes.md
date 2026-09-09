@@ -35,15 +35,17 @@ openclaw exec-policy show
 
 `tools.exec.mode` is the normalized policy surface for host `exec`. Each mode resolves to an underlying `security` (allowlist strictness) and `ask` (prompt-on-miss) pair:
 
-| Mode        | security / ask          | Behavior                                                                                      | Use when                                              |
-| ----------- | ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `deny`      | `deny` / `off`          | Block host exec entirely.                                                                     | No host commands are allowed.                         |
-| `allowlist` | `allowlist` / `off`     | Run only allowlisted commands; silently deny misses.                                          | You have a known-safe command set.                    |
-| `ask`       | `allowlist` / `on-miss` | Run allowlist matches; ask a human on misses.                                                 | A human should review every new command.              |
-| `auto`      | `allowlist` / `on-miss` | Run allowlist matches; send misses through auto-review before falling back to human approval. | Coding sessions need practical guarded access.        |
-| `full`      | `full` / `off`          | Run host exec without prompts.                                                                | This trusted host/session should skip approval gates. |
+| Mode        | security / ask          | Behavior                                                                      | Use when                                              |
+| ----------- | ----------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `deny`      | `deny` / `off`          | Block host exec entirely.                                                     | No host commands are allowed.                         |
+| `allowlist` | `allowlist` / `off`     | Run only allowlisted commands; silently deny misses.                          | You have a known-safe command set.                    |
+| `ask`       | `allowlist` / `on-miss` | Run allowlist matches; ask a human on misses.                                 | A human should review every new command.              |
+| `auto`      | `allowlist` / `on-miss` | Run allowlist matches; review eligible misses with `allow`, `deny`, or `ask`. | Coding sessions need practical guarded access.        |
+| `full`      | `full` / `off`          | Run host exec without prompts.                                                | This trusted host/session should skip approval gates. |
 
-`ask` and `auto` share the same allowlist/ask settings; `auto` additionally enables the native auto-reviewer, which decides misses itself and only defers to the configured human approval route when it cannot safely approve.
+`ask` and `auto` share the same allowlist/ask settings; `auto` additionally enables the native auto-reviewer. An `allow` verdict permits one low- or medium-risk execution. A `deny` verdict returns a reason to the agent so it can choose a materially safer alternative or ask the user. An `ask` verdict requests human approval, as do review failures. On the gateway, three consecutive reviewer denials escalate to a human. Existing binding checks and explicit human-approval requirements still apply; see [Exec modes](/tools/exec#modes).
+
+Gateway approval-backed commands bind every resolved command-segment executable before review and re-check it before launch: protected executables use resolved real-path identity only, while writable executables also use a content hash. Node identity checks cover local policy evaluation through dispatch, with a [remote shell-wrapper approval limitation](/tools/exec-approvals-advanced#interpreter%2Fruntime-commands). In `auto` mode, POSIX login or interactive shell wrappers skip the reviewer and require human approval when binding succeeds; existing binding rejections remain denied. Their implicit startup files are outside operand binding.
 
 For the full host exec policy, local approvals file, allowlist schema, safe bins, and forwarding behavior, see [Exec approvals](/tools/exec-approvals).
 
@@ -63,7 +65,10 @@ For app-server setup, auth order, and native Codex runtime details, see [Codex h
 
 ## ACPX harness permissions
 
-ACPX sessions are non-interactive, so they cannot click a TTY permission prompt. ACPX uses separate harness-level settings under `plugins.entries.acpx.config`:
+ACPX sessions have no interactive TTY for permission prompts. Supported ACP
+form and URL requests can still reach the operator as Gateway questions during
+a channel-delivered turn; those are separate from permission approval. ACPX
+uses separate harness-level settings under `plugins.entries.acpx.config`:
 
 | Setting                     | Values          | Meaning                                     |
 | --------------------------- | --------------- | ------------------------------------------- |
